@@ -14,9 +14,10 @@ switches stay outside the core.
 
 The repository currently contains the clean API boundary, validated CIGAR and
 read/reference types, diagnostics hooks, read segmentation, sparse backbone
-probe selection, and DNA candidate clustering. `Aligner::map` is intentionally
-marked not-ready until the anchor/chain/CIGAR path is ported and
-differential-tested against FlashMap.
+probe selection, DNA candidate clustering, exact anchor discovery, fixed
+Minimap-DP chaining, fixed KSW2 local DP, and the ordered worker-pool runner.
+`Aligner::map` remains an explicit integration point until the final gap/CIGAR
+assembly is ported and differentially tested against FlashMap.
 
 The extraction rule is: design the interface from scratch, but port the
 verified implementation and tests in small commits. FlashMap remains the

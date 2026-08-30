@@ -1,6 +1,6 @@
 fn main() {
     println!(
-        "RS-LRA {} (API scaffold; mapper not ported yet)",
+        "RS-LRA {} (core phases available; CLI adapter pending)",
         rs_lra::VERSION
     );
 }
