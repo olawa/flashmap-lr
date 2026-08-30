@@ -157,7 +157,20 @@ pub fn build_chain_cigar(
         contig.sequence,
         ref_start,
     );
-    let mut repaired_ops = repaired_ops;
+    let mut repaired_ops = crate::postprocess::repair_phase_shifted_spans(
+        &repaired_ops,
+        &oriented_query,
+        contig.sequence,
+        ref_start,
+    );
+    crate::postprocess::deep_terminal_softclip_divergent_ends(
+        &mut repaired_ops,
+        &oriented_query,
+        contig.sequence,
+        &mut ref_start,
+        32,
+        0.20,
+    );
     left_align_indels(
         &mut repaired_ops,
         contig.sequence,

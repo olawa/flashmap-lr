@@ -9,7 +9,8 @@ for the same read and reference:
 2. candidate contig, strand, diagonal, and reference window;
 3. exact anchor query/reference intervals and anchor lengths;
 4. Minimap-DP chain anchor order, score, covered query bases, and terminal gaps;
-5. final reference start, normalized CIGAR, NM, and aligned query/reference
+5. post-chain repeat phase repair and divergent-terminal soft clipping;
+6. final reference start, normalized CIGAR, NM, and aligned query/reference
    consumption.
 
 The first fixtures should be small and deterministic:

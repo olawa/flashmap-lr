@@ -14,6 +14,7 @@ mod dp;
 mod errors;
 mod gap_cigar;
 mod index;
+mod postprocess;
 mod probes;
 mod segment;
 mod types;
