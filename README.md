@@ -11,9 +11,10 @@ switches stay outside the core.
 ## Status
 
 The repository currently contains the clean API boundary, validated CIGAR and
-read/reference types, diagnostics hooks, and the shared LR read-segmentation
-primitive. `Aligner::map` is intentionally marked not-ready until the first
-production phase is ported and differential-tested against FlashMap.
+read/reference types, diagnostics hooks, read segmentation, sparse backbone
+probe selection, and DNA candidate clustering. `Aligner::map` is intentionally
+marked not-ready until the anchor/chain/CIGAR path is ported and
+differential-tested against FlashMap.
 
 The extraction rule is: design the interface from scratch, but port the
 verified implementation and tests in small commits. FlashMap remains the
