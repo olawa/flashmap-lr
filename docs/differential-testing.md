@@ -5,7 +5,7 @@ ported, FlashMap remains the behavioral oracle for the fixed HiFiBalanced LR
 route. A differential fixture should therefore compare the following records
 for the same read and reference:
 
-1. selected probe positions and complete-hit filtering;
+1. selected backbone/endpoint probe positions and complete-hit filtering;
 2. candidate contig, strand, diagonal, and reference window;
 3. exact anchor query/reference intervals and anchor lengths;
 4. Minimap-DP chain anchor order, score, covered query bases, and terminal gaps;
