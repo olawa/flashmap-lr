@@ -75,12 +75,15 @@ pub fn build_chain_alignment(
     read.validate()
         .map_err(|_| ChainCigarError::InvalidQueryCoordinates)?;
     let (cigar, ref_start, oriented_query) = build_chain_cigar(read, contig, chain, config)?;
+    let reference_end = ref_start
+        .checked_add(cigar.reference_len() as usize)
+        .ok_or(ChainCigarError::InvalidReferenceCoordinates)?;
     let edit_distance = crate::types::cigar_edit_distance(
         &cigar,
         &oriented_query,
         contig
             .sequence
-            .get(ref_start..ref_start + cigar.reference_len() as usize)
+            .get(ref_start..reference_end)
             .ok_or(ChainCigarError::InvalidReferenceCoordinates)?,
     )
     .ok_or(ChainCigarError::InvalidReferenceCoordinates)?;
