@@ -1,16 +1,17 @@
 //! Assemble a validated DNA CIGAR from one Minimap-DP chain.
 //!
-//! The first extracted profile deliberately keeps this phase small: exact
-//! anchor spans are emitted as `M`, equal-span gaps are emitted as `M`, pure
-//! length differences become `I`/`D`, and bounded phase-shift gaps use the
-//! fixed KSW2 end-to-end DP wrapper.  The more experimental recursive gap
-//! re-anchoring and endpoint-rescue machinery remains in FlashMap until a
-//! parity test shows that it belongs in the stable core.
+//! Exact anchor spans are emitted as `M`, equal-span gaps are emitted as `M`,
+//! pure length differences become `I`/`D`, and bounded phase-shift gaps use
+//! the fixed KSW2 end-to-end DP wrapper. Longer gaps get a small exact-island
+//! recursion before the deterministic length-difference fallback. A bounded
+//! M-island repair pass is applied after assembly; endpoint attachment and
+//! output formatting remain adapter concerns.
 
 use crate::{
     align_full, Alignment, AlignmentError, Chain, Cigar, CigarError, CigarOp, Config, Contig, Read,
     Strand,
 };
+use std::collections::HashMap;
 
 /// Errors produced while converting a sparse chain into an alignment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,6 +150,13 @@ pub fn build_chain_cigar(
     }
 
     let cigar = Cigar::new(ops)?;
+    let repaired_ops = repair_match_islands(
+        cigar.into_ops(),
+        &oriented_query,
+        contig.sequence,
+        first.ref_start,
+    );
+    let cigar = Cigar::new(repaired_ops)?;
     let ref_end = first
         .ref_start
         .checked_add(cigar.reference_len() as usize)
@@ -283,6 +291,36 @@ fn append_gap(
     ref_end: usize,
     config: &Config,
 ) -> Result<(), ChainCigarError> {
+    append_gap_recursive(
+        ops,
+        query,
+        reference,
+        query_start,
+        query_end,
+        ref_start,
+        ref_end,
+        config,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_gap_recursive(
+    ops: &mut Vec<CigarOp>,
+    query: &[u8],
+    reference: &[u8],
+    query_start: usize,
+    query_end: usize,
+    ref_start: usize,
+    ref_end: usize,
+    config: &Config,
+    depth: usize,
+) -> Result<(), ChainCigarError> {
+    const SMALL_GAP_DP_MAX: usize = 192;
+    const SMALL_GAP_DP_DELTA_MAX: usize = 32;
+    const RECURSIVE_SPLIT_K: usize = 13;
+    const RECURSIVE_SPLIT_MAX_DEPTH: usize = 8;
+
     let query_len = query_end.saturating_sub(query_start);
     let reference_len = ref_end.saturating_sub(ref_start);
     if query_len == 0 && reference_len == 0 {
@@ -311,7 +349,8 @@ fn append_gap(
     let max_gap = query_len.max(reference_len);
     let delta = query_len.abs_diff(reference_len);
     let can_dp = max_gap <= config.alignment.bridge_max_gap
-        && max_gap <= 8_192
+        && max_gap <= SMALL_GAP_DP_MAX
+        && delta <= SMALL_GAP_DP_DELTA_MAX
         && query_len.saturating_mul(reference_len) <= 16_000_000;
     if can_dp {
         let band = delta
@@ -320,6 +359,46 @@ fn append_gap(
         if let Some(alignment) = align_full(query_slice, reference_slice, band) {
             ops.extend(alignment.cigar.into_ops());
             return Ok(());
+        }
+    }
+
+    if depth < RECURSIVE_SPLIT_MAX_DEPTH
+        && max_gap <= config.alignment.bridge_max_gap
+        && query_len >= RECURSIVE_SPLIT_K
+        && reference_len >= RECURSIVE_SPLIT_K
+    {
+        if let Some((q_island_start, r_island_start, island_len)) =
+            find_exact_island(query_slice, reference_slice, RECURSIVE_SPLIT_K)
+        {
+            let has_prefix = q_island_start > 0 || r_island_start > 0;
+            let has_suffix = q_island_start + island_len < query_len
+                || r_island_start + island_len < reference_len;
+            if has_prefix || has_suffix {
+                append_gap_recursive(
+                    ops,
+                    query,
+                    reference,
+                    query_start,
+                    query_start + q_island_start,
+                    ref_start,
+                    ref_start + r_island_start,
+                    config,
+                    depth + 1,
+                )?;
+                ops.push(CigarOp::Match(to_u32(island_len)?));
+                append_gap_recursive(
+                    ops,
+                    query,
+                    reference,
+                    query_start + q_island_start + island_len,
+                    query_end,
+                    ref_start + r_island_start + island_len,
+                    ref_end,
+                    config,
+                    depth + 1,
+                )?;
+                return Ok(());
+            }
         }
     }
 
@@ -333,6 +412,254 @@ fn append_gap(
         ops.push(CigarOp::Del(to_u32(reference_len - query_len)?));
     }
     Ok(())
+}
+
+/// Find the longest exact k-mer island that is strictly internal to both
+/// slices.  A single island is enough to split a long insertion/deletion into
+/// two smaller problems; recursive calls then handle additional phase shifts.
+/// Repetitive reference buckets are ignored so a tandem repeat cannot choose
+/// an arbitrary split point and manufacture a long chain of indels.
+fn find_exact_island(query: &[u8], reference: &[u8], k: usize) -> Option<(usize, usize, usize)> {
+    if k == 0 || query.len() < k || reference.len() < k {
+        return None;
+    }
+
+    let mut reference_buckets = HashMap::<u64, Vec<usize>>::new();
+    for ref_pos in 0..=reference.len() - k {
+        let Some(code) = encode_kmer(&reference[ref_pos..ref_pos + k]) else {
+            continue;
+        };
+        let bucket = reference_buckets.entry(code).or_default();
+        // Keep a marker for repetitive buckets but stop allocating positions
+        // once they can no longer provide safe unique evidence.
+        if bucket.len() <= 16 {
+            bucket.push(ref_pos);
+        }
+    }
+
+    let mut best: Option<(usize, usize, usize)> = None;
+    for query_pos in 0..=query.len() - k {
+        let Some(code) = encode_kmer(&query[query_pos..query_pos + k]) else {
+            continue;
+        };
+        let Some(ref_positions) = reference_buckets.get(&code) else {
+            continue;
+        };
+        if ref_positions.len() > 16 {
+            continue;
+        }
+
+        for &ref_pos in ref_positions {
+            let mut q_start = query_pos;
+            let mut r_start = ref_pos;
+            while q_start > 0
+                && r_start > 0
+                && query[q_start - 1].eq_ignore_ascii_case(&reference[r_start - 1])
+            {
+                q_start -= 1;
+                r_start -= 1;
+            }
+
+            let mut q_end = query_pos + k;
+            let mut r_end = ref_pos + k;
+            while q_end < query.len()
+                && r_end < reference.len()
+                && query[q_end].eq_ignore_ascii_case(&reference[r_end])
+            {
+                q_end += 1;
+                r_end += 1;
+            }
+
+            let length = q_end - q_start;
+            if best
+                .map(|(_, _, best_len)| length > best_len)
+                .unwrap_or(true)
+            {
+                best = Some((q_start, r_start, length));
+            }
+        }
+    }
+    best
+}
+
+fn encode_kmer(sequence: &[u8]) -> Option<u64> {
+    if sequence.is_empty() || sequence.len() > 32 {
+        return None;
+    }
+    let mut code = 0u64;
+    for &base in sequence {
+        let value = match base.to_ascii_uppercase() {
+            b'A' => 0,
+            b'C' => 1,
+            b'G' => 2,
+            b'T' => 3,
+            _ => return None,
+        };
+        code = (code << 2) | value;
+    }
+    Some(code)
+}
+
+fn repair_match_islands(
+    ops: Vec<CigarOp>,
+    query: &[u8],
+    reference: &[u8],
+    ref_start: usize,
+) -> Vec<CigarOp> {
+    const MIN_MATCH_SPAN: usize = 50;
+    const MERGE_DISTANCE: usize = 32;
+    const FLANK: usize = 64;
+    const MAX_WINDOW: usize = 300;
+    const MIN_ISLAND_MISMATCHES: usize = 2;
+    const DP_BAND: usize = 64;
+
+    let mut repaired = Vec::with_capacity(ops.len());
+    let mut query_pos = 0usize;
+    let mut reference_pos = ref_start;
+
+    for op in ops {
+        let CigarOp::Match(length) = op else {
+            if op.consumes_query() {
+                query_pos = query_pos.saturating_add(op_len(op));
+            }
+            if op.consumes_reference() {
+                reference_pos = reference_pos.saturating_add(op_len(op));
+            }
+            repaired.push(op);
+            continue;
+        };
+
+        let length = length as usize;
+        let Some(query_span) = query.get(query_pos..query_pos.saturating_add(length)) else {
+            repaired.push(op);
+            query_pos = query_pos.saturating_add(length);
+            reference_pos = reference_pos.saturating_add(length);
+            continue;
+        };
+        let Some(reference_span) =
+            reference.get(reference_pos..reference_pos.saturating_add(length))
+        else {
+            repaired.push(op);
+            query_pos = query_pos.saturating_add(length);
+            reference_pos = reference_pos.saturating_add(length);
+            continue;
+        };
+
+        if length < MIN_MATCH_SPAN {
+            repaired.push(op);
+            query_pos += length;
+            reference_pos += length;
+            continue;
+        }
+
+        let islands = mismatch_islands(query_span, reference_span, MERGE_DISTANCE);
+        if islands
+            .iter()
+            .all(|island| island.2 < MIN_ISLAND_MISMATCHES)
+        {
+            repaired.push(op);
+            query_pos += length;
+            reference_pos += length;
+            continue;
+        }
+
+        let mut cursor = 0usize;
+        for (island_start, island_end, mismatches) in islands {
+            if mismatches < MIN_ISLAND_MISMATCHES {
+                continue;
+            }
+            let mut local_start = island_start.saturating_sub(FLANK).max(cursor);
+            let mut local_end = (island_end + 1 + FLANK).min(length);
+            if local_end.saturating_sub(local_start) > MAX_WINDOW {
+                let midpoint = (island_start + island_end) / 2;
+                local_start = midpoint.saturating_sub(MAX_WINDOW / 2).max(cursor);
+                local_end = (local_start + MAX_WINDOW).min(length);
+            }
+            if local_end <= local_start {
+                continue;
+            }
+
+            if local_start > cursor {
+                repaired.push(CigarOp::Match(to_u32_lossy(local_start - cursor)));
+            }
+            let q_local = &query_span[local_start..local_end];
+            let r_local = &reference_span[local_start..local_end];
+            let old_nm = mismatch_count(q_local, r_local);
+            let accepted = align_full(q_local, r_local, DP_BAND).and_then(|alignment| {
+                let new_nm = alignment.edit_distance as usize;
+                let has_indel = alignment
+                    .cigar
+                    .ops()
+                    .iter()
+                    .any(|op| matches!(op, CigarOp::Ins(_) | CigarOp::Del(_)));
+                (new_nm < old_nm || (has_indel && new_nm <= old_nm))
+                    .then_some(alignment.cigar.into_ops())
+            });
+            if let Some(ops) = accepted {
+                repaired.extend(ops);
+            } else {
+                repaired.push(CigarOp::Match(to_u32_lossy(local_end - local_start)));
+            }
+            cursor = local_end;
+        }
+        if cursor < length {
+            repaired.push(CigarOp::Match(to_u32_lossy(length - cursor)));
+        }
+        query_pos += length;
+        reference_pos += length;
+    }
+    repaired
+}
+
+fn mismatch_islands(
+    query: &[u8],
+    reference: &[u8],
+    merge_distance: usize,
+) -> Vec<(usize, usize, usize)> {
+    let mut islands = Vec::new();
+    let mut current: Option<(usize, usize, usize)> = None;
+    for (position, (&query_base, &reference_base)) in query.iter().zip(reference).enumerate() {
+        if query_base.eq_ignore_ascii_case(&reference_base) {
+            continue;
+        }
+        match current.as_mut() {
+            Some((start, end, mismatches)) if position.saturating_sub(*end) <= merge_distance => {
+                *end = position;
+                *mismatches += 1;
+                let _ = start;
+            }
+            Some(_) => {
+                islands.push(current.take().expect("current island is present"));
+                current = Some((position, position, 1));
+            }
+            None => current = Some((position, position, 1)),
+        }
+    }
+    if let Some(island) = current {
+        islands.push(island);
+    }
+    islands
+}
+
+fn mismatch_count(query: &[u8], reference: &[u8]) -> usize {
+    query
+        .iter()
+        .zip(reference)
+        .filter(|(query_base, reference_base)| !query_base.eq_ignore_ascii_case(reference_base))
+        .count()
+}
+
+fn op_len(op: CigarOp) -> usize {
+    match op {
+        CigarOp::Match(length)
+        | CigarOp::Ins(length)
+        | CigarOp::Del(length)
+        | CigarOp::SoftClip(length) => length as usize,
+    }
+}
+
+fn to_u32_lossy(value: usize) -> u32 {
+    value.min(u32::MAX as usize) as u32
 }
 
 fn to_u32(value: usize) -> Result<u32, ChainCigarError> {
@@ -471,5 +798,119 @@ mod tests {
         let (cigar, _, _) =
             build_chain_cigar(Read::new("r", read), contig, &chain, &config()).unwrap();
         assert!(cigar.ops().iter().any(|op| matches!(op, CigarOp::Ins(1))));
+    }
+
+    #[test]
+    fn long_phase_shift_gap_is_split_by_an_exact_island() {
+        fn pseudo_sequence(length: usize, mut state: u32) -> Vec<u8> {
+            const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    BASES[(state >> 30) as usize]
+                })
+                .collect()
+        }
+
+        let left = pseudo_sequence(30, 1);
+        let reference_gap = pseudo_sequence(300, 2);
+        let insertion = pseudo_sequence(40, 3);
+        let right = pseudo_sequence(30, 4);
+
+        let mut reference = left.clone();
+        reference.extend_from_slice(&reference_gap);
+        reference.extend_from_slice(&right);
+
+        let mut read = left.clone();
+        read.extend_from_slice(&reference_gap[..120]);
+        read.extend_from_slice(&insertion);
+        read.extend_from_slice(&reference_gap[120..]);
+        read.extend_from_slice(&right);
+
+        let chain = Chain {
+            anchors: vec![
+                anchor(0, 30, 0, 30, Strand::Forward),
+                anchor(370, 400, 330, 360, Strand::Forward),
+            ],
+            score: 60,
+            q_start: 0,
+            q_end: 400,
+            ref_start: 0,
+            ref_end: 360,
+            query_covered_bases: 60,
+            query_covered_fraction: 0.15,
+            longest_anchor: 30,
+            max_query_gap: 340,
+            max_ref_gap: 300,
+            left_end_anchor_len: 30,
+            right_end_anchor_len: 30,
+            left_terminal_gap: 0,
+            right_terminal_gap: 0,
+            internal_only_chain: false,
+            is_primary: true,
+            split_candidate: false,
+        };
+        let contig = Contig {
+            id: ContigId(0),
+            name: "chr0",
+            sequence: &reference,
+        };
+
+        let (cigar, start, _) =
+            build_chain_cigar(Read::new("r", &read), contig, &chain, &config()).unwrap();
+        assert_eq!(start, 0);
+        assert!(cigar.ops().contains(&CigarOp::Ins(40)));
+        assert_eq!(cigar.query_len(), read.len() as u32);
+        assert_eq!(cigar.reference_len(), reference.len() as u32);
+    }
+
+    #[test]
+    fn match_island_repair_recovers_balanced_indel_pair() {
+        fn pseudo_sequence(length: usize, mut state: u32) -> Vec<u8> {
+            const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    BASES[(state >> 30) as usize]
+                })
+                .collect()
+        }
+
+        let reference = pseudo_sequence(100, 5);
+        let mut read = reference[..40].to_vec();
+        read.extend_from_slice(b"AC");
+        read.extend_from_slice(&reference[40..68]);
+        read.extend_from_slice(&reference[70..]);
+
+        let chain = Chain {
+            anchors: vec![anchor(0, 100, 0, 100, Strand::Forward)],
+            score: 100,
+            q_start: 0,
+            q_end: 100,
+            ref_start: 0,
+            ref_end: 100,
+            query_covered_bases: 100,
+            query_covered_fraction: 1.0,
+            longest_anchor: 100,
+            max_query_gap: 0,
+            max_ref_gap: 0,
+            left_end_anchor_len: 100,
+            right_end_anchor_len: 100,
+            left_terminal_gap: 0,
+            right_terminal_gap: 0,
+            internal_only_chain: false,
+            is_primary: true,
+            split_candidate: false,
+        };
+        let contig = Contig {
+            id: ContigId(0),
+            name: "chr0",
+            sequence: &reference,
+        };
+
+        let (cigar, _, _) =
+            build_chain_cigar(Read::new("r", &read), contig, &chain, &config()).unwrap();
+        assert!(cigar.ops().iter().any(|op| matches!(op, CigarOp::Ins(2))));
+        assert!(cigar.ops().iter().any(|op| matches!(op, CigarOp::Del(2))));
     }
 }

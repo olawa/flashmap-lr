@@ -9,6 +9,7 @@ use crate::{
     ReadDiagnostics, Reference, SeedIndex, WorkerPool, WorkerPoolError,
 };
 use std::convert::Infallible;
+use std::time::Instant;
 
 pub struct Aligner<'a> {
     reference: &'a dyn Reference,
@@ -57,6 +58,7 @@ impl<'a> Aligner<'a> {
     /// should wrap it in [`crate::WorkerPool`], which owns the reader,
     /// bounded batches, mapper workers, and ordered output sink.
     pub fn map(&self, read: Read<'_>) -> Result<MappingResult, MapError> {
+        let started = Instant::now();
         read.validate().map_err(MapError::InvalidRead)?;
 
         let mut diagnostics = ReadDiagnostics {
@@ -94,6 +96,20 @@ impl<'a> Aligner<'a> {
             }
         }
 
+        // A candidate can be emitted more than once when overlapping probe
+        // clusters cover the same locus.  Do not let those duplicate chains
+        // manufacture a low MAPQ as if they were independent placements.
+        let mut unique_placements = Vec::with_capacity(placements.len());
+        for placement in placements {
+            let duplicate = unique_placements.iter().any(|(contig, existing)| {
+                *contig == placement.0 && same_chain_placement(existing, &placement.1)
+            });
+            if !duplicate {
+                unique_placements.push(placement);
+            }
+        }
+        placements = unique_placements;
+
         placements.sort_by(|left, right| {
             right
                 .1
@@ -104,6 +120,7 @@ impl<'a> Aligner<'a> {
         });
 
         let Some((contig_id, chain)) = placements.first() else {
+            diagnostics.elapsed_nanos = elapsed_nanos(started);
             self.notify(read.name, &diagnostics);
             return Ok(MappingResult {
                 primary: None,
@@ -128,6 +145,7 @@ impl<'a> Aligner<'a> {
                     _ => 0,
                 })
             }));
+        diagnostics.elapsed_nanos = elapsed_nanos(started);
         self.notify(read.name, &diagnostics);
         Ok(MappingResult {
             primary: Some(primary),
@@ -164,6 +182,10 @@ fn saturating_u32(value: usize) -> u32 {
     value.min(u32::MAX as usize) as u32
 }
 
+fn elapsed_nanos(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
 fn mapping_quality(best_score: i32, second_score: Option<i32>) -> u8 {
     let Some(second_score) = second_score else {
         return 60;
@@ -172,6 +194,20 @@ fn mapping_quality(best_score: i32, second_score: Option<i32>) -> u8 {
         .saturating_sub(second_score)
         .saturating_mul(2)
         .clamp(0, 60) as u8
+}
+
+fn same_chain_placement(left: &crate::Chain, right: &crate::Chain) -> bool {
+    let Some(left_anchor) = left.anchors.first() else {
+        return false;
+    };
+    let Some(right_anchor) = right.anchors.first() else {
+        return false;
+    };
+    left_anchor.strand == right_anchor.strand
+        && left.q_start == right.q_start
+        && left.q_end == right.q_end
+        && left.ref_start == right.ref_start
+        && left.ref_end == right.ref_end
 }
 
 #[cfg(test)]

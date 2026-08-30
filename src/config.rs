@@ -10,9 +10,7 @@
 pub struct Config {
     pub seeding: SeedingConfig,
     pub candidates: CandidateConfig,
-    pub chaining: ChainingConfig,
     pub alignment: AlignmentConfig,
-    pub output: OutputConfig,
     pub worker_pool: WorkerPoolConfig,
 }
 
@@ -36,21 +34,9 @@ pub struct CandidateConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChainingConfig {
-    pub max_chain_gap: usize,
-    pub enable_pass2: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlignmentConfig {
     pub bridge_flank: usize,
     pub bridge_max_gap: usize,
-    pub enable_m_island_repair: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OutputConfig {
-    pub emit_supplementary: bool,
 }
 
 /// Runtime settings for the one supported scheduler.
@@ -96,17 +82,9 @@ impl Default for Config {
                 max_anchors_per_region: 512,
                 diagonal_tolerance: 2_000,
             },
-            chaining: ChainingConfig {
-                max_chain_gap: 5_000,
-                enable_pass2: true,
-            },
             alignment: AlignmentConfig {
                 bridge_flank: 256,
                 bridge_max_gap: 5_000,
-                enable_m_island_repair: true,
-            },
-            output: OutputConfig {
-                emit_supplementary: false,
             },
             worker_pool: WorkerPoolConfig::default(),
         }
@@ -168,11 +146,6 @@ impl Config {
         if self.candidates.diagonal_tolerance < 0 {
             return Err(ConfigError::new(
                 "candidates.diagonal_tolerance cannot be negative",
-            ));
-        }
-        if self.chaining.max_chain_gap == 0 {
-            return Err(ConfigError::new(
-                "chaining.max_chain_gap must be greater than zero",
             ));
         }
         if self.alignment.bridge_max_gap < self.alignment.bridge_flank {

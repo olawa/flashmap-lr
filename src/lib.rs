@@ -24,8 +24,7 @@ pub use anchors::{find_anchors, Anchor, AnchorError};
 pub use candidates::{cluster_probe_hits, CandidateRegion};
 pub use chain::{chain_anchors, Chain, ChainSet, MAX_ITER as CHAIN_MAX_ITER};
 pub use config::{
-    AlignmentConfig, CandidateConfig, ChainingConfig, Config, ConfigError, OutputConfig,
-    SeedingConfig, WorkerPoolConfig,
+    AlignmentConfig, CandidateConfig, Config, ConfigError, SeedingConfig, WorkerPoolConfig,
 };
 pub use diagnostics::{DiagnosticsSink, ReadDiagnostics};
 pub use dp::{align_full, align_local, LocalAlignment};

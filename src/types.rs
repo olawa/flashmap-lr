@@ -303,9 +303,21 @@ impl Cigar {
         I: IntoIterator<Item = CigarOp>,
     {
         let mut normalized: Vec<CigarOp> = Vec::new();
+        let mut query_len = 0u32;
+        let mut reference_len = 0u32;
         for op in ops {
             if op.len() == 0 {
                 return Err(CigarError::ZeroLength);
+            }
+            if op.consumes_query() {
+                query_len = query_len
+                    .checked_add(op.len())
+                    .ok_or(CigarError::LengthOverflow)?;
+            }
+            if op.consumes_reference() {
+                reference_len = reference_len
+                    .checked_add(op.len())
+                    .ok_or(CigarError::LengthOverflow)?;
             }
             if let Some(last) = normalized.last_mut() {
                 if last.same_kind(op) {
@@ -529,6 +541,18 @@ mod tests {
         );
         assert_eq!(cigar.query_len(), 10);
         assert_eq!(cigar.reference_len(), 10);
+    }
+
+    #[test]
+    fn cigar_rejects_total_query_or_reference_length_overflow() {
+        assert_eq!(
+            Cigar::new([CigarOp::Match(u32::MAX), CigarOp::Match(1)]),
+            Err(CigarError::LengthOverflow)
+        );
+        assert_eq!(
+            Cigar::new([CigarOp::Ins(u32::MAX), CigarOp::Ins(1)]),
+            Err(CigarError::LengthOverflow)
+        );
     }
 
     #[test]
