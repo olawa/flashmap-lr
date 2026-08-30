@@ -318,6 +318,8 @@ fn append_gap_recursive(
 ) -> Result<(), ChainCigarError> {
     const SMALL_GAP_DP_MAX: usize = 192;
     const SMALL_GAP_DP_DELTA_MAX: usize = 32;
+    const MEDIUM_GAP_DP_MAX: usize = 1_024;
+    const MEDIUM_GAP_DP_DELTA_MAX: usize = 64;
     const RECURSIVE_SPLIT_K: usize = 13;
     const RECURSIVE_SPLIT_MAX_DEPTH: usize = 8;
 
@@ -399,6 +401,22 @@ fn append_gap_recursive(
                 )?;
                 return Ok(());
             }
+        }
+    }
+
+    // The default LR profile gives medium, near-diagonal gaps one bounded
+    // end-to-end KSW2 attempt after exact-island recursion. This keeps the
+    // common 200--1024 bp phase-shift case faithful to FlashMap without
+    // allowing a quadratic DP call on an arbitrarily large gap.
+    if max_gap <= config.alignment.bridge_max_gap
+        && max_gap <= MEDIUM_GAP_DP_MAX
+        && delta <= MEDIUM_GAP_DP_DELTA_MAX
+        && query_len.saturating_mul(reference_len) <= 16_000_000
+    {
+        let band = delta.saturating_add(16).clamp(32, 64);
+        if let Some(alignment) = align_full(query_slice, reference_slice, band) {
+            ops.extend(alignment.cigar.into_ops());
+            return Ok(());
         }
     }
 
