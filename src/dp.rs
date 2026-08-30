@@ -1,0 +1,205 @@
+//! The fixed local-DP backend used by the RS-LRA default path.
+//!
+//! This is intentionally a small KSW2 adapter.  It keeps the C library's
+//! representation and thread-local mutable aligner behind this module; the
+//! rest of RS-LRA only sees a validated neutral CIGAR.
+
+use crate::{types::cigar_edit_distance, Cigar, CigarOp};
+use std::cell::RefCell;
+
+const MAX_WINDOW: usize = 8_192;
+const MAX_CELLS: usize = 16_000_000;
+const MATCH_SCORE: i8 = 2;
+const MISMATCH_PENALTY: i8 = 4;
+const GAP_OPEN: i8 = 6;
+const GAP_EXTEND: i8 = 1;
+
+thread_local! {
+    static KSW2_ALIGNER: RefCell<ksw2rs::Aligner> = RefCell::new(ksw2rs::Aligner::new());
+    static QUERY_DNA5: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static REFERENCE_DNA5: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalAlignment {
+    pub score: i32,
+    pub query_start: usize,
+    pub query_end: usize,
+    pub ref_start: usize,
+    pub ref_end: usize,
+    pub cigar: Cigar,
+    pub edit_distance: u32,
+}
+
+/// Run the default KSW2 local extension over one bounded query/reference gap.
+///
+/// The returned coordinates are relative to the supplied slices.  KSW2's
+/// extension CIGAR is trimmed of trailing indels, matching FlashMap's LR
+/// adapter; callers must still validate that the resulting consumption fits
+/// their anchor geometry.
+pub fn align_local(query: &[u8], reference: &[u8], band_width: usize) -> Option<LocalAlignment> {
+    if query.is_empty() || reference.is_empty() {
+        return None;
+    }
+    if query.len().max(reference.len()) > MAX_WINDOW
+        || query.len().saturating_mul(reference.len()) > MAX_CELLS
+    {
+        return None;
+    }
+
+    let band_width = band_width.clamp(1, MAX_WINDOW);
+    let (score, raw_cigar) = KSW2_ALIGNER.with(|aligner_cell| {
+        QUERY_DNA5.with(|query_cell| {
+            REFERENCE_DNA5.with(|reference_cell| {
+                let mut query_dna5 = query_cell.borrow_mut();
+                let mut reference_dna5 = reference_cell.borrow_mut();
+                encode_dna5(query, &mut query_dna5);
+                encode_dna5(reference, &mut reference_dna5);
+
+                let matrix = dna5_matrix();
+                let input = ksw2rs::Extz2Input {
+                    query: &query_dna5,
+                    target: &reference_dna5,
+                    m: 5,
+                    mat: &matrix,
+                    q: GAP_OPEN,
+                    e: GAP_EXTEND,
+                    w: band_width as i32,
+                    zdrop: 100,
+                    end_bonus: 0,
+                    flag: ksw2rs::KSW_EZ_EXTZ_ONLY,
+                };
+                let mut aligner = aligner_cell.borrow_mut();
+                let extension = aligner.align(&input);
+                (extension.max, extension.cigar.clone())
+            })
+        })
+    });
+
+    let ops = raw_cigar_to_ops(&raw_cigar);
+    if ops.is_empty() {
+        return None;
+    }
+    let cigar = Cigar::new(ops).ok()?;
+    let query_consumed = cigar.query_len() as usize;
+    let ref_consumed = cigar.reference_len() as usize;
+    if query_consumed == 0
+        || ref_consumed == 0
+        || query_consumed > query.len()
+        || ref_consumed > reference.len()
+    {
+        return None;
+    }
+    let query_start = query.len() - query_consumed;
+    let ref_start = reference.len() - ref_consumed;
+    let query_slice = &query[query_start..];
+    let ref_slice = &reference[ref_start..];
+    let edit_distance = cigar_edit_distance(&cigar, query_slice, ref_slice)?;
+
+    Some(LocalAlignment {
+        score: score as i32,
+        query_start,
+        query_end: query.len(),
+        ref_start,
+        ref_end: reference.len(),
+        cigar,
+        edit_distance,
+    })
+}
+
+fn encode_dna5(sequence: &[u8], output: &mut Vec<u8>) {
+    output.clear();
+    output.reserve(sequence.len());
+    output.extend(sequence.iter().map(|base| match base {
+        b'A' | b'a' => 0,
+        b'C' | b'c' => 1,
+        b'G' | b'g' => 2,
+        b'T' | b't' => 3,
+        _ => 4,
+    }));
+}
+
+fn dna5_matrix() -> [i8; 25] {
+    let mut matrix = [-MISMATCH_PENALTY; 25];
+    for base in 0..5 {
+        matrix[base * 5 + base] = MATCH_SCORE;
+    }
+    // Ambiguous bases neither reward nor penalize an aligned comparison.
+    matrix[24] = 0;
+    matrix
+}
+
+fn raw_cigar_to_ops(raw: &[u32]) -> Vec<CigarOp> {
+    let mut end = raw.len();
+    while end > 0 {
+        let op = raw[end - 1] & 0xf;
+        if op == 1 || op == 2 {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+
+    let mut ops = Vec::new();
+    for &packed in &raw[..end] {
+        let len = packed >> 4;
+        if len == 0 {
+            continue;
+        }
+        match packed & 0xf {
+            0 => ops.push(CigarOp::Match(len)),
+            1 => ops.push(CigarOp::Ins(len)),
+            2 => ops.push(CigarOp::Del(len)),
+            3 => ops.push(CigarOp::SoftClip(len)),
+            _ => return Vec::new(),
+        }
+    }
+    ops
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dna5_encoding_accepts_lowercase_and_n() {
+        let mut encoded = Vec::new();
+        encode_dna5(b"aCgTNx", &mut encoded);
+        assert_eq!(encoded, vec![0, 1, 2, 3, 4, 4]);
+    }
+
+    #[test]
+    fn raw_cigar_decoder_trims_terminal_indels() {
+        assert_eq!(
+            raw_cigar_to_ops(&[(3 << 4), (2 << 4) | 1, (1 << 4) | 2]),
+            vec![CigarOp::Match(3)]
+        );
+    }
+
+    #[test]
+    fn exact_window_maps_with_fixed_ksw2_scoring() {
+        let alignment = align_local(b"ACGTACGT", b"ACGTACGT", 32).unwrap();
+        assert_eq!(alignment.cigar.ops(), &[CigarOp::Match(8)]);
+        assert_eq!(alignment.edit_distance, 0);
+        assert_eq!(alignment.query_start, 0);
+        assert_eq!(alignment.ref_start, 0);
+    }
+
+    #[test]
+    fn mismatch_stays_inside_match_operation_and_counts_in_nm() {
+        let alignment = align_local(b"ACGTTCGT", b"ACGTACGT", 32).unwrap();
+        assert_eq!(alignment.cigar.ops(), &[CigarOp::Match(8)]);
+        assert_eq!(alignment.edit_distance, 1);
+    }
+
+    #[test]
+    fn short_insertion_is_reported_as_an_indel() {
+        let alignment = align_local(b"ACGTTACGT", b"ACGTACGT", 32).unwrap();
+        assert!(alignment
+            .cigar
+            .ops()
+            .iter()
+            .any(|op| matches!(op, CigarOp::Ins(1))));
+        assert_eq!(alignment.edit_distance, 1);
+    }
+}

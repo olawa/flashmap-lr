@@ -310,6 +310,52 @@ impl Cigar {
     }
 }
 
+/// Compute NM for an aligned query/reference slice pair.
+pub(crate) fn cigar_edit_distance(cigar: &Cigar, query: &[u8], reference: &[u8]) -> Option<u32> {
+    let mut query_pos = 0usize;
+    let mut reference_pos = 0usize;
+    let mut edit_distance = 0u32;
+
+    for &op in cigar.ops() {
+        match op {
+            CigarOp::Match(length) => {
+                let length = length as usize;
+                let query_end = query_pos.checked_add(length)?;
+                let reference_end = reference_pos.checked_add(length)?;
+                let query_window = query.get(query_pos..query_end)?;
+                let reference_window = reference.get(reference_pos..reference_end)?;
+                edit_distance = edit_distance.checked_add(
+                    query_window
+                        .iter()
+                        .zip(reference_window)
+                        .filter(|(query_base, reference_base)| query_base != reference_base)
+                        .count() as u32,
+                )?;
+                query_pos = query_end;
+                reference_pos = reference_end;
+            }
+            CigarOp::Ins(length) => {
+                let length = length as usize;
+                query_pos = query_pos.checked_add(length)?;
+                query.get(query_pos - length..query_pos)?;
+                edit_distance = edit_distance.checked_add(length as u32)?;
+            }
+            CigarOp::Del(length) => {
+                let length = length as usize;
+                reference_pos = reference_pos.checked_add(length)?;
+                reference.get(reference_pos - length..reference_pos)?;
+                edit_distance = edit_distance.checked_add(length as u32)?;
+            }
+            CigarOp::SoftClip(length) => {
+                query_pos = query_pos.checked_add(length as usize)?;
+                query.get(query_pos - length as usize..query_pos)?;
+            }
+        }
+    }
+
+    (query_pos == query.len() && reference_pos == reference.len()).then_some(edit_distance)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CigarError {
     Empty,

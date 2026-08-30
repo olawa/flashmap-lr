@@ -443,8 +443,10 @@ fn reader_loop<I, R, E>(
 
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+type RawReceiver<R, E> = Arc<Mutex<Receiver<Result<ReadBatch<R>, E>>>>;
+
 fn worker_loop<R, T, SE, ME, F>(
-    raw_rx: Arc<Mutex<Receiver<Result<ReadBatch<R>, SE>>>>,
+    raw_rx: RawReceiver<R, SE>,
     mapped_tx: SyncSender<Result<MappedBatch<T>, InternalFailure<SE, ME>>>,
     mapper: &F,
     cancellation: Arc<AtomicBool>,
@@ -631,7 +633,7 @@ mod tests {
     fn source_and_mapper_errors_are_forwarded() {
         let pool = WorkerPool::new(config(2, 1, None)).unwrap();
         let source = vec![Ok(1), Ok(2), Err("source")].into_iter();
-        let error = pool.map(source, |value| Ok::<_, &str>(value)).unwrap_err();
+        let error = pool.map(source, Ok::<_, &str>).unwrap_err();
         assert!(matches!(error, WorkerPoolError::Source("source")));
 
         let source = (0..4).map(Ok::<_, Infallible>);
