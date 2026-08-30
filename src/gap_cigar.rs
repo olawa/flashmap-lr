@@ -428,6 +428,56 @@ fn append_gap_recursive(
         }
     }
 
+    // For a long gap, keep the expensive DP work at the two ends where it
+    // can actually recover local substitutions/indels.  The middle span is
+    // still represented deterministically from its length difference.  This
+    // is the bounded flank rescue in FlashMap's default LR path: it avoids a
+    // quadratic call over a multi-kilobase bridge while preserving the
+    // sequence context around the sparse anchors.
+    const FLANK_MAX: usize = 64;
+    const FLANK_MIN: usize = 16;
+    let flank = FLANK_MAX.min(query_len / 2).min(reference_len / 2);
+    if flank >= FLANK_MIN {
+        let flank_band = query_len
+            .abs_diff(reference_len)
+            .min(FLANK_MAX)
+            .saturating_add(32)
+            .max(64);
+        let left = align_full(
+            &query[query_start..query_start + flank],
+            &reference[ref_start..ref_start + flank],
+            flank_band,
+        );
+        let right = align_full(
+            &query[query_end - flank..query_end],
+            &reference[ref_end - flank..ref_end],
+            flank_band,
+        );
+
+        if let (Some(left), Some(right)) = (left, right) {
+            ops.extend(left.cigar.into_ops());
+
+            let middle_query_len = query_len - 2 * flank;
+            let middle_reference_len = reference_len - 2 * flank;
+            let common = middle_query_len.min(middle_reference_len);
+            if common > 0 {
+                ops.push(CigarOp::Match(to_u32(common)?));
+            }
+            if middle_query_len > middle_reference_len {
+                ops.push(CigarOp::Ins(to_u32(
+                    middle_query_len - middle_reference_len,
+                )?));
+            } else if middle_reference_len > middle_query_len {
+                ops.push(CigarOp::Del(to_u32(
+                    middle_reference_len - middle_query_len,
+                )?));
+            }
+
+            ops.extend(right.cigar.into_ops());
+            return Ok(());
+        }
+    }
+
     let common = query_len.min(reference_len);
     if common > 0 {
         ops.push(CigarOp::Match(to_u32(common)?));
@@ -1111,6 +1161,35 @@ mod tests {
             build_chain_cigar(Read::new("r", &read), contig, &chain, &config()).unwrap();
         assert_eq!(start, 0);
         assert!(cigar.ops().contains(&CigarOp::Ins(40)));
+        assert_eq!(cigar.query_len(), read.len() as u32);
+        assert_eq!(cigar.reference_len(), reference.len() as u32);
+    }
+
+    #[test]
+    fn long_repetitive_gap_uses_bounded_flank_rescue() {
+        // The repetitive middle deliberately has no safe exact island: the
+        // reference k-mer bucket is over the uniqueness cap.  The bounded
+        // flank DP must still recover the two-base insertion at the left end
+        // while the middle is emitted without a quadratic whole-gap call.
+        let reference = b"AC".repeat(1_032);
+        let mut read = reference[..64].to_vec();
+        read.extend_from_slice(b"GG");
+        read.extend_from_slice(&reference[64..]);
+
+        let mut ops = Vec::new();
+        append_gap(
+            &mut ops,
+            &read,
+            &reference,
+            0,
+            read.len(),
+            0,
+            reference.len(),
+            &config(),
+        )
+        .unwrap();
+        let cigar = Cigar::new(ops).unwrap();
+        assert!(cigar.ops().iter().any(|op| matches!(op, CigarOp::Ins(2))));
         assert_eq!(cigar.query_len(), read.len() as u32);
         assert_eq!(cigar.reference_len(), reference.len() as u32);
     }

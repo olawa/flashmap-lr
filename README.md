@@ -17,9 +17,10 @@ read/reference types, diagnostics hooks, read segmentation, sparse backbone
 probe selection, DNA candidate clustering, exact anchor discovery, fixed
 Minimap-DP chaining, fixed KSW2 local/end-to-end DP, chain CIGAR assembly, and
 the ordered worker-pool runner. `Aligner::map` now exercises that fixed path,
-including the default exact-island gap split and bounded M-island repair;
-endpoint attachment and output adapters still need differential testing
-against FlashMap before claiming full production parity.
+including the default exact-island gap split, bounded long-gap flank rescue,
+and bounded M-island repair; endpoint attachment and output adapters still
+need differential testing against FlashMap before claiming full production
+parity.
 
 The extraction rule is: design the interface from scratch, but port the
 verified implementation and tests in small commits. FlashMap remains the

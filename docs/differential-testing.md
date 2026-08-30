@@ -17,7 +17,9 @@ The first fixtures should be small and deterministic:
 - exact forward and reverse reads;
 - one SNP inside an anchored span;
 - one insertion and one deletion in a unique sequence;
-- phase-shifted gaps longer than 192 bp and up to the 5,000 bp bridge limit;
+- phase-shifted gaps longer than 192 bp and up to the 5,000 bp bridge limit,
+  including a gap with no exact internal island so the bounded 64 bp flank
+  rescue is exercised;
 - homopolymer/tandem-repeat indels to check left alignment;
 - soft-clipped leading and trailing query sequence;
 - repetitive or sampled seed buckets that must not create a placement.
