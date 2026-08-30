@@ -1,0 +1,17 @@
+[package]
+name = "rs-lra"
+version = "0.1.0"
+edition = "2021"
+description = "Rapid Sparse Long-Read Aligner"
+license = "MIT"
+readme = "README.md"
+
+[lib]
+name = "rs_lra"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rs-lra"
+path = "src/main.rs"
+
+[dependencies]
