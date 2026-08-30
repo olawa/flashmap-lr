@@ -13,6 +13,10 @@ for the same read and reference:
 6. final reference start, normalized CIGAR, NM, and aligned query/reference
    consumption.
 
+The current core intentionally records terminal DP rescue, score-aware
+endpoint clipping, seed-tier escalation, and endpoint attachment as pending
+parity work rather than silently approximating those policies.
+
 The first fixtures should be small and deterministic:
 
 - exact forward and reverse reads;
