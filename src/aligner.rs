@@ -5,8 +5,8 @@
 
 use crate::{
     build_chain_alignment, chain_anchors, cluster_probe_hits, extract_read_probes, find_anchors,
-    Config, ConfigError, DiagnosticsSink, MapError, MappingResult, OwnedRead, Read,
-    ReadDiagnostics, Reference, SeedIndex, WorkerPool, WorkerPoolError,
+    Config, ConfigError, DiagnosticsSink, MapError, MappedRead, MappingResult, OwnedRead, Read,
+    ReadDiagnostics, Reference, SeedIndex, WorkerPool, WorkerPoolError, WorkerPoolStats,
 };
 use std::convert::Infallible;
 use std::time::Instant;
@@ -158,17 +158,56 @@ impl<'a> Aligner<'a> {
     ///
     /// The source error type is preserved for adapters (for example a FASTQ
     /// decoder). Mapping remains per-read and deterministic; the pool only
-    /// supplies parallelism and ordered collection.
+    /// supplies parallelism and ordered collection. Read names are retained
+    /// in each [`MappedRead`] so callers can emit records without a parallel
+    /// name stream.
     pub fn map_with_worker_pool<I, SourceError>(
         &self,
         pool: &WorkerPool,
         source: I,
-    ) -> Result<Vec<MappingResult>, WorkerPoolError<SourceError, MapError, Infallible>>
+    ) -> Result<Vec<MappedRead>, WorkerPoolError<SourceError, MapError, Infallible>>
     where
         I: IntoIterator<Item = Result<OwnedRead, SourceError>> + Send,
         SourceError: Send,
     {
-        pool.map(source, |owned_read| self.map(owned_read.as_read()))
+        pool.map(source, |owned_read| {
+            let name = owned_read.name.clone();
+            let mapping = self.map(owned_read.as_read())?;
+            Ok::<MappedRead, MapError>(MappedRead { name, mapping })
+        })
+    }
+
+    /// Stream ordered mapping results through the worker pool.
+    ///
+    /// This is the bounded-memory entry point for FASTQ/FASTA adapters. The
+    /// callback runs on the caller thread, once per read in source order; it
+    /// can write SAM records immediately instead of retaining a whole WGS
+    /// result set. The source read name is preserved in [`MappedRead`].
+    pub fn map_with_worker_pool_sink<I, SourceError, SinkError, Sink>(
+        &self,
+        pool: &WorkerPool,
+        source: I,
+        mut sink: Sink,
+    ) -> Result<WorkerPoolStats, WorkerPoolError<SourceError, MapError, SinkError>>
+    where
+        I: IntoIterator<Item = Result<OwnedRead, SourceError>> + Send,
+        SourceError: Send,
+        Sink: FnMut(MappedRead) -> Result<(), SinkError>,
+    {
+        pool.run(
+            source,
+            |owned_read| {
+                let name = owned_read.name.clone();
+                let mapping = self.map(owned_read.as_read())?;
+                Ok::<MappedRead, MapError>(MappedRead { name, mapping })
+            },
+            |batch| {
+                for result in batch.into_results() {
+                    sink(result)?;
+                }
+                Ok(())
+            },
+        )
     }
 
     fn notify(&self, read_name: &str, diagnostics: &ReadDiagnostics) {
@@ -323,7 +362,41 @@ mod tests {
         ];
         let results = aligner.map_with_worker_pool(&pool, reads).unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|result| result.primary.is_some()));
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r0", "r1"]
+        );
+        assert!(results
+            .iter()
+            .all(|result| result.mapping.primary.is_some()));
+    }
+
+    #[test]
+    fn worker_pool_sink_receives_results_in_source_order() {
+        let aligner = test_aligner();
+        let pool = WorkerPool::new(crate::WorkerPoolConfig {
+            workers: 2,
+            chunk_size: 1,
+            reader_batch_size: None,
+        })
+        .unwrap();
+        let reads: Vec<Result<OwnedRead, Infallible>> = vec![
+            Ok(OwnedRead::new("r0", b"ACGT".repeat(25))),
+            Ok(OwnedRead::new("r1", b"ACGT".repeat(25))),
+        ];
+        let mut names = Vec::new();
+        let stats = aligner
+            .map_with_worker_pool_sink(&pool, reads, |result| {
+                assert!(result.mapping.primary.is_some());
+                names.push(result.name);
+                Ok::<(), Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(names, vec!["r0".to_string(), "r1".to_string()]);
+        assert_eq!(stats.reads_written, 2);
     }
 
     #[test]

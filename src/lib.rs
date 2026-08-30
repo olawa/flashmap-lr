@@ -35,7 +35,8 @@ pub use probes::{extract_backbone_probes, extract_read_probes, Probe};
 pub use segment::{segment_read, Segment};
 pub use types::{
     Alignment, AlignmentError, Cigar, CigarError, CigarOp, Contig, ContigId, HitCompleteness,
-    MappingResult, OwnedRead, QuerySeed, Read, ReadError, SeedHit, SeedKey, SeedLookup, Strand,
+    MappedRead, MappingResult, OwnedRead, QuerySeed, Read, ReadError, SeedHit, SeedKey, SeedLookup,
+    Strand,
 };
 pub use worker_pool::{
     MappedBatch, ReadBatch, WorkerPool, WorkerPoolConfigError, WorkerPoolError, WorkerPoolStats,

@@ -516,6 +516,17 @@ pub struct MappingResult {
     pub diagnostics: Option<crate::ReadDiagnostics>,
 }
 
+/// A mapping result paired with the source read name.
+///
+/// The per-read [`crate::Aligner::map`] kernel intentionally works with a
+/// borrowed [`Read`] and returns only alignment data. Stream adapters use this
+/// wrapper when they need to write read names alongside ordered results.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MappedRead {
+    pub name: String,
+    pub mapping: MappingResult,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
