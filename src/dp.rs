@@ -107,6 +107,76 @@ pub fn align_local(query: &[u8], reference: &[u8], band_width: usize) -> Option<
     })
 }
 
+/// Run the fixed KSW2 affine-gap alignment while requiring both supplied
+/// slices to be consumed end-to-end.
+///
+/// This is the gap-assembly companion to [`align_local`].  It uses the same
+/// scoring matrix and gap penalties, but leaves KSW2's extension-only flag
+/// off so traceback is anchored at both ends.  Returning `None` on a
+/// truncated/soft-clipped traceback keeps callers from silently emitting a
+/// CIGAR that does not cover the complete internal gap.
+pub fn align_full(query: &[u8], reference: &[u8], band_width: usize) -> Option<LocalAlignment> {
+    if query.is_empty() || reference.is_empty() {
+        return None;
+    }
+    if query.len().max(reference.len()) > MAX_WINDOW
+        || query.len().saturating_mul(reference.len()) > MAX_CELLS
+    {
+        return None;
+    }
+
+    let band_width = band_width.clamp(1, MAX_WINDOW);
+    let (score, raw_cigar) = KSW2_ALIGNER.with(|aligner_cell| {
+        QUERY_DNA5.with(|query_cell| {
+            REFERENCE_DNA5.with(|reference_cell| {
+                let mut query_dna5 = query_cell.borrow_mut();
+                let mut reference_dna5 = reference_cell.borrow_mut();
+                encode_dna5(query, &mut query_dna5);
+                encode_dna5(reference, &mut reference_dna5);
+
+                let matrix = dna5_matrix();
+                let input = ksw2rs::Extz2Input {
+                    query: &query_dna5,
+                    target: &reference_dna5,
+                    m: 5,
+                    mat: &matrix,
+                    q: GAP_OPEN,
+                    e: GAP_EXTEND,
+                    w: band_width as i32,
+                    zdrop: 100,
+                    end_bonus: 0,
+                    flag: 0,
+                };
+                let mut aligner = aligner_cell.borrow_mut();
+                let extension = aligner.align(&input);
+                (extension.score, extension.cigar.clone())
+            })
+        })
+    });
+
+    let ops = raw_cigar_to_ops_full(&raw_cigar);
+    if ops.is_empty() || ops.iter().any(|op| matches!(op, CigarOp::SoftClip(_))) {
+        return None;
+    }
+    let cigar = Cigar::new(ops).ok()?;
+    if cigar.query_len() as usize != query.len()
+        || cigar.reference_len() as usize != reference.len()
+    {
+        return None;
+    }
+    let edit_distance = cigar_edit_distance(&cigar, query, reference)?;
+
+    Some(LocalAlignment {
+        score,
+        query_start: 0,
+        query_end: query.len(),
+        ref_start: 0,
+        ref_end: reference.len(),
+        cigar,
+        edit_distance,
+    })
+}
+
 fn encode_dna5(sequence: &[u8], output: &mut Vec<u8>) {
     output.clear();
     output.reserve(sequence.len());
@@ -130,13 +200,23 @@ fn dna5_matrix() -> [i8; 25] {
 }
 
 fn raw_cigar_to_ops(raw: &[u32]) -> Vec<CigarOp> {
+    raw_cigar_to_ops_with_terminal_policy(raw, true)
+}
+
+fn raw_cigar_to_ops_full(raw: &[u32]) -> Vec<CigarOp> {
+    raw_cigar_to_ops_with_terminal_policy(raw, false)
+}
+
+fn raw_cigar_to_ops_with_terminal_policy(raw: &[u32], trim_terminal_indels: bool) -> Vec<CigarOp> {
     let mut end = raw.len();
-    while end > 0 {
-        let op = raw[end - 1] & 0xf;
-        if op == 1 || op == 2 {
-            end -= 1;
-        } else {
-            break;
+    if trim_terminal_indels {
+        while end > 0 {
+            let op = raw[end - 1] & 0xf;
+            if op == 1 || op == 2 {
+                end -= 1;
+            } else {
+                break;
+            }
         }
     }
 
@@ -201,5 +281,27 @@ mod tests {
             .iter()
             .any(|op| matches!(op, CigarOp::Ins(1))));
         assert_eq!(alignment.edit_distance, 1);
+    }
+
+    #[test]
+    fn full_alignment_consumes_both_slices() {
+        let alignment = align_full(b"AAA", b"AATAA", 32).unwrap();
+        assert_eq!(alignment.query_start, 0);
+        assert_eq!(alignment.ref_end, 5);
+        assert_eq!(alignment.cigar.query_len(), 3);
+        assert_eq!(alignment.cigar.reference_len(), 5);
+        assert_eq!(alignment.edit_distance, 2);
+    }
+
+    #[test]
+    fn full_alignment_keeps_terminal_indels() {
+        let alignment = align_full(b"AAAA", b"AAA", 32).unwrap();
+        assert_eq!(alignment.cigar.query_len(), 4);
+        assert_eq!(alignment.cigar.reference_len(), 3);
+        assert!(alignment
+            .cigar
+            .ops()
+            .iter()
+            .any(|op| matches!(op, CigarOp::Ins(1))));
     }
 }

@@ -12,6 +12,46 @@ pub struct Read<'a> {
     pub qualities: Option<&'a [u8]>,
 }
 
+/// An owned read suitable for hand-off to [`crate::WorkerPool`].
+///
+/// Adapters can decode FASTQ/FASTA records into this small container without
+/// exposing their parser or lifetime to the mapper workers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedRead {
+    pub name: String,
+    pub sequence: Vec<u8>,
+    pub qualities: Option<Vec<u8>>,
+}
+
+impl OwnedRead {
+    pub fn new(name: impl Into<String>, sequence: impl Into<Vec<u8>>) -> Self {
+        Self {
+            name: name.into(),
+            sequence: sequence.into(),
+            qualities: None,
+        }
+    }
+
+    pub fn with_qualities(
+        name: impl Into<String>,
+        sequence: impl Into<Vec<u8>>,
+        qualities: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            sequence: sequence.into(),
+            qualities: Some(qualities.into()),
+        }
+    }
+
+    pub fn as_read(&self) -> Read<'_> {
+        match self.qualities.as_deref() {
+            Some(qualities) => Read::with_qualities(&self.name, &self.sequence, qualities),
+            None => Read::new(&self.name, &self.sequence),
+        }
+    }
+}
+
 impl<'a> Read<'a> {
     pub const fn new(name: &'a str, sequence: &'a [u8]) -> Self {
         Self {
@@ -328,7 +368,9 @@ pub(crate) fn cigar_edit_distance(cigar: &Cigar, query: &[u8], reference: &[u8])
                     query_window
                         .iter()
                         .zip(reference_window)
-                        .filter(|(query_base, reference_base)| query_base != reference_base)
+                        .filter(|(query_base, reference_base)| {
+                            !query_base.eq_ignore_ascii_case(reference_base)
+                        })
                         .count() as u32,
                 )?;
                 query_pos = query_end;

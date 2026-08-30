@@ -12,6 +12,7 @@ mod config;
 mod diagnostics;
 mod dp;
 mod errors;
+mod gap_cigar;
 mod index;
 mod probes;
 mod segment;
@@ -27,14 +28,15 @@ pub use config::{
     SeedingConfig, WorkerPoolConfig,
 };
 pub use diagnostics::{DiagnosticsSink, ReadDiagnostics};
-pub use dp::{align_local, LocalAlignment};
+pub use dp::{align_full, align_local, LocalAlignment};
 pub use errors::MapError;
+pub use gap_cigar::{build_chain_alignment, build_chain_cigar, ChainCigarError};
 pub use index::{collect_hits, Reference, SeedIndex};
 pub use probes::{extract_backbone_probes, extract_read_probes, Probe};
 pub use segment::{segment_read, Segment};
 pub use types::{
     Alignment, AlignmentError, Cigar, CigarError, CigarOp, Contig, ContigId, HitCompleteness,
-    MappingResult, QuerySeed, Read, ReadError, SeedHit, SeedKey, SeedLookup, Strand,
+    MappingResult, OwnedRead, QuerySeed, Read, ReadError, SeedHit, SeedKey, SeedLookup, Strand,
 };
 pub use worker_pool::{
     MappedBatch, ReadBatch, WorkerPool, WorkerPoolConfigError, WorkerPoolError, WorkerPoolStats,
