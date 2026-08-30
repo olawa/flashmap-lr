@@ -107,7 +107,7 @@ pub struct Contig<'a> {
 /// packed minimizer index currently used by FlashMap while still allowing a
 /// future adapter to assign another meaning.  `QuerySeed::key` is only meant
 /// to be passed back to the same [`crate::SeedIndex`] implementation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct SeedKey {
     first: u64,
     second: u64,
