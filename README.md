@@ -27,6 +27,9 @@ temporary behavioral oracle; it is not copied wholesale into this repository.
 `Config::default()` is the single algorithm profile and `WorkerPoolConfig` is
 the only execution configuration.
 
+The phase-by-phase comparison checklist is in
+[`docs/differential-testing.md`](docs/differential-testing.md).
+
 ## Development
 
 ```text
