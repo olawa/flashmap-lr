@@ -244,7 +244,7 @@ pub fn find_anchors(
     let mut kmer_hits = 0usize;
     let max_kmer_hits = policy
         .max_local_kmer_hits
-        .max((read.sequence.len() / 1000) * 1000);
+        .max(read.sequence.len().div_ceil(1000) * 1000);
     let mut full_span_found = false;
 
     // Paired positions are scanned first. A paired hit list is authoritative
