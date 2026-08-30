@@ -2,10 +2,12 @@
 
 **Rapid Sparse Long-Read Aligner**
 
-RS-LRA is a standalone Rust project for a sparse long-read alignment
+RS-LRA is a standalone Rust project for the sparse long-read alignment
 algorithm. The core API is independent of FlashMap's index representation and
-of SAM/BAM encoding. The first implementation target is the stable DNA/HiFi
-LR path; RNA, SR dispatch, truth/evidence reporting, and experiment-only
+of SAM/BAM encoding. The first target is one path only: FlashMap's current LR
+default (`HiFiBalanced`, with its resolved KSW2 local DP and Minimap-DP chain),
+run through a worker pool. RNA, SR dispatch, truth/evidence reporting,
+alternate DP/chain backends, alternate seed profiles, and experiment-only
 switches stay outside the core.
 
 ## Status
@@ -19,6 +21,8 @@ differential-tested against FlashMap.
 The extraction rule is: design the interface from scratch, but port the
 verified implementation and tests in small commits. FlashMap remains the
 temporary behavioral oracle; it is not copied wholesale into this repository.
+`Config::default()` is the single algorithm profile and `WorkerPoolConfig` is
+the only execution configuration.
 
 ## Development
 

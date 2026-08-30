@@ -2,19 +2,6 @@
 
 use crate::{segment_read, Config, QuerySeed, Read, SeedIndex, SeedLookup, Segment};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum SeedTier {
-    UltraSparse,
-    Sparse,
-    DenseFallback,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum ProbeClass {
-    Backbone,
-    Endpoint,
-}
-
 /// A selected query seed.  Reference hits are deliberately looked up through
 /// `SeedIndex` later; retaining only the seed token keeps this object small.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -23,28 +10,17 @@ pub struct Probe {
     pub segment_index: usize,
     pub read_pos: u32,
     pub frequency: u32,
-    pub tier: SeedTier,
     pub rank: usize,
-    pub class: ProbeClass,
 }
 
 impl Probe {
-    pub const fn new(
-        seed: QuerySeed,
-        segment_index: usize,
-        read_pos: u32,
-        frequency: u32,
-        tier: SeedTier,
-        class: ProbeClass,
-    ) -> Self {
+    pub const fn new(seed: QuerySeed, segment_index: usize, read_pos: u32, frequency: u32) -> Self {
         Self {
             seed,
             segment_index,
             read_pos,
             frequency,
-            tier,
             rank: 0,
-            class,
         }
     }
 }
@@ -60,7 +36,6 @@ pub fn extract_backbone_probes(
     segment: &Segment,
     index: &dyn SeedIndex,
     config: &Config,
-    tier: SeedTier,
 ) -> Vec<Probe> {
     let max_probes = config.seeding.max_probes_per_segment;
     if max_probes == 0 || segment.is_empty() {
@@ -79,8 +54,7 @@ pub fn extract_backbone_probes(
             return true;
         }
         if matches!(lookup.completeness, crate::HitCompleteness::Sampled { .. })
-            || (tier == SeedTier::UltraSparse
-                && frequency as usize > config.seeding.max_probe_frequency)
+            || frequency as usize > config.seeding.max_probe_frequency
         {
             return true;
         }
@@ -89,8 +63,6 @@ pub fn extract_backbone_probes(
             segment.index,
             segment.read_start as u32 + seed.query_pos,
             frequency,
-            tier,
-            ProbeClass::Backbone,
         ));
         true
     });
@@ -136,19 +108,14 @@ pub fn extract_backbone_probes(
 }
 
 /// Segment a read and select backbone probes from every segment.
-pub fn extract_read_probes(
-    read: Read<'_>,
-    index: &dyn SeedIndex,
-    config: &Config,
-    tier: SeedTier,
-) -> Vec<Probe> {
+pub fn extract_read_probes(read: Read<'_>, index: &dyn SeedIndex, config: &Config) -> Vec<Probe> {
     segment_read(
         read.sequence,
         config.seeding.segment_size,
         config.seeding.segment_overlap,
     )
     .iter()
-    .flat_map(|segment| extract_backbone_probes(read, segment, index, config, tier))
+    .flat_map(|segment| extract_backbone_probes(read, segment, index, config))
     .collect()
 }
 
@@ -190,14 +157,14 @@ mod tests {
 
     #[test]
     fn probes_are_spaced_and_ranked_in_query_order() {
-        let config = Config::hifi();
+        let config = Config::default();
         let read = Read::new("read", b"ACGTACGTACGT");
         let segment = Segment {
             index: 0,
             read_start: 0,
             read_end: read.sequence.len(),
         };
-        let probes = extract_backbone_probes(read, &segment, &TestIndex, &config, SeedTier::Sparse);
+        let probes = extract_backbone_probes(read, &segment, &TestIndex, &config);
         assert!(!probes.is_empty());
         assert!(probes
             .windows(2)
@@ -209,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn sampled_hits_are_not_selected_for_ultra_sparse() {
+    fn sampled_hits_are_not_selected() {
         struct SampledIndex;
         impl SeedIndex for SampledIndex {
             fn seed_span(&self) -> usize {
@@ -234,13 +201,8 @@ mod tests {
             read_start: 0,
             read_end: 4,
         };
-        assert!(extract_backbone_probes(
-            read,
-            &segment,
-            &SampledIndex,
-            &Config::hifi(),
-            SeedTier::UltraSparse
-        )
-        .is_empty());
+        assert!(
+            extract_backbone_probes(read, &segment, &SampledIndex, &Config::default()).is_empty()
+        );
     }
 }

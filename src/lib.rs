@@ -17,13 +17,13 @@ mod types;
 pub use aligner::Aligner;
 pub use candidates::{cluster_probe_hits, CandidateRegion};
 pub use config::{
-    AlignmentConfig, CandidateConfig, ChainingConfig, Config, ConfigError, DpBackend, OutputConfig,
-    SeedingConfig,
+    AlignmentConfig, CandidateConfig, ChainingConfig, Config, ConfigError, OutputConfig,
+    SeedingConfig, WorkerPoolConfig,
 };
 pub use diagnostics::{DiagnosticsSink, ReadDiagnostics};
 pub use errors::MapError;
 pub use index::{collect_hits, Reference, SeedIndex};
-pub use probes::{extract_backbone_probes, extract_read_probes, Probe, ProbeClass, SeedTier};
+pub use probes::{extract_backbone_probes, extract_read_probes, Probe};
 pub use segment::{segment_read, Segment};
 pub use types::{
     Alignment, AlignmentError, Cigar, CigarError, CigarOp, Contig, ContigId, HitCompleteness,

@@ -1,6 +1,6 @@
 //! Candidate-region clustering from sparse probe hits.
 
-use crate::{Config, ContigId, Probe, SeedHit, SeedIndex, SeedTier, Strand};
+use crate::{Config, ContigId, Probe, SeedHit, SeedIndex, Strand};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -16,7 +16,6 @@ pub struct CandidateRegion {
     pub diagonal_mean: f32,
     pub diagonal_median: f32,
     pub score: i32,
-    pub tier: SeedTier,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -87,7 +86,7 @@ pub fn cluster_probe_hits(
         for hit in hits {
             let joins = cluster.last().is_some_and(|last: &ProbeHit| {
                 (hit.diagonal - last.diagonal).unsigned_abs()
-                    <= config.chaining.diagonal_tolerance as u64
+                    <= config.candidates.diagonal_tolerance as u64
             });
             if !joins && !cluster.is_empty() {
                 add_cluster(&mut candidates, &cluster, index.seed_span(), config);
@@ -158,11 +157,6 @@ fn add_cluster(
         diagonal_mean,
         diagonal_median,
         score,
-        tier: cluster
-            .iter()
-            .map(|hit| hit.probe.tier)
-            .min_by_key(|tier| tier_key(*tier))
-            .unwrap_or(SeedTier::UltraSparse),
     });
 }
 
@@ -200,18 +194,10 @@ fn strand_key(strand: Strand) -> u8 {
     }
 }
 
-fn tier_key(tier: SeedTier) -> u8 {
-    match tier {
-        SeedTier::UltraSparse => 0,
-        SeedTier::Sparse => 1,
-        SeedTier::DenseFallback => 2,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ProbeClass, QuerySeed, SeedKey};
+    use crate::{QuerySeed, SeedKey};
 
     struct TestIndex;
 
@@ -246,19 +232,15 @@ mod tests {
                 0,
                 10,
                 1,
-                SeedTier::UltraSparse,
-                ProbeClass::Backbone,
             ),
             Probe::new(
                 QuerySeed::new(20, Strand::Forward, SeedKey::new(2, 0)),
                 1,
                 20,
                 1,
-                SeedTier::UltraSparse,
-                ProbeClass::Backbone,
             ),
         ];
-        let mut config = Config::hifi();
+        let mut config = Config::default();
         config.candidates.min_supporting_segments = 2;
         let candidates = cluster_probe_hits(&probes, &TestIndex, &config);
         assert_eq!(candidates.len(), 1);

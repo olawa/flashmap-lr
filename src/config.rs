@@ -1,16 +1,10 @@
-//! Stable DNA/HiFi configuration.
+//! Stable RS-LRA configuration.
 //!
-//! CLI presets and experimental toggles stay outside this module.  The values
-//! below are a conservative starting profile; the extraction work will replace
-//! them with the frozen production values once the FlashMap differential tests
-//! establish parity.
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DpBackend {
-    Auto,
-    Native2Bit,
-    Ksw2,
-}
+//! There is deliberately one algorithm profile in this repository: the
+//! current FlashMap LR default (HiFi-balanced settings), with the worker-pool
+//! scheduler as the only execution model. CLI presets, alternate DP
+//! backends, alternate chainers, and experimental seed schedules stay out of
+//! the core until a parity baseline exists.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -19,6 +13,7 @@ pub struct Config {
     pub chaining: ChainingConfig,
     pub alignment: AlignmentConfig,
     pub output: OutputConfig,
+    pub worker_pool: WorkerPoolConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,11 +32,11 @@ pub struct CandidateConfig {
     pub anchor_k: usize,
     pub min_anchor_length: usize,
     pub max_anchors_per_region: usize,
+    pub diagonal_tolerance: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChainingConfig {
-    pub diagonal_tolerance: i32,
     pub max_chain_gap: usize,
     pub enable_pass2: bool,
 }
@@ -50,7 +45,6 @@ pub struct ChainingConfig {
 pub struct AlignmentConfig {
     pub bridge_flank: usize,
     pub bridge_max_gap: usize,
-    pub dp_backend: DpBackend,
     pub enable_m_island_repair: bool,
 }
 
@@ -59,46 +53,67 @@ pub struct OutputConfig {
     pub emit_supplementary: bool,
 }
 
-impl Config {
-    /// Initial DNA/HiFi profile.  It is deliberately small and explicit;
-    /// values are not intended to silently encode FlashMap's experimental
-    /// flags.
-    pub fn hifi() -> Self {
+/// Runtime settings for the one supported scheduler.
+///
+/// A single worker is still a worker-pool run; the value is one mainly for
+/// library callers and tests. The CLI adapter should set it to the requested
+/// mapper-worker count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerPoolConfig {
+    pub workers: usize,
+    pub chunk_size: usize,
+    pub reader_batch_size: Option<usize>,
+}
+
+impl Default for WorkerPoolConfig {
+    fn default() -> Self {
+        Self {
+            workers: 1,
+            chunk_size: 1024,
+            reader_batch_size: None,
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
         Self {
             seeding: SeedingConfig {
                 segment_size: 2048,
-                segment_overlap: 256,
-                // These are the currently verified HiFiUltraSparse starting
-                // values in FlashMap.  Keep them explicit until the first
-                // differential test freezes the RS-LRA profile.
-                max_probes_per_segment: 2,
-                max_total_hits_scanned: 1_000,
-                max_probe_frequency: 10,
+                segment_overlap: 512,
+                // Current FlashMap HiFi-balanced default (the default lowers
+                // through SvSensitive, not the experimental ultra-sparse
+                // profile).
+                max_probes_per_segment: 6,
+                max_total_hits_scanned: 8_000,
+                max_probe_frequency: 40,
             },
             candidates: CandidateConfig {
-                max_regions: 8,
+                max_regions: 20,
                 min_supporting_segments: 2,
-                anchor_k: 21,
+                anchor_k: 15,
                 min_anchor_length: 30,
-                max_anchors_per_region: 256,
+                max_anchors_per_region: 512,
+                diagonal_tolerance: 2_000,
             },
             chaining: ChainingConfig {
-                diagonal_tolerance: 2_000,
                 max_chain_gap: 5_000,
                 enable_pass2: true,
             },
             alignment: AlignmentConfig {
                 bridge_flank: 256,
                 bridge_max_gap: 5_000,
-                dp_backend: DpBackend::Ksw2,
                 enable_m_island_repair: true,
             },
             output: OutputConfig {
                 emit_supplementary: false,
             },
+            worker_pool: WorkerPoolConfig::default(),
         }
     }
+}
 
+impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.seeding.segment_size == 0 {
             return Err(ConfigError::new(
@@ -150,9 +165,9 @@ impl Config {
                 "candidates.max_anchors_per_region must be greater than zero",
             ));
         }
-        if self.chaining.diagonal_tolerance < 0 {
+        if self.candidates.diagonal_tolerance < 0 {
             return Err(ConfigError::new(
-                "chaining.diagonal_tolerance cannot be negative",
+                "candidates.diagonal_tolerance cannot be negative",
             ));
         }
         if self.chaining.max_chain_gap == 0 {
@@ -165,13 +180,22 @@ impl Config {
                 "alignment.bridge_max_gap must be at least bridge_flank",
             ));
         }
+        if self.worker_pool.workers == 0 {
+            return Err(ConfigError::new(
+                "worker_pool.workers must be greater than zero",
+            ));
+        }
+        if self.worker_pool.chunk_size == 0 {
+            return Err(ConfigError::new(
+                "worker_pool.chunk_size must be greater than zero",
+            ));
+        }
+        if self.worker_pool.reader_batch_size == Some(0) {
+            return Err(ConfigError::new(
+                "worker_pool.reader_batch_size must be greater than zero",
+            ));
+        }
         Ok(())
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self::hifi()
     }
 }
 
@@ -199,14 +223,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hifi_profile_is_valid() {
-        assert!(Config::hifi().validate().is_ok());
+    fn default_profile_is_valid() {
+        assert!(Config::default().validate().is_ok());
     }
 
     #[test]
     fn invalid_overlap_is_rejected() {
-        let mut config = Config::hifi();
+        let mut config = Config::default();
         config.seeding.segment_overlap = config.seeding.segment_size;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn zero_worker_pool_is_rejected() {
+        let mut config = Config::default();
+        config.worker_pool.workers = 0;
         assert!(config.validate().is_err());
     }
 }

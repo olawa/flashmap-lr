@@ -3,7 +3,9 @@
 //! The boundary is established before the FlashMap implementation is ported.
 //! Keeping the temporary error explicit prevents callers from mistaking the
 //! repository scaffold for a usable aligner while the production LR phases are
-//! migrated and differential-tested.
+//! migrated and differential-tested. `Aligner::map` is the per-read kernel
+//! that the fixed worker-pool runner will call; it is not a second scheduling
+//! mode.
 
 use crate::{
     Config, ConfigError, DiagnosticsSink, MapError, MappingResult, Read, Reference, SeedIndex,
