@@ -109,14 +109,102 @@ pub fn extract_backbone_probes(
 
 /// Segment a read and select backbone probes from every segment.
 pub fn extract_read_probes(read: Read<'_>, index: &dyn SeedIndex, config: &Config) -> Vec<Probe> {
-    segment_read(
+    let mut probes: Vec<Probe> = segment_read(
         read.sequence,
         config.seeding.segment_size,
         config.seeding.segment_overlap,
     )
     .iter()
     .flat_map(|segment| extract_backbone_probes(read, segment, index, config))
-    .collect()
+    .collect();
+
+    // The resolved FlashMap LR default adds a small, fixed endpoint probe
+    // set after the backbone pass.  Keep this staging internal to the one
+    // profile: endpoint probes are not a second seed schedule or a public
+    // configuration choice, but they prevent an otherwise well-supported
+    // locus from losing both read ends during candidate clustering.
+    const END_WINDOW: usize = 1_000;
+    const END_PROBES_PER_END: usize = 4;
+    const END_MAX_FREQUENCY: usize = 200;
+    let window_len = END_WINDOW.min(read.sequence.len());
+    if window_len > 0 {
+        append_endpoint_probes(
+            &mut probes,
+            read,
+            index,
+            0,
+            window_len,
+            usize::MAX - 1,
+            END_PROBES_PER_END,
+            END_MAX_FREQUENCY,
+        );
+        let right_start = read.sequence.len().saturating_sub(window_len);
+        append_endpoint_probes(
+            &mut probes,
+            read,
+            index,
+            right_start,
+            read.sequence.len(),
+            usize::MAX,
+            END_PROBES_PER_END,
+            END_MAX_FREQUENCY,
+        );
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(probes.len());
+    probes.retain(|probe| seen.insert((probe.seed, probe.read_pos)));
+    probes
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_endpoint_probes(
+    probes: &mut Vec<Probe>,
+    read: Read<'_>,
+    index: &dyn SeedIndex,
+    window_start: usize,
+    window_end: usize,
+    segment_index: usize,
+    max_probes: usize,
+    max_frequency: usize,
+) {
+    let sequence = &read.sequence[window_start..window_end];
+    let mut candidates = Vec::new();
+    for seed in index.query_seeds(sequence) {
+        let read_pos = window_start.saturating_add(seed.query_pos as usize);
+        let mut visited = 0u32;
+        let lookup = index.visit_hits(&seed, &mut |_| {
+            visited = visited.saturating_add(1);
+        });
+        let frequency = endpoint_frequency(lookup, visited);
+        if frequency == 0
+            || frequency as usize > max_frequency
+            || matches!(lookup.completeness, crate::HitCompleteness::Sampled { .. })
+        {
+            continue;
+        }
+        candidates.push(Probe::new(
+            seed,
+            segment_index,
+            read_pos.min(u32::MAX as usize) as u32,
+            frequency,
+        ));
+    }
+    candidates.sort_by_key(|probe| (probe.frequency, probe.read_pos, probe.seed.key()));
+    candidates.truncate(max_probes);
+    for (rank, probe) in candidates.into_iter().enumerate() {
+        let mut probe = probe;
+        probe.rank = rank + 1;
+        probes.push(probe);
+    }
+}
+
+fn endpoint_frequency(lookup: SeedLookup, visited: u32) -> u32 {
+    match lookup.completeness {
+        crate::HitCompleteness::Absent => 0,
+        crate::HitCompleteness::Complete | crate::HitCompleteness::Sampled { .. } => {
+            lookup.reported_hits.max(visited)
+        }
+    }
 }
 
 fn seed_frequency(lookup: SeedLookup, visited_hits: u32) -> u32 {
@@ -204,5 +292,41 @@ mod tests {
         assert!(
             extract_backbone_probes(read, &segment, &SampledIndex, &Config::default()).is_empty()
         );
+    }
+
+    #[test]
+    fn endpoint_staging_adds_fixed_left_and_right_probes() {
+        struct EndpointIndex;
+        impl SeedIndex for EndpointIndex {
+            fn seed_span(&self) -> usize {
+                3
+            }
+
+            fn query_seeds(&self, sequence: &[u8]) -> Vec<QuerySeed> {
+                (0..sequence.len().saturating_sub(2))
+                    .step_by(100)
+                    .map(|pos| {
+                        QuerySeed::new(pos as u32, Strand::Forward, SeedKey::new(pos as u64 + 1, 0))
+                    })
+                    .collect()
+            }
+
+            fn visit_hits(&self, _: &QuerySeed, visit: &mut dyn FnMut(SeedHit)) -> SeedLookup {
+                visit(SeedHit {
+                    contig: ContigId(0),
+                    ref_pos: 0,
+                    strand: Strand::Forward,
+                });
+                SeedLookup::complete(1)
+            }
+        }
+
+        let sequence = vec![b'A'; 2_000];
+        let read = Read::new("read", &sequence);
+        let probes = extract_read_probes(read, &EndpointIndex, &Config::default());
+        assert!(probes
+            .iter()
+            .any(|probe| probe.segment_index == usize::MAX - 1));
+        assert!(probes.iter().any(|probe| probe.segment_index == usize::MAX));
     }
 }
