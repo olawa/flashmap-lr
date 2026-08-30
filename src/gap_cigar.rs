@@ -117,6 +117,7 @@ pub fn build_chain_cigar(
     let anchors = normalize_anchor_overlaps(orient_anchors(chain, read.sequence.len(), contig)?);
     let first = anchors.first().ok_or(ChainCigarError::EmptyChain)?;
     let last = anchors.last().ok_or(ChainCigarError::EmptyChain)?;
+    let mut ref_start = first.ref_start;
 
     let mut ops = Vec::with_capacity(anchors.len() * 2 + 2);
     if first.q_start > 0 {
@@ -154,11 +155,18 @@ pub fn build_chain_cigar(
         cigar.into_ops(),
         &oriented_query,
         contig.sequence,
-        first.ref_start,
+        ref_start,
     );
+    let mut repaired_ops = repaired_ops;
+    left_align_indels(
+        &mut repaired_ops,
+        contig.sequence,
+        &oriented_query,
+        ref_start,
+    );
+    clean_cigar_edges(&mut repaired_ops, &mut ref_start);
     let cigar = Cigar::new(repaired_ops)?;
-    let ref_end = first
-        .ref_start
+    let ref_end = ref_start
         .checked_add(cigar.reference_len() as usize)
         .ok_or(ChainCigarError::InvalidReferenceCoordinates)?;
     if ref_end > contig.sequence.len() || last.ref_end > contig.sequence.len() {
@@ -167,7 +175,7 @@ pub fn build_chain_cigar(
     if cigar.query_len() as usize != oriented_query.len() {
         return Err(ChainCigarError::InvalidQueryCoordinates);
     }
-    Ok((cigar, first.ref_start, oriented_query))
+    Ok((cigar, ref_start, oriented_query))
 }
 
 fn chain_strand(chain: &Chain) -> Result<Strand, ChainCigarError> {
@@ -680,6 +688,231 @@ fn to_u32_lossy(value: usize) -> u32 {
     value.min(u32::MAX as usize) as u32
 }
 
+/// Shift repeat-compatible insertions/deletions toward the leftmost
+/// reference coordinate. This is the same normalization used by FlashMap's
+/// LR output path and is deliberately restricted to a preceding `M` run, so
+/// it cannot cross another indel or a soft clip.
+fn left_align_indels(ops: &mut Vec<CigarOp>, reference: &[u8], query: &[u8], ref_start: usize) {
+    let mut reference_pos = ref_start;
+    let mut query_pos = 0usize;
+    let mut index = 0usize;
+
+    while index < ops.len() {
+        match ops[index] {
+            CigarOp::Match(length) => {
+                reference_pos = reference_pos.saturating_add(length as usize);
+                query_pos = query_pos.saturating_add(length as usize);
+                index += 1;
+            }
+            CigarOp::Ins(length) => {
+                left_align_insertion(
+                    ops,
+                    index,
+                    length as usize,
+                    &mut reference_pos,
+                    &mut query_pos,
+                    reference,
+                    query,
+                );
+                query_pos = query_pos.saturating_add(length as usize);
+                index += 1;
+            }
+            CigarOp::Del(length) => {
+                left_align_deletion(
+                    ops,
+                    index,
+                    length as usize,
+                    &mut reference_pos,
+                    &mut query_pos,
+                    reference,
+                );
+                reference_pos = reference_pos.saturating_add(length as usize);
+                index += 1;
+            }
+            CigarOp::SoftClip(length) => {
+                query_pos = query_pos.saturating_add(length as usize);
+                index += 1;
+            }
+        }
+    }
+
+    normalize_ops(ops);
+}
+
+fn left_align_insertion(
+    ops: &mut Vec<CigarOp>,
+    index: usize,
+    length: usize,
+    reference_pos: &mut usize,
+    query_pos: &mut usize,
+    reference: &[u8],
+    query: &[u8],
+) {
+    if index == 0 || length == 0 {
+        return;
+    }
+
+    let mut shift = 0usize;
+    loop {
+        if *reference_pos <= shift || query_pos.saturating_add(length) <= shift {
+            break;
+        }
+        let Some(CigarOp::Match(match_len)) = ops.get(index.saturating_sub(1)).copied() else {
+            break;
+        };
+        if match_len as usize <= shift {
+            break;
+        }
+        let query_index = query_pos
+            .saturating_add(length)
+            .saturating_sub(1)
+            .saturating_sub(shift);
+        let reference_index = reference_pos.saturating_sub(1).saturating_sub(shift);
+        let Some(&inserted_base) = query.get(query_index) else {
+            break;
+        };
+        let Some(&reference_base) = reference.get(reference_index) else {
+            break;
+        };
+        if inserted_base.eq_ignore_ascii_case(&b'N')
+            || !inserted_base.eq_ignore_ascii_case(&reference_base)
+        {
+            break;
+        }
+        shift += 1;
+    }
+
+    if shift > 0 {
+        if let Some(CigarOp::Match(match_len)) = ops.get_mut(index - 1) {
+            *match_len = match_len.saturating_sub(to_u32_lossy(shift));
+        }
+        ops.insert(index + 1, CigarOp::Match(to_u32_lossy(shift)));
+        *reference_pos = reference_pos.saturating_sub(shift);
+        *query_pos = query_pos.saturating_sub(shift);
+    }
+}
+
+fn left_align_deletion(
+    ops: &mut Vec<CigarOp>,
+    index: usize,
+    length: usize,
+    reference_pos: &mut usize,
+    query_pos: &mut usize,
+    reference: &[u8],
+) {
+    if index == 0 || length == 0 {
+        return;
+    }
+
+    let mut shift = 0usize;
+    loop {
+        if *reference_pos <= shift {
+            break;
+        }
+        let Some(CigarOp::Match(match_len)) = ops.get(index.saturating_sub(1)).copied() else {
+            break;
+        };
+        if match_len as usize <= shift {
+            break;
+        }
+        let deleted_index = reference_pos
+            .saturating_add(length)
+            .saturating_sub(1)
+            .saturating_sub(shift);
+        let previous_index = reference_pos.saturating_sub(1).saturating_sub(shift);
+        let Some(&deleted_base) = reference.get(deleted_index) else {
+            break;
+        };
+        let Some(&previous_base) = reference.get(previous_index) else {
+            break;
+        };
+        if deleted_base.eq_ignore_ascii_case(&b'N')
+            || !deleted_base.eq_ignore_ascii_case(&previous_base)
+        {
+            break;
+        }
+        shift += 1;
+    }
+
+    if shift > 0 {
+        if let Some(CigarOp::Match(match_len)) = ops.get_mut(index - 1) {
+            *match_len = match_len.saturating_sub(to_u32_lossy(shift));
+        }
+        ops.insert(index + 1, CigarOp::Match(to_u32_lossy(shift)));
+        *reference_pos = reference_pos.saturating_sub(shift);
+        *query_pos = query_pos.saturating_sub(shift);
+    }
+}
+
+/// Remove edge deletions and represent edge insertions as soft clips. Left
+/// alignment can create these operations when a homopolymer reaches the edge
+/// of the anchored interval; keeping them as indels would produce invalid SAM
+/// placement semantics.
+fn clean_cigar_edges(ops: &mut Vec<CigarOp>, ref_start: &mut usize) {
+    loop {
+        match ops.first().copied() {
+            Some(CigarOp::Del(length)) => {
+                *ref_start = ref_start.saturating_add(length as usize);
+                ops.remove(0);
+            }
+            Some(CigarOp::Ins(length)) => ops[0] = CigarOp::SoftClip(length),
+            _ => break,
+        }
+    }
+    loop {
+        match ops.last().copied() {
+            Some(CigarOp::Del(_)) => {
+                ops.pop();
+            }
+            Some(CigarOp::Ins(length)) => {
+                let last = ops.len() - 1;
+                ops[last] = CigarOp::SoftClip(length);
+            }
+            _ => break,
+        }
+    }
+    normalize_ops(ops);
+}
+
+fn normalize_ops(ops: &mut Vec<CigarOp>) {
+    let normalized = ops.iter().copied().filter(|op| op_len(*op) > 0).fold(
+        Vec::<CigarOp>::new(),
+        |mut normalized, op| {
+            if let Some(last) = normalized.last_mut() {
+                if same_op_kind(*last, op) {
+                    let merged = op_len(*last)
+                        .saturating_add(op_len(op))
+                        .min(u32::MAX as usize) as u32;
+                    *last = with_op_len(*last, merged);
+                    return normalized;
+                }
+            }
+            normalized.push(op);
+            normalized
+        },
+    );
+    *ops = normalized;
+}
+
+fn same_op_kind(left: CigarOp, right: CigarOp) -> bool {
+    matches!(
+        (left, right),
+        (CigarOp::Match(_), CigarOp::Match(_))
+            | (CigarOp::Ins(_), CigarOp::Ins(_))
+            | (CigarOp::Del(_), CigarOp::Del(_))
+            | (CigarOp::SoftClip(_), CigarOp::SoftClip(_))
+    )
+}
+
+fn with_op_len(op: CigarOp, length: u32) -> CigarOp {
+    match op {
+        CigarOp::Match(_) => CigarOp::Match(length),
+        CigarOp::Ins(_) => CigarOp::Ins(length),
+        CigarOp::Del(_) => CigarOp::Del(length),
+        CigarOp::SoftClip(_) => CigarOp::SoftClip(length),
+    }
+}
+
 fn to_u32(value: usize) -> Result<u32, ChainCigarError> {
     u32::try_from(value).map_err(|_| ChainCigarError::InvalidQueryCoordinates)
 }
@@ -930,5 +1163,22 @@ mod tests {
             build_chain_cigar(Read::new("r", &read), contig, &chain, &config()).unwrap();
         assert!(cigar.ops().iter().any(|op| matches!(op, CigarOp::Ins(2))));
         assert!(cigar.ops().iter().any(|op| matches!(op, CigarOp::Del(2))));
+    }
+
+    #[test]
+    fn left_alignment_moves_repeat_indels_to_the_leftmost_equivalent_site() {
+        let mut insertion = vec![CigarOp::Match(2), CigarOp::Ins(1), CigarOp::Match(3)];
+        left_align_indels(&mut insertion, b"CAAAA", b"CAAAAA", 0);
+        assert_eq!(
+            insertion,
+            vec![CigarOp::Match(1), CigarOp::Ins(1), CigarOp::Match(4)]
+        );
+
+        let mut deletion = vec![CigarOp::Match(2), CigarOp::Del(1), CigarOp::Match(2)];
+        left_align_indels(&mut deletion, b"CAAAA", b"CAAA", 0);
+        assert_eq!(
+            deletion,
+            vec![CigarOp::Match(1), CigarOp::Del(1), CigarOp::Match(3)]
+        );
     }
 }
