@@ -6,7 +6,7 @@
 //! soft clips, trim a divergent terminal run only when an internal relock
 //! exists, and leave final edge/indel normalization to the CIGAR assembler.
 
-use std::collections::HashMap;
+use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt};
 
 use crate::{align_full, CigarOp, Config};
 
@@ -401,9 +401,9 @@ pub(crate) fn rescue_terminal_softclips(
     config: &Config,
 ) {
     const MAX_DP_QUERY: usize = 300;
-    const MAX_RECURSIVE_QUERY: usize = 1_000;
-    const REF_SLACK: usize = 50;
-    const MAX_REF_WINDOW: usize = 1_200;
+    const MAX_RECURSIVE_QUERY: usize = 2_500;
+    const REF_SLACK: usize = 256;
+    const MAX_REF_WINDOW: usize = 4_096;
     const MAX_NM_RATE: f64 = 0.15;
     const KMER: usize = 13;
 
@@ -770,6 +770,304 @@ fn query_consumed(ops: &[CigarOp]) -> usize {
         .filter(|op| op.consumes_query())
         .map(|op| op_len(*op))
         .sum()
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AlignElem {
+    Match { exact: bool },
+    Ins,
+    Del,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn endpoint_score_clip(
+    ops: &mut Vec<CigarOp>,
+    ref_seq: &[u8],
+    read_seq: &[u8],
+    ref_start: &mut usize,
+    match_score: i8,
+    mismatch_penalty: i8,
+    gap_open: i32,
+    gap_extend: i32,
+    terminal_clip_penalty: i32,
+    min_terminal_clip_score_gain: i32,
+    terminal_end_search: usize,
+    protect_indel_support: usize,
+) {
+    if ops.is_empty() {
+        return;
+    }
+
+    let elems = expand_cigar_to_elems(ops, ref_seq, read_seq, *ref_start);
+    if elems.is_empty() {
+        return;
+    }
+
+    let n = elems.len();
+    let left_protect = left_protected_boundary(&elems, protect_indel_support);
+    let right_protect = right_protected_boundary(&elems, protect_indel_support);
+
+    // --- Scan best LEFT trim ---
+    let max_left = terminal_end_search.min(left_protect).min(n);
+    let mut best_left: Option<usize> = None;
+    let mut best_left_gain = i32::MIN;
+
+    for clip_len in 1..=max_left {
+        let boundary = clip_len;
+        if !matches!(
+            elems.get(boundary.saturating_sub(1)),
+            Some(AlignElem::Match { exact: true })
+        ) {
+            continue;
+        }
+        let trimmed = &elems[..clip_len];
+        let keep_score =
+            score_segment(trimmed, match_score, mismatch_penalty, gap_open, gap_extend);
+        let gain = (-terminal_clip_penalty) - keep_score;
+        if gain >= min_terminal_clip_score_gain && gain > best_left_gain {
+            best_left = Some(clip_len);
+            best_left_gain = gain;
+        }
+    }
+
+    // --- Scan best RIGHT trim ---
+    let max_right = terminal_end_search
+        .min(n.saturating_sub(right_protect))
+        .min(n);
+    let mut best_right: Option<usize> = None;
+    let mut best_right_gain = i32::MIN;
+
+    for clip_len in 1..=max_right {
+        let boundary = n - clip_len;
+        if !matches!(elems.get(boundary), Some(AlignElem::Match { exact: true })) {
+            continue;
+        }
+        let trimmed = &elems[n - clip_len..];
+        let keep_score =
+            score_segment(trimmed, match_score, mismatch_penalty, gap_open, gap_extend);
+        let gain = (-terminal_clip_penalty) - keep_score;
+        if gain >= min_terminal_clip_score_gain && gain > best_right_gain {
+            best_right = Some(clip_len);
+            best_right_gain = gain;
+        }
+    }
+
+    if best_left.is_none() && best_right.is_none() {
+        return;
+    }
+
+    let left_clip = best_left.unwrap_or(0);
+    let right_clip = best_right.unwrap_or(0);
+
+    if left_clip + right_clip >= n {
+        return;
+    }
+
+    let kept = &elems[left_clip..n - right_clip];
+    if kept.is_empty() {
+        return;
+    }
+
+    let orig_leading_sc = match ops.first() {
+        Some(CigarOp::SoftClip(s)) => *s as usize,
+        _ => 0,
+    };
+    let orig_trailing_sc = match ops.last() {
+        Some(CigarOp::SoftClip(s)) => *s as usize,
+        _ => 0,
+    };
+
+    let left_q_bases: usize = elems[..left_clip]
+        .iter()
+        .filter(|e| matches!(e, AlignElem::Match { .. } | AlignElem::Ins))
+        .count();
+    let left_r_bases: usize = elems[..left_clip]
+        .iter()
+        .filter(|e| matches!(e, AlignElem::Match { .. } | AlignElem::Del))
+        .count();
+    let right_q_bases: usize = elems[n - right_clip..]
+        .iter()
+        .filter(|e| matches!(e, AlignElem::Match { .. } | AlignElem::Ins))
+        .count();
+
+    let mut new_ops = elems_to_cigar(kept);
+
+    let new_leading_sc = orig_leading_sc + left_q_bases;
+    if new_leading_sc > 0 {
+        new_ops.insert(0, CigarOp::SoftClip(new_leading_sc as u32));
+    }
+    let new_trailing_sc = orig_trailing_sc + right_q_bases;
+    if new_trailing_sc > 0 {
+        new_ops.push(CigarOp::SoftClip(new_trailing_sc as u32));
+    }
+
+    normalize_ops(&mut new_ops);
+    *ops = new_ops;
+    *ref_start += left_r_bases;
+}
+
+fn left_protected_boundary(elems: &[AlignElem], protect_n: usize) -> usize {
+    if protect_n == 0 {
+        return 0;
+    }
+    let mut i = 0;
+    while i < elems.len() {
+        match elems[i] {
+            AlignElem::Ins | AlignElem::Del => {
+                let left_exact = (0..i)
+                    .rev()
+                    .take_while(|&j| matches!(elems[j], AlignElem::Match { exact: true }))
+                    .count();
+                let indel_end = {
+                    let mut e = i;
+                    while e < elems.len() && matches!(elems[e], AlignElem::Ins | AlignElem::Del) {
+                        e += 1;
+                    }
+                    e
+                };
+                let right_exact = (indel_end..elems.len())
+                    .take_while(|&j| matches!(elems[j], AlignElem::Match { exact: true }))
+                    .count();
+                if left_exact >= protect_n && right_exact >= protect_n {
+                    return i;
+                }
+                i = indel_end;
+            }
+            _ => i += 1,
+        }
+    }
+    elems.len()
+}
+
+fn right_protected_boundary(elems: &[AlignElem], protect_n: usize) -> usize {
+    if protect_n == 0 {
+        return elems.len();
+    }
+    let mut i = elems.len();
+    while i > 0 {
+        i -= 1;
+        match elems[i] {
+            AlignElem::Ins | AlignElem::Del => {
+                let indel_start = {
+                    let mut s = i;
+                    while s > 0 && matches!(elems[s - 1], AlignElem::Ins | AlignElem::Del) {
+                        s -= 1;
+                    }
+                    s
+                };
+                let left_exact = (0..indel_start)
+                    .rev()
+                    .take_while(|&j| matches!(elems[j], AlignElem::Match { exact: true }))
+                    .count();
+                let right_exact = (i + 1..elems.len())
+                    .take_while(|&j| matches!(elems[j], AlignElem::Match { exact: true }))
+                    .count();
+                if left_exact >= protect_n && right_exact >= protect_n {
+                    return i + 1;
+                }
+                if indel_start == 0 {
+                    break;
+                }
+                i = indel_start;
+            }
+            _ => {}
+        }
+    }
+    0
+}
+
+fn score_segment(
+    elems: &[AlignElem],
+    match_score: i8,
+    mismatch_penalty: i8,
+    gap_open: i32,
+    gap_extend: i32,
+) -> i32 {
+    let mut score = 0i32;
+    let mut in_gap = false;
+    for elem in elems {
+        match elem {
+            AlignElem::Match { exact } => {
+                in_gap = false;
+                if *exact {
+                    score += match_score as i32;
+                } else {
+                    score -= mismatch_penalty as i32;
+                }
+            }
+            AlignElem::Ins | AlignElem::Del => {
+                if in_gap {
+                    score -= gap_extend;
+                } else {
+                    score -= gap_open + gap_extend;
+                    in_gap = true;
+                }
+            }
+        }
+    }
+    score
+}
+
+fn expand_cigar_to_elems(
+    ops: &[CigarOp],
+    ref_seq: &[u8],
+    read_seq: &[u8],
+    ref_start: usize,
+) -> Vec<AlignElem> {
+    let leading_softclip = match ops.first() {
+        Some(CigarOp::SoftClip(n)) => *n as usize,
+        _ => 0,
+    };
+    let mut q_pos = leading_softclip;
+    let mut r_pos = ref_start;
+    let mut elems = Vec::new();
+
+    for op in ops {
+        match *op {
+            CigarOp::SoftClip(_) => {}
+            CigarOp::Match(len) => {
+                for _ in 0..len as usize {
+                    let q_base = read_seq.get(q_pos).copied().unwrap_or(b'N');
+                    let r_base = ref_seq.get(r_pos).copied().unwrap_or(b'N');
+                    let exact = q_base.eq_ignore_ascii_case(&r_base);
+                    elems.push(AlignElem::Match { exact });
+                    q_pos += 1;
+                    r_pos += 1;
+                }
+            }
+            CigarOp::Ins(len) => {
+                for _ in 0..len as usize {
+                    elems.push(AlignElem::Ins);
+                    q_pos += 1;
+                }
+            }
+            CigarOp::Del(len) => {
+                for _ in 0..len as usize {
+                    elems.push(AlignElem::Del);
+                    r_pos += 1;
+                }
+            }
+        }
+    }
+    elems
+}
+
+fn elems_to_cigar(elems: &[AlignElem]) -> Vec<CigarOp> {
+    let mut ops: Vec<CigarOp> = Vec::new();
+    for elem in elems {
+        let new_op = match elem {
+            AlignElem::Match { .. } => CigarOp::Match(1),
+            AlignElem::Ins => CigarOp::Ins(1),
+            AlignElem::Del => CigarOp::Del(1),
+        };
+        match ops.last_mut() {
+            Some(CigarOp::Match(n)) if matches!(new_op, CigarOp::Match(_)) => *n += 1,
+            Some(CigarOp::Ins(n)) if matches!(new_op, CigarOp::Ins(_)) => *n += 1,
+            Some(CigarOp::Del(n)) if matches!(new_op, CigarOp::Del(_)) => *n += 1,
+            _ => ops.push(new_op),
+        }
+    }
+    ops
 }
 
 fn op_len(op: CigarOp) -> usize {

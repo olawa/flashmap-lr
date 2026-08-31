@@ -899,14 +899,15 @@ fn query_minimizers(sequence: &[u8], k: usize, w: usize) -> Vec<(u32, u64, u64, 
     }
     let window = w.max(1);
     let mut result = Vec::new();
+    let mut deque: std::collections::VecDeque<(usize, (u32, u64, u64, bool))> =
+        std::collections::VecDeque::with_capacity(window + 1);
     for run in valid_runs(sequence) {
         let run_len = run.end - run.start;
         if run_len < k {
             continue;
         }
+        deque.clear();
         let num_kmers = run_len - k + 1;
-        let mut deque: std::collections::VecDeque<(usize, (u32, u64, u64, bool))> =
-            std::collections::VecDeque::with_capacity(window + 1);
         let mut fwd = 0u64;
         for &base in &sequence[run.start..run.start + k] {
             fwd = (fwd << 2) | encode_base(base).expect("valid run guarantees DNA") as u64;

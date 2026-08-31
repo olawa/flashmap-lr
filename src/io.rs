@@ -460,17 +460,11 @@ impl<W: Write> SamWriter<W> {
         if let Some(primary) = mapped.mapping.primary.as_ref() {
             self.write_alignment(mapped, primary, false)?;
         } else {
-            let sequence = sam_sequence(&mapped.sequence);
-            let quality = mapped
-                .qualities
-                .as_deref()
-                .map(sam_quality)
-                .unwrap_or_else(|| "*".to_owned());
-            writeln!(
-                self.writer,
-                "{}\t4\t*\t0\t0\t*\t*\t0\t0\t{}\t{}",
-                mapped.name, sequence, quality
-            )?;
+            write!(self.writer, "{}\t4\t*\t0\t0\t*\t*\t0\t0\t", mapped.name)?;
+            write_sam_sequence(&mut self.writer, &mapped.sequence, false)?;
+            self.writer.write_all(b"\t")?;
+            write_sam_quality(&mut self.writer, mapped.qualities.as_deref(), false)?;
+            self.writer.write_all(b"\n")?;
         }
         for supplementary in &mapped.mapping.supplementary {
             self.write_alignment(mapped, supplementary, true)?;
@@ -512,25 +506,21 @@ impl<W: Write> SamWriter<W> {
         }
         ensure_sam_field(name, "reference name")?;
         let reverse = alignment.strand == Strand::Reverse;
-        let sequence = sam_sequence_oriented(&mapped.sequence, reverse);
-        let quality = mapped
-            .qualities
-            .as_deref()
-            .map(|qualities| sam_quality_oriented(qualities, reverse))
-            .unwrap_or_else(|| "*".to_owned());
+
+        write!(
+            self.writer,
+            "{}\t{}\t{}\t{}\t{}\t",
+            mapped.name, flag, name, pos, alignment.mapq
+        )?;
+        write_sam_cigar(&mut self.writer, alignment)?;
+        self.writer.write_all(b"\t*\t0\t0\t")?;
+        write_sam_sequence(&mut self.writer, &mapped.sequence, reverse)?;
+        self.writer.write_all(b"\t")?;
+        write_sam_quality(&mut self.writer, mapped.qualities.as_deref(), reverse)?;
         writeln!(
             self.writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}\tNM:i:{}\tAS:i:{}",
-            mapped.name,
-            flag,
-            name,
-            pos,
-            alignment.mapq,
-            cigar_string(alignment),
-            sequence,
-            quality,
-            alignment.edit_distance,
-            alignment.score,
+            "\tNM:i:{}\tAS:i:{}",
+            alignment.edit_distance, alignment.score
         )?;
         Ok(())
     }
@@ -546,113 +536,116 @@ fn ensure_sam_field(value: &str, field: &'static str) -> Result<(), SamError> {
     Ok(())
 }
 
-fn sam_sequence(sequence: &[u8]) -> String {
-    sequence
-        .iter()
-        .map(|&byte| {
-            if byte.is_ascii_graphic() {
-                byte as char
-            } else {
-                'N'
-            }
-        })
-        .collect()
-}
+const SAM_COMPLEMENT_TABLE: [u8; 256] = {
+    let mut t = [b'N'; 256];
+    let mut i = 0;
+    while i < 256 {
+        if (i as u8).is_ascii_graphic() {
+            t[i] = i as u8;
+        }
+        i += 1;
+    }
+    t[b'A' as usize] = b'T';
+    t[b'C' as usize] = b'G';
+    t[b'G' as usize] = b'C';
+    t[b'T' as usize] = b'A';
+    t[b'a' as usize] = b't';
+    t[b'c' as usize] = b'g';
+    t[b'g' as usize] = b'c';
+    t[b't' as usize] = b'a';
+    t[b'R' as usize] = b'Y';
+    t[b'Y' as usize] = b'R';
+    t[b'S' as usize] = b'S';
+    t[b'W' as usize] = b'W';
+    t[b'K' as usize] = b'M';
+    t[b'M' as usize] = b'K';
+    t[b'B' as usize] = b'V';
+    t[b'V' as usize] = b'B';
+    t[b'D' as usize] = b'H';
+    t[b'H' as usize] = b'D';
+    t[b'N' as usize] = b'N';
+    t[b'r' as usize] = b'y';
+    t[b'y' as usize] = b'r';
+    t[b's' as usize] = b's';
+    t[b'w' as usize] = b'w';
+    t[b'k' as usize] = b'm';
+    t[b'm' as usize] = b'k';
+    t[b'b' as usize] = b'v';
+    t[b'v' as usize] = b'b';
+    t[b'd' as usize] = b'h';
+    t[b'h' as usize] = b'd';
+    t[b'n' as usize] = b'n';
+    t
+};
 
-fn sam_sequence_oriented(sequence: &[u8], reverse: bool) -> String {
+fn write_sam_sequence<W: Write>(writer: &mut W, sequence: &[u8], reverse: bool) -> io::Result<()> {
     if reverse {
-        sequence
-            .iter()
-            .rev()
-            .map(|&byte| complement_sam_base(byte))
-            .collect()
-    } else {
-        sam_sequence(sequence)
-    }
-}
-
-fn complement_sam_base(byte: u8) -> char {
-    match byte {
-        b'A' => 'T',
-        b'C' => 'G',
-        b'G' => 'C',
-        b'T' => 'A',
-        b'a' => 't',
-        b'c' => 'g',
-        b'g' => 'c',
-        b't' => 'a',
-        // Preserve the common IUPAC ambiguity alphabet while reversing it.
-        b'R' => 'Y',
-        b'Y' => 'R',
-        b'S' => 'S',
-        b'W' => 'W',
-        b'K' => 'M',
-        b'M' => 'K',
-        b'B' => 'V',
-        b'V' => 'B',
-        b'D' => 'H',
-        b'H' => 'D',
-        b'N' => 'N',
-        b'r' => 'y',
-        b'y' => 'r',
-        b's' => 's',
-        b'w' => 'w',
-        b'k' => 'm',
-        b'm' => 'k',
-        b'b' => 'v',
-        b'v' => 'b',
-        b'd' => 'h',
-        b'h' => 'd',
-        b'n' => 'n',
-        value if value.is_ascii_graphic() => value as char,
-        _ => 'N',
-    }
-}
-
-fn sam_quality(qualities: &[u8]) -> String {
-    qualities
-        .iter()
-        .map(|&byte| {
-            if (33..=126).contains(&byte) {
-                byte as char
-            } else {
-                '!'
+        let mut chunk = [0u8; 4096];
+        let mut pos = 0;
+        for &byte in sequence.iter().rev() {
+            chunk[pos] = SAM_COMPLEMENT_TABLE[byte as usize];
+            pos += 1;
+            if pos == chunk.len() {
+                writer.write_all(&chunk)?;
+                pos = 0;
             }
-        })
-        .collect()
-}
-
-fn sam_quality_oriented(qualities: &[u8], reverse: bool) -> String {
-    if reverse {
-        qualities
-            .iter()
-            .rev()
-            .map(|&byte| {
-                if (33..=126).contains(&byte) {
-                    byte as char
-                } else {
-                    '!'
-                }
-            })
-            .collect()
+        }
+        if pos > 0 {
+            writer.write_all(&chunk[..pos])?;
+        }
     } else {
-        sam_quality(qualities)
+        writer.write_all(sequence)?;
     }
+    Ok(())
 }
 
-fn cigar_string(alignment: &Alignment) -> String {
-    let mut result = String::new();
-    for &operation in alignment.cigar.ops() {
+fn write_sam_quality<W: Write>(
+    writer: &mut W,
+    qualities: Option<&[u8]>,
+    reverse: bool,
+) -> io::Result<()> {
+    let Some(qualities) = qualities else {
+        return writer.write_all(b"*");
+    };
+    if reverse {
+        let mut chunk = [0u8; 4096];
+        let mut pos = 0;
+        for &byte in qualities.iter().rev() {
+            chunk[pos] = if (33..=126).contains(&byte) {
+                byte
+            } else {
+                b'!'
+            };
+            pos += 1;
+            if pos == chunk.len() {
+                writer.write_all(&chunk)?;
+                pos = 0;
+            }
+        }
+        if pos > 0 {
+            writer.write_all(&chunk[..pos])?;
+        }
+    } else {
+        writer.write_all(qualities)?;
+    }
+    Ok(())
+}
+
+fn write_sam_cigar<W: Write>(writer: &mut W, alignment: &Alignment) -> io::Result<()> {
+    let ops = alignment.cigar.ops();
+    if ops.is_empty() {
+        return writer.write_all(b"*");
+    }
+    for &operation in ops {
         let (length, code) = match operation {
             CigarOp::Match(length) => (length, 'M'),
             CigarOp::Ins(length) => (length, 'I'),
             CigarOp::Del(length) => (length, 'D'),
             CigarOp::SoftClip(length) => (length, 'S'),
         };
-        result.push_str(&length.to_string());
-        result.push(code);
+        write!(writer, "{length}{code}")?;
     }
-    result
+    Ok(())
 }
 
 #[cfg(test)]

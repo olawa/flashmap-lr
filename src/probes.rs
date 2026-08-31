@@ -1,5 +1,6 @@
 //! Sparse query-probe extraction.
 
+use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt};
 use crate::{segment_read, Config, QuerySeed, Read, SeedIndex, SeedLookup, Segment};
 
 /// Internal markers used to carry fixed endpoint-probe provenance through
@@ -157,8 +158,8 @@ pub fn extract_read_probes(read: Read<'_>, index: &dyn SeedIndex, config: &Confi
         );
     }
 
-    let mut seen: std::collections::HashMap<(crate::SeedKey, crate::Strand, u32), usize> =
-        std::collections::HashMap::with_capacity(probes.len());
+    let mut seen: HashMap<(crate::SeedKey, crate::Strand, u32), usize> =
+        HashMap::with_capacity(probes.len());
     // `QuerySeed::query_pos` is segment-local.  Overlapping backbone
     // segments can therefore describe the same absolute read position with
     // different seed tokens even when they represent the same reference

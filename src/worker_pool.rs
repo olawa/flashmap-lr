@@ -12,16 +12,91 @@
 //! algorithm.  The implementation uses `std::sync::mpsc::sync_channel`, so a
 //! standalone RS-LRA build does not need a channel/runtime dependency.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use crate::config::WorkerPoolConfig;
+
+type RawQueue<R, E> = Arc<BoundedQueue<Result<ReadBatch<R>, E>>>;
+type MappedQueue<T, SE, ME> = Arc<BoundedQueue<Result<MappedBatch<T>, InternalFailure<SE, ME>>>>;
+
+struct BoundedQueue<T> {
+    state: Mutex<QueueState<T>>,
+    not_empty: Condvar,
+    not_full: Condvar,
+    capacity: usize,
+}
+
+struct QueueState<T> {
+    items: VecDeque<T>,
+    closed: bool,
+}
+
+impl<T> BoundedQueue<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(QueueState {
+                items: VecDeque::with_capacity(capacity),
+                closed: false,
+            }),
+            not_empty: Condvar::new(),
+            not_full: Condvar::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn push(&self, item: T) -> Result<(), ()> {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while state.items.len() >= self.capacity && !state.closed {
+            state = match self.not_full.wait(state) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        if state.closed {
+            return Err(());
+        }
+        state.items.push_back(item);
+        self.not_empty.notify_one();
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<T> {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while state.items.is_empty() && !state.closed {
+            state = match self.not_empty.wait(state) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        if let Some(item) = state.items.pop_front() {
+            self.not_full.notify_one();
+            Some(item)
+        } else {
+            None
+        }
+    }
+
+    fn close(&self) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.closed = true;
+        self.not_empty.notify_all();
+        self.not_full.notify_all();
+    }
+}
 
 /// An owned, numbered batch handed from the reader stage to mapper workers.
 ///
@@ -242,29 +317,41 @@ impl WorkerPool {
         let worker_count = self.config.workers;
 
         thread::scope(|scope| {
-            let (raw_tx, raw_rx) = mpsc::sync_channel::<Result<ReadBatch<R>, SE>>(raw_capacity);
-            let (mapped_tx, mapped_rx) = mpsc::sync_channel::<
+            let raw_queue = Arc::new(BoundedQueue::<Result<ReadBatch<R>, SE>>::new(raw_capacity));
+            let mapped_queue = Arc::new(BoundedQueue::<
                 Result<MappedBatch<T>, InternalFailure<SE, ME>>,
-            >(mapped_capacity);
+            >::new(mapped_capacity));
+            let active_workers = Arc::new(AtomicUsize::new(worker_count));
 
             let reader_cancel = Arc::clone(&cancellation);
+            let reader_raw = Arc::clone(&raw_queue);
             let reader_handle = scope.spawn(move || {
-                reader_loop(source, raw_tx, chunk_size, reader_batch_size, reader_cancel);
+                reader_loop(
+                    source,
+                    reader_raw,
+                    chunk_size,
+                    reader_batch_size,
+                    reader_cancel,
+                );
             });
 
-            let shared_raw_rx = Arc::new(Mutex::new(raw_rx));
             let mut worker_handles = Vec::with_capacity(worker_count);
             for _ in 0..worker_count {
-                let raw_rx = Arc::clone(&shared_raw_rx);
-                let mapped_tx = mapped_tx.clone();
+                let raw_q = Arc::clone(&raw_queue);
+                let mapped_q = Arc::clone(&mapped_queue);
                 let worker_cancel = Arc::clone(&cancellation);
+                let workers_remaining = Arc::clone(&active_workers);
                 let mapper_ref = &mapper;
                 worker_handles.push(scope.spawn(move || {
-                    worker_loop(raw_rx, mapped_tx, mapper_ref, worker_cancel);
+                    worker_loop(
+                        raw_q,
+                        mapped_q,
+                        mapper_ref,
+                        worker_cancel,
+                        workers_remaining,
+                    );
                 }));
             }
-            // Only workers may keep sending mapped batches.
-            drop(mapped_tx);
 
             let mut stats = WorkerPoolStats {
                 workers: worker_count,
@@ -277,12 +364,14 @@ impl WorkerPool {
 
             let mut sink_result = Ok(());
             let mut pool_error = None;
-            while let Ok(message) = mapped_rx.recv() {
+            while let Some(message) = mapped_queue.pop() {
                 match message {
                     Ok(batch) => {
                         let batch_id = batch.batch_id;
                         if pending.insert(batch_id, batch).is_some() {
                             cancellation.store(true, Ordering::Release);
+                            raw_queue.close();
+                            mapped_queue.close();
                             pool_error = Some(WorkerPoolError::DuplicateBatch(batch_id));
                             break;
                         }
@@ -292,6 +381,8 @@ impl WorkerPool {
                             stats.reads_written += batch.results.len();
                             if let Err(error) = sink(batch) {
                                 cancellation.store(true, Ordering::Release);
+                                raw_queue.close();
+                                mapped_queue.close();
                                 sink_result = Err(error);
                                 break;
                             }
@@ -303,21 +394,17 @@ impl WorkerPool {
                     }
                     Err(error) => {
                         cancellation.store(true, Ordering::Release);
+                        raw_queue.close();
+                        mapped_queue.close();
                         pool_error = Some(error.into_public());
                         break;
                     }
                 }
             }
 
-            // Dropping the receiver is important on an early sink/mapper
-            // failure: blocked workers must be able to observe send failure
-            // and release their raw-queue receivers.
-            drop(mapped_rx);
-            drop(shared_raw_rx);
+            raw_queue.close();
+            mapped_queue.close();
 
-            // Join workers before the reader.  On an early sink/mapper
-            // failure the reader may be blocked on the raw queue; workers
-            // must first release their receiver clones so that send returns.
             let mut thread_panicked = false;
             for handle in worker_handles {
                 thread_panicked |= handle.join().is_err();
@@ -382,7 +469,7 @@ impl<S, M> InternalFailure<S, M> {
 
 fn reader_loop<I, R, E>(
     source: I,
-    raw_tx: SyncSender<Result<ReadBatch<R>, E>>,
+    raw_queue: Arc<BoundedQueue<Result<ReadBatch<R>, E>>>,
     chunk_size: usize,
     reader_batch_size: usize,
     cancellation: Arc<AtomicBool>,
@@ -394,20 +481,23 @@ fn reader_loop<I, R, E>(
 
     loop {
         if cancellation.load(Ordering::Acquire) {
+            raw_queue.close();
             return;
         }
 
         let mut reader_batch = Vec::with_capacity(reader_batch_size);
         for _ in 0..reader_batch_size {
             if cancellation.load(Ordering::Acquire) {
+                raw_queue.close();
                 return;
             }
             match source.next() {
                 Some(Ok(read)) => reader_batch.push(read),
                 Some(Err(error)) => {
                     if !cancellation.load(Ordering::Acquire) {
-                        let _ = raw_tx.send(Err(error));
+                        let _ = raw_queue.push(Err(error));
                     }
+                    raw_queue.close();
                     return;
                 }
                 None => break,
@@ -415,6 +505,7 @@ fn reader_loop<I, R, E>(
         }
 
         if reader_batch.is_empty() {
+            raw_queue.close();
             return;
         }
 
@@ -431,9 +522,10 @@ fn reader_loop<I, R, E>(
                 break;
             }
             if cancellation.load(Ordering::Acquire) {
+                raw_queue.close();
                 return;
             }
-            if raw_tx.send(Ok(ReadBatch::new(batch_id, chunk))).is_err() {
+            if raw_queue.push(Ok(ReadBatch::new(batch_id, chunk))).is_err() {
                 return;
             }
             batch_id += 1;
@@ -441,15 +533,25 @@ fn reader_loop<I, R, E>(
     }
 }
 
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+struct WorkerGuard<T, SE, ME> {
+    active: Arc<AtomicUsize>,
+    mapped_queue: MappedQueue<T, SE, ME>,
+}
 
-type RawReceiver<R, E> = Arc<Mutex<Receiver<Result<ReadBatch<R>, E>>>>;
+impl<T, SE, ME> Drop for WorkerGuard<T, SE, ME> {
+    fn drop(&mut self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.mapped_queue.close();
+        }
+    }
+}
 
 fn worker_loop<R, T, SE, ME, F>(
-    raw_rx: RawReceiver<R, SE>,
-    mapped_tx: SyncSender<Result<MappedBatch<T>, InternalFailure<SE, ME>>>,
+    raw_queue: RawQueue<R, SE>,
+    mapped_queue: MappedQueue<T, SE, ME>,
     mapper: &F,
     cancellation: Arc<AtomicBool>,
+    active_workers: Arc<AtomicUsize>,
 ) where
     R: Send,
     T: Send,
@@ -457,37 +559,25 @@ fn worker_loop<R, T, SE, ME, F>(
     ME: Send,
     F: Fn(R) -> Result<T, ME> + Sync,
 {
-    loop {
-        let message = {
-            let receiver = match raw_rx.lock() {
-                Ok(receiver) => receiver,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            receiver.recv_timeout(CANCEL_POLL_INTERVAL)
-        };
+    let _guard = WorkerGuard {
+        active: active_workers,
+        mapped_queue: Arc::clone(&mapped_queue),
+    };
 
-        let raw_batch = match message {
-            Ok(Ok(batch)) => batch,
-            Ok(Err(error)) => {
-                // The reader is the only producer of a source error, so the
-                // error must still be forwarded even if the reader set the
-                // cancellation flag immediately after enqueueing it.
-                cancellation.store(true, Ordering::Release);
-                let _ = mapped_tx.send(Err(InternalFailure::Source(error)));
-                return;
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                if cancellation.load(Ordering::Acquire) {
-                    return;
-                }
-                continue;
-            }
-            Err(RecvTimeoutError::Disconnected) => return,
-        };
-
+    while let Some(message) = raw_queue.pop() {
         if cancellation.load(Ordering::Acquire) {
             return;
         }
+
+        let raw_batch = match message {
+            Ok(batch) => batch,
+            Err(error) => {
+                cancellation.store(true, Ordering::Release);
+                raw_queue.close();
+                let _ = mapped_queue.push(Err(InternalFailure::Source(error)));
+                return;
+            }
+        };
 
         let batch_id = raw_batch.batch_id;
         let mut results = Vec::with_capacity(raw_batch.reads.len());
@@ -499,7 +589,8 @@ fn worker_loop<R, T, SE, ME, F>(
                 Ok(result) => results.push(result),
                 Err(error) => {
                     if !cancellation.swap(true, Ordering::AcqRel) {
-                        let _ = mapped_tx.send(Err(InternalFailure::Mapper(error)));
+                        raw_queue.close();
+                        let _ = mapped_queue.push(Err(InternalFailure::Mapper(error)));
                     }
                     return;
                 }
@@ -509,8 +600,8 @@ fn worker_loop<R, T, SE, ME, F>(
         if cancellation.load(Ordering::Acquire) {
             return;
         }
-        if mapped_tx
-            .send(Ok(MappedBatch::new(batch_id, results)))
+        if mapped_queue
+            .push(Ok(MappedBatch::new(batch_id, results)))
             .is_err()
         {
             return;
@@ -524,6 +615,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::Duration;
 
     fn config(
         workers: usize,

@@ -13,6 +13,7 @@ mod diagnostics;
 mod dp;
 mod errors;
 mod fmi;
+pub(crate) mod fxhash;
 mod gap_cigar;
 mod index;
 pub mod io;

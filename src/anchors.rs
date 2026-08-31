@@ -8,7 +8,7 @@
 //! default FlashMap profile resolves `lr_emms_min_exact_span` to zero, so the
 //! mismatch-tolerant EMMS bridge is intentionally not part of this path.
 
-use std::collections::{HashMap, HashSet};
+use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt, FxHashSet as HashSet, FxHashSetExt};
 
 use crate::{
     CandidateRegion, Config, ContigId, QuerySeed, Read, Reference, SeedHit, SeedIndex, SeedLookup,
@@ -320,20 +320,20 @@ pub(crate) fn find_anchors_with_seed_hits(
 
     // Paired positions are scanned first. A paired hit list is authoritative
     // for its query position; other positions need the local reference map.
-    let scan_batch = |positions: &[usize],
-                      local_kmer_map: &mut Option<LocalKmerMap>,
-                      raw_anchors: &mut Vec<Anchor>,
-                      coverage: &mut AnchorCoverage,
-                      seen_seed_hits: &mut HashSet<(usize, u64)>,
-                      kmer_hits: &mut usize,
-                      full_span_found: &mut bool| {
+    let scan_positions = |positions: &[usize],
+                          local_kmer_map: &mut Option<LocalKmerMap>,
+                          raw_anchors: &mut Vec<Anchor>,
+                          coverage: &mut AnchorCoverage,
+                          seen_seed_hits: &mut HashSet<(usize, u64)>,
+                          kmer_hits: &mut usize,
+                          full_span_found: &mut bool| {
         for &q_start in positions {
             if q_start > scan_end || *kmer_hits >= max_kmer_hits || *full_span_found {
                 break;
             }
 
-            let ref_positions = if let Some(positions) = paired_hits.get(&q_start) {
-                positions.clone()
+            let ref_positions: &[u64] = if let Some(positions) = paired_hits.get(&q_start) {
+                positions.as_slice()
             } else {
                 if local_kmer_map.is_none() {
                     *local_kmer_map = Some(LocalKmerMap::build(
@@ -353,10 +353,10 @@ pub(crate) fn find_anchors_with_seed_hits(
                 local_kmer_map
                     .as_ref()
                     .and_then(|map| map.positions(code))
-                    .map_or_else(Vec::new, ToOwned::to_owned)
+                    .unwrap_or(&[])
             };
 
-            for ref_start in ref_positions {
+            for &ref_start in ref_positions {
                 if *kmer_hits >= max_kmer_hits {
                     break;
                 }
@@ -401,7 +401,7 @@ pub(crate) fn find_anchors_with_seed_hits(
     };
 
     // Stage A: paired minimizer positions.
-    scan_batch(
+    scan_positions(
         &prioritized_positions,
         &mut local_kmer_map,
         &mut raw_anchors,
@@ -416,13 +416,12 @@ pub(crate) fn find_anchors_with_seed_hits(
     if !full_span_found && !sufficient {
         // Stage B: remaining minimizer positions. The map is built lazily and
         // is shared by the final dense fallback.
-        let prioritized: HashSet<usize> = prioritized_positions.iter().copied().collect();
         let stage_b: Vec<usize> = raw_minimizer_positions
             .iter()
             .copied()
-            .filter(|position| !prioritized.contains(position))
+            .filter(|pos| !paired_hits.contains_key(pos))
             .collect();
-        scan_batch(
+        scan_positions(
             &stage_b,
             &mut local_kmer_map,
             &mut raw_anchors,
@@ -434,13 +433,11 @@ pub(crate) fn find_anchors_with_seed_hits(
     }
 
     if !full_span_found && !is_sufficient_anchors(&raw_anchors, read.sequence.len(), policy) {
-        // Stage C: dense positions not already visited as minimizers. This is
-        // the default staged emergency fallback, not a separate profile.
-        let minimizers: HashSet<usize> = raw_minimizer_positions.iter().copied().collect();
+        // Stage C: dense positions not already visited as minimizers.
         let dense: Vec<usize> = (0..=scan_end)
-            .filter(|position| !minimizers.contains(position))
+            .filter(|pos| raw_minimizer_positions.binary_search(pos).is_err())
             .collect();
-        scan_batch(
+        scan_positions(
             &dense,
             &mut local_kmer_map,
             &mut raw_anchors,

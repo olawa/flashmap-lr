@@ -1,8 +1,8 @@
 //! Candidate-region clustering from sparse probe hits.
 
+use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt, FxHashSet as HashSet};
 use crate::probes::{LEFT_ENDPOINT_SEGMENT, RIGHT_ENDPOINT_SEGMENT};
 use crate::{Config, ContigId, Probe, SeedHit, SeedIndex, Strand};
-use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CandidateRegion {

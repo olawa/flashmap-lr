@@ -8,6 +8,19 @@
 //! are recovered by score-ranked traceback.
 
 use crate::{Anchor, Strand};
+use std::cell::RefCell;
+
+#[derive(Default)]
+struct ChainScratch {
+    dp: Vec<i32>,
+    previous: Vec<Option<usize>>,
+    used: Vec<bool>,
+    ranked: Vec<usize>,
+}
+
+thread_local! {
+    static CHAIN_SCRATCH: RefCell<ChainScratch> = RefCell::new(ChainScratch::default());
+}
 
 /// Bounded look-back used by the production Minimap-DP chainer.
 pub const MAX_ITER: usize = 256;
@@ -83,120 +96,134 @@ pub fn chain_anchors(anchors: Vec<Anchor>, read_len: usize, colinear_threshold: 
     });
 
     let n = anchors.len();
-    let mut dp = vec![0i32; n];
-    let mut previous = vec![None; n];
-    let mut used = vec![false; n];
+    CHAIN_SCRATCH.with(|scratch_cell| {
+        let mut scratch = scratch_cell.borrow_mut();
+        scratch.dp.clear();
+        scratch.dp.resize(n, 0);
+        scratch.previous.clear();
+        scratch.previous.resize(n, None);
+        scratch.used.clear();
+        scratch.used.resize(n, false);
+        scratch.ranked.clear();
+        scratch.ranked.extend(0..n);
 
-    for i in 0..n {
-        dp[i] = anchor_score(&anchors[i]);
-        let mut iterations = 0usize;
+        let ChainScratch {
+            dp,
+            previous,
+            used,
+            ranked,
+        } = &mut *scratch;
 
-        for j in (0..i).rev() {
-            let previous_anchor = &anchors[j];
-            let current_anchor = &anchors[i];
+        for i in 0..n {
+            dp[i] = anchor_score(&anchors[i]);
+            let mut iterations = 0usize;
 
-            if previous_anchor.ref_id != current_anchor.ref_id
-                || previous_anchor.strand != current_anchor.strand
-            {
-                // The sort groups reference contig and strand, so older
-                // groups cannot contain a valid predecessor for this cell.
-                break;
+            for j in (0..i).rev() {
+                let previous_anchor = &anchors[j];
+                let current_anchor = &anchors[i];
+
+                if previous_anchor.ref_id != current_anchor.ref_id
+                    || previous_anchor.strand != current_anchor.strand
+                {
+                    // The sort groups reference contig and strand, so older
+                    // groups cannot contain a valid predecessor for this cell.
+                    break;
+                }
+                if current_anchor
+                    .q_start
+                    .saturating_sub(previous_anchor.q_start)
+                    > max_dist
+                {
+                    break;
+                }
+
+                iterations += 1;
+                if iterations > MAX_ITER {
+                    break;
+                }
+
+                let Some(step) = minimap_chain_step_score(
+                    previous_anchor,
+                    current_anchor,
+                    colinear_threshold,
+                    max_dist,
+                ) else {
+                    continue;
+                };
+
+                let candidate = dp[j].saturating_add(step);
+                if candidate > dp[i] {
+                    dp[i] = candidate;
+                    previous[i] = Some(j);
+                }
             }
-            if current_anchor
-                .q_start
-                .saturating_sub(previous_anchor.q_start)
-                > max_dist
-            {
-                break;
-            }
+        }
 
-            iterations += 1;
-            if iterations > MAX_ITER {
-                break;
-            }
+        ranked.sort_by(|&a, &b| {
+            dp[b]
+                .cmp(&dp[a])
+                .then_with(|| anchors[a].q_start.cmp(&anchors[b].q_start))
+        });
 
-            let Some(step) = minimap_chain_step_score(
-                previous_anchor,
-                current_anchor,
-                colinear_threshold,
-                max_dist,
-            ) else {
+        let mut paths = Vec::new();
+        for &seed in ranked.iter() {
+            if used[seed] || dp[seed] <= 15 {
                 continue;
-            };
-
-            let candidate = dp[j].saturating_add(step);
-            if candidate > dp[i] {
-                dp[i] = candidate;
-                previous[i] = Some(j);
             }
-        }
-    }
 
-    let mut ranked: Vec<usize> = (0..n).collect();
-    ranked.sort_by(|&a, &b| {
-        dp[b]
-            .cmp(&dp[a])
-            .then_with(|| anchors[a].q_start.cmp(&anchors[b].q_start))
-    });
-
-    let mut paths = Vec::new();
-    for seed in ranked {
-        if used[seed] || dp[seed] <= 15 {
-            continue;
-        }
-
-        let mut path = Vec::new();
-        let mut current = Some(seed);
-        while let Some(index) = current {
-            if used[index] {
-                break;
+            let mut path = Vec::new();
+            let mut current = Some(seed);
+            while let Some(index) = current {
+                if used[index] {
+                    break;
+                }
+                path.push(index);
+                current = previous[index];
             }
-            path.push(index);
-            current = previous[index];
-        }
-        if path.is_empty() {
-            continue;
+            if path.is_empty() {
+                continue;
+            }
+
+            path.reverse();
+            for &index in &path {
+                used[index] = true;
+            }
+            paths.push(path);
         }
 
-        path.reverse();
-        for &index in &path {
-            used[index] = true;
+        let mut chains = paths
+            .into_iter()
+            .map(|path| {
+                let chain_anchors = path
+                    .into_iter()
+                    .map(|index| anchors[index])
+                    .collect::<Vec<_>>();
+                build_chain(chain_anchors, read_len, false)
+            })
+            .collect::<Vec<_>>();
+        chains.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| b.query_covered_bases.cmp(&a.query_covered_bases))
+                .then_with(|| a.q_start.cmp(&b.q_start))
+        });
+        for (index, chain) in chains.iter_mut().enumerate() {
+            chain.is_primary = index == 0;
         }
-        paths.push(path);
-    }
 
-    let mut chains = paths
-        .into_iter()
-        .map(|path| {
-            let chain_anchors = path
-                .into_iter()
-                .map(|index| anchors[index])
-                .collect::<Vec<_>>();
-            build_chain(chain_anchors, read_len, false)
-        })
-        .collect::<Vec<_>>();
-    chains.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then_with(|| b.query_covered_bases.cmp(&a.query_covered_bases))
-            .then_with(|| a.q_start.cmp(&b.q_start))
-    });
-    for (index, chain) in chains.iter_mut().enumerate() {
-        chain.is_primary = index == 0;
-    }
-
-    let primary = if chains.is_empty() {
-        None
-    } else {
-        Some(chains.remove(0))
-    };
-    ChainSet {
-        primary,
-        alternatives: chains,
-        anchors_input,
-        max_dist,
-        max_iter: MAX_ITER,
-    }
+        let primary = if chains.is_empty() {
+            None
+        } else {
+            Some(chains.remove(0))
+        };
+        ChainSet {
+            primary,
+            alternatives: chains,
+            anchors_input,
+            max_dist,
+            max_iter: MAX_ITER,
+        }
+    })
 }
 
 fn strand_key(strand: Strand) -> u8 {

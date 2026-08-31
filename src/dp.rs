@@ -177,16 +177,25 @@ pub fn align_full(query: &[u8], reference: &[u8], band_width: usize) -> Option<L
     })
 }
 
+const DNA5_TABLE: [u8; 256] = {
+    let mut t = [4u8; 256];
+    t[b'A' as usize] = 0;
+    t[b'a' as usize] = 0;
+    t[b'C' as usize] = 1;
+    t[b'c' as usize] = 1;
+    t[b'G' as usize] = 2;
+    t[b'g' as usize] = 2;
+    t[b'T' as usize] = 3;
+    t[b't' as usize] = 3;
+    t
+};
+
 fn encode_dna5(sequence: &[u8], output: &mut Vec<u8>) {
     output.clear();
     output.reserve(sequence.len());
-    output.extend(sequence.iter().map(|base| match base {
-        b'A' | b'a' => 0,
-        b'C' | b'c' => 1,
-        b'G' | b'g' => 2,
-        b'T' | b't' => 3,
-        _ => 4,
-    }));
+    for &base in sequence {
+        output.push(DNA5_TABLE[base as usize]);
+    }
 }
 
 fn dna5_matrix() -> [i8; 25] {

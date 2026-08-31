@@ -7,11 +7,11 @@
 //! M-island repair pass is applied after assembly; endpoint attachment and
 //! output formatting remain adapter concerns.
 
+use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt};
 use crate::{
     align_full, Alignment, AlignmentError, Chain, Cigar, CigarError, CigarOp, Config, Contig, Read,
     Strand,
 };
-use std::collections::HashMap;
 
 /// Errors produced while converting a sparse chain into an alignment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,8 +163,6 @@ pub fn build_chain_cigar(
         &mut ref_start,
         config,
     );
-    let repaired_ops =
-        repair_match_islands(repaired_ops, &oriented_query, contig.sequence, ref_start);
     let mut repaired_ops = crate::postprocess::repair_phase_shifted_spans(
         &repaired_ops,
         &oriented_query,
@@ -184,6 +182,20 @@ pub fn build_chain_cigar(
         contig.sequence,
         &oriented_query,
         ref_start,
+    );
+    crate::postprocess::endpoint_score_clip(
+        &mut repaired_ops,
+        contig.sequence,
+        &oriented_query,
+        &mut ref_start,
+        1,  // match_score
+        4,  // mismatch_penalty
+        6,  // gap_open
+        1,  // gap_extend
+        5,  // terminal_clip_penalty
+        3,  // min_terminal_clip_score_gain
+        25, // terminal_end_search
+        8,  // protect_indel_support
     );
     clean_cigar_edges(&mut repaired_ops, &mut ref_start);
     let cigar = Cigar::new(repaired_ops)?;
@@ -433,38 +445,43 @@ fn append_gap_recursive(
         && query_len >= RECURSIVE_SPLIT_K
         && reference_len >= RECURSIVE_SPLIT_K
     {
-        if let Some((q_island_start, r_island_start, island_len)) =
-            find_exact_island(query_slice, reference_slice, RECURSIVE_SPLIT_K)
+        if let Some(chain) =
+            find_exact_island_chain(query_slice, reference_slice, RECURSIVE_SPLIT_K, max_gap)
         {
-            let has_prefix = q_island_start > 0 || r_island_start > 0;
-            let has_suffix = q_island_start + island_len < query_len
-                || r_island_start + island_len < reference_len;
-            if has_prefix || has_suffix {
+            let mut curr_q = 0usize;
+            let mut curr_r = 0usize;
+            for (s_q, s_r, s_len) in chain {
+                if s_q > curr_q || s_r > curr_r {
+                    append_gap_recursive(
+                        ops,
+                        query,
+                        reference,
+                        query_start + curr_q,
+                        query_start + s_q,
+                        ref_start + curr_r,
+                        ref_start + s_r,
+                        config,
+                        depth + 1,
+                    )?;
+                }
+                ops.push(CigarOp::Match(to_u32(s_len)?));
+                curr_q = s_q + s_len;
+                curr_r = s_r + s_len;
+            }
+            if curr_q < query_len || curr_r < reference_len {
                 append_gap_recursive(
                     ops,
                     query,
                     reference,
-                    query_start,
-                    query_start + q_island_start,
-                    ref_start,
-                    ref_start + r_island_start,
-                    config,
-                    depth + 1,
-                )?;
-                ops.push(CigarOp::Match(to_u32(island_len)?));
-                append_gap_recursive(
-                    ops,
-                    query,
-                    reference,
-                    query_start + q_island_start + island_len,
+                    query_start + curr_q,
                     query_end,
-                    ref_start + r_island_start + island_len,
+                    ref_start + curr_r,
                     ref_end,
                     config,
                     depth + 1,
                 )?;
-                return Ok(());
             }
+            return Ok(());
         }
     }
 
@@ -546,74 +563,125 @@ fn append_gap_recursive(
     Ok(())
 }
 
-/// Find the longest exact k-mer island that is strictly internal to both
-/// slices.  A single island is enough to split a long insertion/deletion into
-/// two smaller problems; recursive calls then handle additional phase shifts.
-/// Repetitive reference buckets are ignored so a tandem repeat cannot choose
-/// an arbitrary split point and manufacture a long chain of indels.
-fn find_exact_island(query: &[u8], reference: &[u8], k: usize) -> Option<(usize, usize, usize)> {
-    if k == 0 || query.len() < k || reference.len() < k {
+fn find_exact_island_chain(
+    q_gap_seq: &[u8],
+    r_gap_seq: &[u8],
+    k: usize,
+    max_gap: usize,
+) -> Option<Vec<(usize, usize, usize)>> {
+    let q_gap_len = q_gap_seq.len();
+    let r_gap_len = r_gap_seq.len();
+    if q_gap_len < k || r_gap_len < k {
         return None;
     }
 
-    let mut reference_buckets = HashMap::<u64, Vec<usize>>::new();
-    for ref_pos in 0..=reference.len() - k {
-        let Some(code) = encode_kmer(&reference[ref_pos..ref_pos + k]) else {
-            continue;
-        };
-        let bucket = reference_buckets.entry(code).or_default();
-        // Keep the seventeenth position as an explicit saturation marker, but
-        // never retain the rest of a repetitive bucket.  A lookup with 17
-        // positions is skipped below, so no arbitrary repeat occurrence can
-        // be selected as an exact split point.
-        if bucket.len() < 17 {
-            bucket.push(ref_pos);
+    let mut r_kmers = HashMap::<u64, Vec<u32>>::new();
+    for i in 0..=r_gap_len - k {
+        if let Some(val) = encode_kmer(&r_gap_seq[i..i + k]) {
+            r_kmers.entry(val).or_default().push(i as u32);
         }
     }
 
-    let mut best: Option<(usize, usize, usize)> = None;
-    for query_pos in 0..=query.len() - k {
-        let Some(code) = encode_kmer(&query[query_pos..query_pos + k]) else {
-            continue;
-        };
-        let Some(ref_positions) = reference_buckets.get(&code) else {
-            continue;
-        };
-        if ref_positions.len() > 16 {
-            continue;
-        }
-
-        for &ref_pos in ref_positions {
-            let mut q_start = query_pos;
-            let mut r_start = ref_pos;
-            while q_start > 0
-                && r_start > 0
-                && query[q_start - 1].eq_ignore_ascii_case(&reference[r_start - 1])
-            {
-                q_start -= 1;
-                r_start -= 1;
-            }
-
-            let mut q_end = query_pos + k;
-            let mut r_end = ref_pos + k;
-            while q_end < query.len()
-                && r_end < reference.len()
-                && query[q_end].eq_ignore_ascii_case(&reference[r_end])
-            {
-                q_end += 1;
-                r_end += 1;
-            }
-
-            let length = q_end - q_start;
-            if best
-                .map(|(_, _, best_len)| length > best_len)
-                .unwrap_or(true)
-            {
-                best = Some((q_start, r_start, length));
+    let mut matches = Vec::new();
+    let query_step = (max_gap / 512).max(1);
+    for i in (0..=q_gap_len - k).step_by(query_step) {
+        if let Some(val) = encode_kmer(&q_gap_seq[i..i + k]) {
+            if let Some(r_poses) = r_kmers.get(&val) {
+                if r_poses.len() <= 16 {
+                    for &r_pos in r_poses {
+                        matches.push((i as u32, r_pos));
+                    }
+                }
             }
         }
     }
-    best
+
+    if matches.is_empty() {
+        return None;
+    }
+
+    let mut intervals = Vec::new();
+    for &(q_pos, r_pos) in &matches {
+        let mut b = 0;
+        while q_pos as usize > b && r_pos as usize > b {
+            if q_gap_seq[q_pos as usize - 1 - b]
+                .eq_ignore_ascii_case(&r_gap_seq[r_pos as usize - 1 - b])
+            {
+                b += 1;
+            } else {
+                break;
+            }
+        }
+        let mut f = 0;
+        while q_pos as usize + f < q_gap_len && r_pos as usize + f < r_gap_len {
+            if q_gap_seq[q_pos as usize + f].eq_ignore_ascii_case(&r_gap_seq[r_pos as usize + f]) {
+                f += 1;
+            } else {
+                break;
+            }
+        }
+        let start_q = q_pos - b as u32;
+        let start_r = r_pos - b as u32;
+        let len = b + f;
+        if len >= k {
+            intervals.push((start_q, start_r, len as u32));
+        }
+    }
+
+    intervals.sort_unstable_by_key(|&(q, r, l)| (q, r, std::cmp::Reverse(l)));
+    intervals.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+
+    if intervals.is_empty() {
+        return None;
+    }
+
+    let mut dp = vec![0i32; intervals.len()];
+    let mut parent = vec![None; intervals.len()];
+    let mut best_idx = 0;
+    let mut best_score = 0;
+
+    for j in 0..intervals.len() {
+        let (q_j, r_j, l_j) = intervals[j];
+        dp[j] = l_j as i32;
+        for i in 0..j {
+            let (q_i, r_i, l_i) = intervals[i];
+            if q_i + l_i <= q_j && r_i + l_i <= r_j {
+                let dq = q_j - (q_i + l_i);
+                let dr = r_j - (r_i + l_i);
+                let diag_diff = dq.abs_diff(dr);
+                if diag_diff <= 500 {
+                    let penalty = if dq == 0 && dr == 0 {
+                        0
+                    } else {
+                        4 + (diag_diff as i32) * 2 + ((dq + dr) as i32) / 16
+                    };
+                    let candidate_score = dp[i] + (l_j as i32) - penalty;
+                    if candidate_score > dp[j] {
+                        dp[j] = candidate_score;
+                        parent[j] = Some(i);
+                    }
+                }
+            }
+        }
+        if dp[j] > best_score {
+            best_score = dp[j];
+            best_idx = j;
+        }
+    }
+
+    if best_score >= k as i32 {
+        let mut chain = Vec::new();
+        let mut curr = Some(best_idx);
+        while let Some(idx) = curr {
+            let (q, r, l) = intervals[idx];
+            chain.push((q as usize, r as usize, l as usize));
+            curr = parent[idx];
+        }
+        chain.reverse();
+        Some(chain)
+    } else {
+        None
+    }
 }
 
 fn encode_kmer(sequence: &[u8]) -> Option<u64> {
@@ -632,155 +700,6 @@ fn encode_kmer(sequence: &[u8]) -> Option<u64> {
         code = (code << 2) | value;
     }
     Some(code)
-}
-
-fn repair_match_islands(
-    ops: Vec<CigarOp>,
-    query: &[u8],
-    reference: &[u8],
-    ref_start: usize,
-) -> Vec<CigarOp> {
-    const MIN_MATCH_SPAN: usize = 50;
-    const MERGE_DISTANCE: usize = 32;
-    const FLANK: usize = 64;
-    const MAX_WINDOW: usize = 300;
-    const MIN_ISLAND_MISMATCHES: usize = 2;
-    const DP_BAND: usize = 64;
-
-    let mut repaired = Vec::with_capacity(ops.len());
-    let mut query_pos = 0usize;
-    let mut reference_pos = ref_start;
-
-    for op in ops {
-        let CigarOp::Match(length) = op else {
-            if op.consumes_query() {
-                query_pos = query_pos.saturating_add(op_len(op));
-            }
-            if op.consumes_reference() {
-                reference_pos = reference_pos.saturating_add(op_len(op));
-            }
-            repaired.push(op);
-            continue;
-        };
-
-        let length = length as usize;
-        let Some(query_span) = query.get(query_pos..query_pos.saturating_add(length)) else {
-            repaired.push(op);
-            query_pos = query_pos.saturating_add(length);
-            reference_pos = reference_pos.saturating_add(length);
-            continue;
-        };
-        let Some(reference_span) =
-            reference.get(reference_pos..reference_pos.saturating_add(length))
-        else {
-            repaired.push(op);
-            query_pos = query_pos.saturating_add(length);
-            reference_pos = reference_pos.saturating_add(length);
-            continue;
-        };
-
-        if length < MIN_MATCH_SPAN {
-            repaired.push(op);
-            query_pos += length;
-            reference_pos += length;
-            continue;
-        }
-
-        let islands = mismatch_islands(query_span, reference_span, MERGE_DISTANCE);
-        if islands
-            .iter()
-            .all(|island| island.2 < MIN_ISLAND_MISMATCHES)
-        {
-            repaired.push(op);
-            query_pos += length;
-            reference_pos += length;
-            continue;
-        }
-
-        let mut cursor = 0usize;
-        for (island_start, island_end, mismatches) in islands {
-            if mismatches < MIN_ISLAND_MISMATCHES {
-                continue;
-            }
-            let mut local_start = island_start.saturating_sub(FLANK).max(cursor);
-            let mut local_end = (island_end + 1 + FLANK).min(length);
-            if local_end.saturating_sub(local_start) > MAX_WINDOW {
-                let midpoint = (island_start + island_end) / 2;
-                local_start = midpoint.saturating_sub(MAX_WINDOW / 2).max(cursor);
-                local_end = (local_start + MAX_WINDOW).min(length);
-            }
-            if local_end <= local_start {
-                continue;
-            }
-
-            if local_start > cursor {
-                repaired.push(CigarOp::Match(to_u32_lossy(local_start - cursor)));
-            }
-            let q_local = &query_span[local_start..local_end];
-            let r_local = &reference_span[local_start..local_end];
-            let old_nm = mismatch_count(q_local, r_local);
-            let accepted = align_full(q_local, r_local, DP_BAND).and_then(|alignment| {
-                let new_nm = alignment.edit_distance as usize;
-                let has_indel = alignment
-                    .cigar
-                    .ops()
-                    .iter()
-                    .any(|op| matches!(op, CigarOp::Ins(_) | CigarOp::Del(_)));
-                (new_nm < old_nm || (has_indel && new_nm <= old_nm))
-                    .then_some(alignment.cigar.into_ops())
-            });
-            if let Some(ops) = accepted {
-                repaired.extend(ops);
-            } else {
-                repaired.push(CigarOp::Match(to_u32_lossy(local_end - local_start)));
-            }
-            cursor = local_end;
-        }
-        if cursor < length {
-            repaired.push(CigarOp::Match(to_u32_lossy(length - cursor)));
-        }
-        query_pos += length;
-        reference_pos += length;
-    }
-    repaired
-}
-
-fn mismatch_islands(
-    query: &[u8],
-    reference: &[u8],
-    merge_distance: usize,
-) -> Vec<(usize, usize, usize)> {
-    let mut islands = Vec::new();
-    let mut current: Option<(usize, usize, usize)> = None;
-    for (position, (&query_base, &reference_base)) in query.iter().zip(reference).enumerate() {
-        if query_base.eq_ignore_ascii_case(&reference_base) {
-            continue;
-        }
-        match current.as_mut() {
-            Some((start, end, mismatches)) if position.saturating_sub(*end) <= merge_distance => {
-                *end = position;
-                *mismatches += 1;
-                let _ = start;
-            }
-            Some(_) => {
-                islands.push(current.take().expect("current island is present"));
-                current = Some((position, position, 1));
-            }
-            None => current = Some((position, position, 1)),
-        }
-    }
-    if let Some(island) = current {
-        islands.push(island);
-    }
-    islands
-}
-
-fn mismatch_count(query: &[u8], reference: &[u8]) -> usize {
-    query
-        .iter()
-        .zip(reference)
-        .filter(|(query_base, reference_base)| !query_base.eq_ignore_ascii_case(reference_base))
-        .count()
 }
 
 fn op_len(op: CigarOp) -> usize {
@@ -1329,53 +1248,30 @@ mod tests {
     }
 
     #[test]
-    fn match_island_repair_recovers_balanced_indel_pair() {
-        fn pseudo_sequence(length: usize, mut state: u32) -> Vec<u8> {
-            const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
-            (0..length)
-                .map(|_| {
-                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                    BASES[(state >> 30) as usize]
-                })
-                .collect()
-        }
-
-        let reference = pseudo_sequence(100, 5);
-        let mut read = reference[..40].to_vec();
-        read.extend_from_slice(b"AC");
-        read.extend_from_slice(&reference[40..68]);
-        read.extend_from_slice(&reference[70..]);
-
-        let chain = Chain {
-            anchors: vec![anchor(0, 100, 0, 100, Strand::Forward)],
-            score: 100,
-            q_start: 0,
-            q_end: 100,
-            ref_start: 0,
-            ref_end: 100,
-            query_covered_bases: 100,
-            query_covered_fraction: 1.0,
-            longest_anchor: 100,
-            max_query_gap: 0,
-            max_ref_gap: 0,
-            left_end_anchor_len: 100,
-            right_end_anchor_len: 100,
-            left_terminal_gap: 0,
-            right_terminal_gap: 0,
-            internal_only_chain: false,
-            is_primary: true,
-            split_candidate: false,
-        };
-        let contig = Contig {
-            id: ContigId(0),
-            name: "chr0",
-            sequence: &reference,
-        };
-
-        let (cigar, _, _) =
-            build_chain_cigar(Read::new("r", &read), contig, &chain, &config()).unwrap();
-        assert!(cigar.ops().iter().any(|op| matches!(op, CigarOp::Ins(2))));
-        assert!(cigar.ops().iter().any(|op| matches!(op, CigarOp::Del(2))));
+    fn endpoint_score_clip_softclips_terminal_mismatch_run() {
+        let reference = b"ACGTACGTACGTACGTACGTACGTACGTACGT";
+        let mut read = reference.to_vec();
+        read[0] = b'T';
+        read[1] = b'T';
+        read[2] = b'T';
+        let mut ops = vec![CigarOp::Match(32)];
+        let mut ref_start = 0;
+        crate::postprocess::endpoint_score_clip(
+            &mut ops,
+            reference,
+            &read,
+            &mut ref_start,
+            1,
+            4,
+            6,
+            1,
+            5,
+            3,
+            25,
+            8,
+        );
+        assert!(ops.iter().any(|op| matches!(op, CigarOp::SoftClip(_))));
+        assert_eq!(ref_start, 4);
     }
 
     #[test]
