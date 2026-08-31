@@ -185,11 +185,7 @@ impl<'a> Aligner<'a> {
         I: IntoIterator<Item = Result<OwnedRead, SourceError>> + Send,
         SourceError: Send,
     {
-        pool.map(source, |owned_read| {
-            let name = owned_read.name.clone();
-            let mapping = self.map(owned_read.as_read())?;
-            Ok::<MappedRead, MapError>(MappedRead { name, mapping })
-        })
+        pool.map(source, |owned_read| self.map_owned_read(owned_read))
     }
 
     /// Stream ordered mapping results through the worker pool.
@@ -211,11 +207,7 @@ impl<'a> Aligner<'a> {
     {
         pool.run(
             source,
-            |owned_read| {
-                let name = owned_read.name.clone();
-                let mapping = self.map(owned_read.as_read())?;
-                Ok::<MappedRead, MapError>(MappedRead { name, mapping })
-            },
+            |owned_read| self.map_owned_read(owned_read),
             |batch| {
                 for result in batch.into_results() {
                     sink(result)?;
@@ -223,6 +215,25 @@ impl<'a> Aligner<'a> {
                 Ok(())
             },
         )
+    }
+
+    fn map_owned_read(&self, owned_read: OwnedRead) -> Result<MappedRead, MapError> {
+        let OwnedRead {
+            name,
+            sequence,
+            qualities,
+        } = owned_read;
+        let mapping = self.map(Read {
+            name: &name,
+            sequence: &sequence,
+            qualities: qualities.as_deref(),
+        })?;
+        Ok(MappedRead {
+            name,
+            sequence,
+            qualities,
+            mapping,
+        })
     }
 
     fn notify(&self, read_name: &str, diagnostics: &ReadDiagnostics) {

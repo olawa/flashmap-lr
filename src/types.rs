@@ -516,14 +516,19 @@ pub struct MappingResult {
     pub diagnostics: Option<crate::ReadDiagnostics>,
 }
 
-/// A mapping result paired with the source read name.
+/// A mapping result paired with the source read.
 ///
 /// The per-read [`crate::Aligner::map`] kernel intentionally works with a
 /// borrowed [`Read`] and returns only alignment data. Stream adapters use this
-/// wrapper when they need to write read names alongside ordered results.
+/// wrapper when they need to write read names and sequence/quality columns
+/// alongside ordered results. Keeping the source payload here also means a
+/// bounded sink can emit SAM without maintaining a second name/sequence
+/// queue beside the worker pool.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MappedRead {
     pub name: String,
+    pub sequence: Vec<u8>,
+    pub qualities: Option<Vec<u8>>,
     pub mapping: MappingResult,
 }
 

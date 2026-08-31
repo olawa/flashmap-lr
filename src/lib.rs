@@ -14,6 +14,7 @@ mod dp;
 mod errors;
 mod gap_cigar;
 mod index;
+pub mod io;
 mod postprocess;
 mod probes;
 mod segment;
@@ -31,7 +32,14 @@ pub use diagnostics::{DiagnosticsSink, ReadDiagnostics};
 pub use dp::{align_full, align_local, LocalAlignment};
 pub use errors::MapError;
 pub use gap_cigar::{build_chain_alignment, build_chain_cigar, ChainCigarError};
-pub use index::{collect_hits, Reference, SeedIndex};
+pub use index::{
+    collect_hits, InMemoryReference, InMemorySeedIndex, OwnedContig, Reference, SeedIndex,
+    SeedIndexBuildError, DEFAULT_MAX_STORED_HITS, LR_MINIMIZER_WINDOW, LR_SEED_K,
+};
+pub use io::{
+    load_reference, load_reference_path, open_fastx, FastxError, FastxFormat, FastxReader,
+    ReferenceIoError, SamError, SamWriter,
+};
 pub use probes::{extract_backbone_probes, extract_read_probes, Probe};
 pub use segment::{segment_read, Segment};
 pub use types::{

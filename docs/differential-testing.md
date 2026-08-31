@@ -1,9 +1,11 @@
 # Differential testing against FlashMap
 
-RS-LRA is intentionally extracted phase by phase. Until the output adapter is
-ported, FlashMap remains the behavioral oracle for the fixed HiFiBalanced LR
-route. A differential fixture should therefore compare the following records
-for the same read and reference:
+RS-LRA is intentionally extracted phase by phase. FlashMap remains the
+behavioral oracle for the fixed HiFiBalanced LR route. The standalone CLI can
+now run small FASTA/FASTQ fixtures through the in-memory k=15 index and emit
+SAM, but a FlashMap `.fmi` adapter is still needed for realistic references.
+A differential fixture should therefore compare the following records for the
+same read and reference:
 
 1. selected backbone/endpoint probe positions and complete-hit filtering;
 2. candidate contig, strand, diagonal, reference window, endpoint-support
@@ -43,6 +45,8 @@ record diff.
 
 The standalone crate currently exposes enough neutral data to build an
 adapter-side harness without importing FlashMap types: `Read`, `Reference`,
-`SeedIndex`, `Anchor`, `Chain`, `Cigar`, and `MappingResult`. The harness should
-run with `Config::default()` and a `WorkerPool` whose chunk size is fixed for
-reproducibility; worker count may vary only in a separate determinism test.
+`SeedIndex`, `Anchor`, `Chain`, `Cigar`, and `MappingResult`. The small CLI
+surface adds `FastxReader`, `load_reference`, and `SamWriter` for smoke tests.
+The harness should run with `Config::default()` and a `WorkerPool` whose chunk
+size is fixed for reproducibility; worker count may vary only in a separate
+determinism test. Do not treat the in-memory index as a WGS backend.
