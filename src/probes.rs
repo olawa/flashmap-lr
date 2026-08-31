@@ -51,11 +51,8 @@ pub fn extract_backbone_probes(
     let segment_sequence = &read.sequence[segment.read_start..segment.read_end];
     let mut candidates = Vec::new();
     index.visit_query_seeds(segment_sequence, &mut |seed| {
-        let mut ignored_hits = 0_u32;
-        let lookup = index.visit_hits(&seed, &mut |_| {
-            ignored_hits = ignored_hits.saturating_add(1);
-        });
-        let frequency = seed_frequency(lookup, ignored_hits);
+        let lookup = index.lookup(&seed);
+        let frequency = seed_frequency(lookup);
         if frequency == 0 {
             return true;
         }
@@ -73,8 +70,16 @@ pub fn extract_backbone_probes(
         true
     });
 
+    select_spaced_probes(candidates, segment.len(), max_probes)
+}
+
+fn select_spaced_probes(
+    mut candidates: Vec<Probe>,
+    segment_len: usize,
+    max_probes: usize,
+) -> Vec<Probe> {
     candidates.sort_by_key(|probe| (probe.frequency, probe.read_pos, probe.seed.key()));
-    let min_spacing = (segment.len() / (max_probes + 1)).max(50);
+    let min_spacing = (segment_len / (max_probes + 1)).max(50);
     let mut selected = Vec::with_capacity(max_probes);
 
     for candidate in &candidates {
@@ -111,6 +116,91 @@ pub fn extract_backbone_probes(
         probe.rank = rank + 1;
     }
     selected
+}
+
+/// Select fixed-profile probes from a read-global minimizer list.
+///
+/// The aligner already needs this list for the gapless fastpath and anchor
+/// cache. Reusing it avoids re-running minimizer extraction for every
+/// overlapping backbone segment and both endpoint windows.
+pub(crate) fn extract_read_probes_from_seeds(
+    read: Read<'_>,
+    query_seeds: &[QuerySeed],
+    index: &dyn SeedIndex,
+    config: &Config,
+) -> Vec<Probe> {
+    const END_WINDOW: usize = 1_000;
+    const END_PROBES_PER_END: usize = 4;
+    const END_MAX_FREQUENCY: usize = 250;
+
+    let seed_span = index.seed_span();
+    let mut ranked = Vec::with_capacity(query_seeds.len());
+    for &seed in query_seeds {
+        let lookup = index.lookup(&seed);
+        if !matches!(lookup.completeness, crate::HitCompleteness::Complete)
+            || lookup.reported_hits == 0
+            || lookup.reported_hits as usize
+                > config.seeding.max_probe_frequency.max(END_MAX_FREQUENCY)
+        {
+            continue;
+        }
+        ranked.push((seed, lookup.reported_hits));
+    }
+
+    let segments = segment_read(
+        read.sequence,
+        config.seeding.segment_size,
+        config.seeding.segment_overlap,
+    );
+    let mut probes = Vec::new();
+    for segment in &segments {
+        let candidates = ranked
+            .iter()
+            .filter(|(seed, frequency)| {
+                *frequency as usize <= config.seeding.max_probe_frequency
+                    && seed.query_pos as usize >= segment.read_start
+                    && (seed.query_pos as usize).saturating_add(seed_span) <= segment.read_end
+            })
+            .map(|&(seed, frequency)| Probe::new(seed, segment.index, seed.query_pos, frequency))
+            .collect();
+        probes.extend(select_spaced_probes(
+            candidates,
+            segment.len(),
+            config.seeding.max_probes_per_segment,
+        ));
+    }
+
+    let window_len = END_WINDOW.min(read.sequence.len());
+    if window_len > 0 {
+        for (window_start, window_end, segment_index) in [
+            (0, window_len, LEFT_ENDPOINT_SEGMENT),
+            (
+                read.sequence.len().saturating_sub(window_len),
+                read.sequence.len(),
+                RIGHT_ENDPOINT_SEGMENT,
+            ),
+        ] {
+            let mut candidates: Vec<Probe> = ranked
+                .iter()
+                .filter(|(seed, frequency)| {
+                    *frequency as usize <= END_MAX_FREQUENCY
+                        && seed.query_pos as usize >= window_start
+                        && (seed.query_pos as usize).saturating_add(seed_span) <= window_end
+                })
+                .map(|&(seed, frequency)| {
+                    Probe::new(seed, segment_index, seed.query_pos, frequency)
+                })
+                .collect();
+            candidates.sort_by_key(|probe| (probe.frequency, probe.read_pos, probe.seed.key()));
+            candidates.truncate(END_PROBES_PER_END);
+            for (rank, probe) in candidates.iter_mut().enumerate() {
+                probe.rank = rank + 1;
+            }
+            probes.extend(candidates);
+        }
+    }
+
+    deduplicate_probes(probes)
 }
 
 /// Segment a read and select backbone probes from every segment.
@@ -158,6 +248,10 @@ pub fn extract_read_probes(read: Read<'_>, index: &dyn SeedIndex, config: &Confi
         );
     }
 
+    deduplicate_probes(probes)
+}
+
+fn deduplicate_probes(mut probes: Vec<Probe>) -> Vec<Probe> {
     let mut seen: HashMap<(crate::SeedKey, crate::Strand, u32), usize> =
         HashMap::with_capacity(probes.len());
     // `QuerySeed::query_pos` is segment-local.  Overlapping backbone
@@ -183,8 +277,7 @@ pub fn extract_read_probes(read: Read<'_>, index: &dyn SeedIndex, config: &Confi
             deduplicated.push(probe);
         }
     }
-    probes = deduplicated;
-    probes
+    deduplicated
 }
 
 fn is_endpoint_segment(segment_index: usize) -> bool {
@@ -209,11 +302,8 @@ fn append_endpoint_probes(
     let mut candidates = Vec::new();
     for seed in index.query_seeds(sequence) {
         let read_pos = window_start.saturating_add(seed.query_pos as usize);
-        let mut visited = 0u32;
-        let lookup = index.visit_hits(&seed, &mut |_| {
-            visited = visited.saturating_add(1);
-        });
-        let frequency = endpoint_frequency(lookup, visited);
+        let lookup = index.lookup(&seed);
+        let frequency = endpoint_frequency(lookup);
         if frequency == 0
             || frequency as usize > max_frequency
             || matches!(lookup.completeness, crate::HitCompleteness::Sampled { .. })
@@ -236,20 +326,21 @@ fn append_endpoint_probes(
     }
 }
 
-fn endpoint_frequency(lookup: SeedLookup, visited: u32) -> u32 {
+fn endpoint_frequency(lookup: SeedLookup) -> u32 {
     match lookup.completeness {
         crate::HitCompleteness::Absent => 0,
         crate::HitCompleteness::Complete | crate::HitCompleteness::Sampled { .. } => {
-            lookup.reported_hits.max(visited)
+            lookup.reported_hits
         }
     }
 }
 
-fn seed_frequency(lookup: SeedLookup, visited_hits: u32) -> u32 {
+fn seed_frequency(lookup: SeedLookup) -> u32 {
     match lookup.completeness {
         crate::HitCompleteness::Absent => 0,
-        crate::HitCompleteness::Complete => lookup.reported_hits.max(visited_hits),
-        crate::HitCompleteness::Sampled { .. } => lookup.reported_hits.max(visited_hits),
+        crate::HitCompleteness::Complete | crate::HitCompleteness::Sampled { .. } => {
+            lookup.reported_hits
+        }
     }
 }
 

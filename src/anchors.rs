@@ -1,12 +1,13 @@
-//! Local exact anchors for the fixed RS-LRA DNA profile.
+//! Local anchors for the fixed RS-LRA DNA profile.
 //!
 //! This module is deliberately smaller than FlashMap's `lr::anchors` module.
 //! The first RS-LRA profile has one anchor path: paired minimizer positions
 //! are tried first, then remaining minimizer positions, and finally a dense
 //! local k-mer scan if the sparse stages do not provide enough coverage.
-//! Every accepted anchor is an exact, same-diagonal extension of a k-mer. The
-//! default FlashMap profile resolves `lr_emms_min_exact_span` to zero, so the
-//! mismatch-tolerant EMMS bridge is intentionally not part of this path.
+//! Exact same-diagonal extension remains the fallback, but compatible
+//! minimizer pairs first form bounded mismatch-tolerant EMMS spans. This is
+//! the cheap FlashMap path that can cross isolated HiFi substitutions before
+//! a per-candidate local k-mer table is needed.
 
 use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt, FxHashSet as HashSet, FxHashSetExt};
 
@@ -105,6 +106,7 @@ struct MatchingSeedHits {
 /// checks below.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CachedQuerySeedHits {
+    seed_span: usize,
     seeds: Vec<QuerySeed>,
     offsets: Vec<usize>,
     hits: Vec<SeedHit>,
@@ -117,6 +119,7 @@ pub(crate) fn cache_query_seed_hits(
     index: &dyn SeedIndex,
 ) -> CachedQuerySeedHits {
     let mut cached = CachedQuerySeedHits {
+        seed_span: index.seed_span(),
         seeds: query_seeds.to_vec(),
         offsets: Vec::with_capacity(query_seeds.len() + 1),
         hits: Vec::with_capacity(query_seeds.len()),
@@ -188,6 +191,14 @@ struct Interval {
     ref_end: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct PairedMinimizerPair {
+    q_left: usize,
+    q_right: usize,
+    r_left: u64,
+    r_right: u64,
+}
+
 #[derive(Default)]
 struct AnchorCoverage {
     intervals: Vec<Interval>,
@@ -255,6 +266,30 @@ pub(crate) fn find_anchors_with_seed_hits(
     config: &Config,
     query_seed_hits: &CachedQuerySeedHits,
 ) -> Result<Vec<Anchor>, AnchorError> {
+    find_anchors_with_seed_hits_depth(read, candidate, reference, config, query_seed_hits, true)
+}
+
+/// Cheap competitor evidence: paired EMMS plus paired exact Stage A only.
+/// The caller may use this to estimate MAPQ without constructing a local
+/// k-mer table for every weak candidate.
+pub(crate) fn find_sparse_anchors_with_seed_hits(
+    read: Read<'_>,
+    candidate: &CandidateRegion,
+    reference: &dyn Reference,
+    config: &Config,
+    query_seed_hits: &CachedQuerySeedHits,
+) -> Result<Vec<Anchor>, AnchorError> {
+    find_anchors_with_seed_hits_depth(read, candidate, reference, config, query_seed_hits, false)
+}
+
+fn find_anchors_with_seed_hits_depth(
+    read: Read<'_>,
+    candidate: &CandidateRegion,
+    reference: &dyn Reference,
+    config: &Config,
+    query_seed_hits: &CachedQuerySeedHits,
+    allow_local_fallback: bool,
+) -> Result<Vec<Anchor>, AnchorError> {
     read.validate().map_err(AnchorError::InvalidRead)?;
     let policy = DefaultAnchorPolicy::default();
     let k = config.candidates.anchor_k;
@@ -304,7 +339,7 @@ pub(crate) fn find_anchors_with_seed_hits(
     raw_minimizer_positions.dedup();
     matching_seed_hits.sort_unstable_by_key(|seed| seed.query_pos);
 
-    let (prioritized_positions, paired_hits) =
+    let (prioritized_positions, paired_hits, paired_emms_pairs) =
         build_paired_staging(candidate.strand, &matching_seed_hits, policy);
 
     let scan_end = read.sequence.len() - k;
@@ -317,6 +352,27 @@ pub(crate) fn find_anchors_with_seed_hits(
         .max_local_kmer_hits
         .max(read.sequence.len().div_ceil(1000) * 1000);
     let mut full_span_found = false;
+
+    // A compatible equal-distance pair already supplies exact support at
+    // both ends. Validate its diagonal span with the bounded EMMS rule before
+    // constructing LocalKmerMap or entering the dense fallback.
+    if config.candidates.paired_emms {
+        for pair in paired_emms_pairs {
+            let Some(anchor) = build_paired_emms_anchor(
+                read.sequence,
+                contig.sequence,
+                candidate,
+                pair,
+                query_seed_hits.seed_span,
+                window_start,
+                window_end,
+            ) else {
+                continue;
+            };
+            coverage.insert(anchor);
+            raw_anchors.push(anchor);
+        }
+    }
 
     // Paired positions are scanned first. A paired hit list is authoritative
     // for its query position; other positions need the local reference map.
@@ -413,7 +469,7 @@ pub(crate) fn find_anchors_with_seed_hits(
 
     let sufficient = is_sufficient_anchors(&raw_anchors, read.sequence.len(), policy);
 
-    if !full_span_found && !sufficient {
+    if allow_local_fallback && !full_span_found && !sufficient {
         // Stage B: remaining minimizer positions. The map is built lazily and
         // is shared by the final dense fallback.
         let stage_b: Vec<usize> = raw_minimizer_positions
@@ -432,7 +488,10 @@ pub(crate) fn find_anchors_with_seed_hits(
         );
     }
 
-    if !full_span_found && !is_sufficient_anchors(&raw_anchors, read.sequence.len(), policy) {
+    if allow_local_fallback
+        && !full_span_found
+        && !is_sufficient_anchors(&raw_anchors, read.sequence.len(), policy)
+    {
         // Stage C: dense positions not already visited as minimizers.
         let dense: Vec<usize> = (0..=scan_end)
             .filter(|pos| raw_minimizer_positions.binary_search(pos).is_err())
@@ -459,16 +518,17 @@ fn collect_matching_seed_hits(
     query_seed_hits: &CachedQuerySeedHits,
     read_len: usize,
     candidate: &CandidateRegion,
-    k: usize,
+    _k: usize,
     window_start: usize,
     window_end: usize,
 ) -> (Vec<usize>, Vec<MatchingSeedHits>) {
+    let seed_span = query_seed_hits.seed_span;
     let mut raw_minimizer_positions = Vec::new();
     let mut matching_seed_hits = Vec::new();
     for seed_index in 0..query_seed_hits.seeds.len() {
         let seed = query_seed_hits.seeds[seed_index];
         let query_pos = seed.query_pos as usize;
-        if query_pos > read_len.saturating_sub(k) {
+        if query_pos > read_len.saturating_sub(seed_span) {
             continue;
         }
         raw_minimizer_positions.push(query_pos);
@@ -480,7 +540,7 @@ fn collect_matching_seed_hits(
             if hit.contig != candidate.contig
                 || effective_strand(seed.strand, hit.strand) != candidate.strand
                 || hit.ref_pos < window_start as u64
-                || hit.ref_pos.saturating_add(k as u64) > window_end as u64
+                || hit.ref_pos.saturating_add(seed_span as u64) > window_end as u64
             {
                 continue;
             }
@@ -514,7 +574,11 @@ fn build_paired_staging(
     strand: Strand,
     matching_seed_hits: &[MatchingSeedHits],
     policy: DefaultAnchorPolicy,
-) -> (Vec<usize>, HashMap<usize, Vec<u64>>) {
+) -> (
+    Vec<usize>,
+    HashMap<usize, Vec<u64>>,
+    Vec<PairedMinimizerPair>,
+) {
     let mut paired_hits = HashMap::<usize, Vec<u64>>::new();
     for seed in matching_seed_hits {
         paired_hits
@@ -528,6 +592,7 @@ fn build_paired_staging(
     }
 
     let mut prioritized = HashSet::new();
+    let mut emms_pairs = Vec::new();
     let mut compatible_pairs = 0usize;
     for (left_index, left) in matching_seed_hits.iter().enumerate() {
         let mut right_examined = 0usize;
@@ -544,17 +609,29 @@ fn build_paired_staging(
                 break;
             }
 
-            let compatible = left.ref_positions.iter().any(|&left_ref| {
-                right.ref_positions.iter().any(|&right_ref| {
+            let mut compatible = false;
+            for &left_ref in &left.ref_positions {
+                for &right_ref in &right.ref_positions {
                     let direction_ok = match strand {
                         Strand::Forward => right_ref >= left_ref,
                         Strand::Reverse => left_ref >= right_ref,
                     };
-                    direction_ok
-                        && (left_ref.abs_diff(right_ref) as usize).abs_diff(query_distance)
-                            <= policy.paired_distance_tolerance
-                })
-            });
+                    let ref_distance = left_ref.abs_diff(right_ref) as usize;
+                    if direction_ok
+                        && ref_distance.abs_diff(query_distance) <= policy.paired_distance_tolerance
+                    {
+                        compatible = true;
+                        if ref_distance == query_distance && emms_pairs.len() < 1024 {
+                            emms_pairs.push(PairedMinimizerPair {
+                                q_left: left.query_pos,
+                                q_right: right.query_pos,
+                                r_left: left_ref,
+                                r_right: right_ref,
+                            });
+                        }
+                    }
+                }
+            }
             if compatible {
                 prioritized.insert(left.query_pos);
                 prioritized.insert(right.query_pos);
@@ -571,7 +648,99 @@ fn build_paired_staging(
 
     let mut prioritized: Vec<usize> = prioritized.into_iter().collect();
     prioritized.sort_unstable();
-    (prioritized, paired_hits)
+    emms_pairs.sort_unstable_by_key(|pair| (pair.q_left, pair.q_right, pair.r_left, pair.r_right));
+    emms_pairs.dedup();
+    (prioritized, paired_hits, emms_pairs)
+}
+
+/// Join an equal-distance minimizer pair across isolated substitutions.
+///
+/// Indels necessarily change the diagonal and are rejected here; gap DP owns
+/// those spans. Accepted mismatch runs are at most three bases and must
+/// re-lock for twelve exact bases before another run. The final exact seed
+/// naturally supplies the terminal re-lock.
+fn build_paired_emms_anchor(
+    read: &[u8],
+    reference: &[u8],
+    candidate: &CandidateRegion,
+    pair: PairedMinimizerPair,
+    seed_span: usize,
+    window_start: usize,
+    window_end: usize,
+) -> Option<Anchor> {
+    const RELOCK_SPAN: usize = 12;
+    const MAX_MISMATCH_RUN: usize = 3;
+    const MAX_MISMATCHES: usize = 32;
+    const MAX_MISMATCH_PERCENT: usize = 8;
+
+    if seed_span == 0 || pair.q_right < pair.q_left.checked_add(seed_span)? {
+        return None;
+    }
+    let query_distance = pair.q_right - pair.q_left;
+    if pair.r_left.abs_diff(pair.r_right) as usize != query_distance {
+        return None;
+    }
+
+    let q_end = pair.q_right.checked_add(seed_span)?;
+    let (ref_start, ref_end) = match candidate.strand {
+        Strand::Forward => (pair.r_left, pair.r_right.checked_add(seed_span as u64)?),
+        Strand::Reverse => (pair.r_right, pair.r_left.checked_add(seed_span as u64)?),
+    };
+    if q_end > read.len()
+        || ref_start < window_start as u64
+        || ref_end > window_end as u64
+        || ref_end > reference.len() as u64
+    {
+        return None;
+    }
+
+    let span_len = q_end - pair.q_left;
+    let mut mismatches = 0usize;
+    let mut mismatch_run = 0usize;
+    let mut exact_since_run = RELOCK_SPAN;
+    let mut awaiting_relock = false;
+    for offset in 0..span_len {
+        let ref_index = match candidate.strand {
+            Strand::Forward => ref_start as usize + offset,
+            Strand::Reverse => ref_end as usize - 1 - offset,
+        };
+        if bases_match(
+            read[pair.q_left + offset],
+            reference[ref_index],
+            candidate.strand,
+        ) {
+            mismatch_run = 0;
+            exact_since_run = exact_since_run.saturating_add(1);
+            if exact_since_run >= RELOCK_SPAN {
+                awaiting_relock = false;
+            }
+            continue;
+        }
+
+        if mismatch_run == 0 && (awaiting_relock || exact_since_run < RELOCK_SPAN) {
+            return None;
+        }
+        mismatch_run += 1;
+        mismatches += 1;
+        if mismatch_run > MAX_MISMATCH_RUN || mismatches > MAX_MISMATCHES {
+            return None;
+        }
+        exact_since_run = 0;
+        awaiting_relock = true;
+    }
+
+    if awaiting_relock || mismatches * 100 > span_len * MAX_MISMATCH_PERCENT {
+        return None;
+    }
+    Some(Anchor {
+        ref_id: candidate.contig,
+        ref_start,
+        ref_end,
+        q_start: pair.q_left as u32,
+        q_end: q_end as u32,
+        strand: candidate.strand,
+        score: span_len.saturating_sub(mismatches).min(i32::MAX as usize) as i32,
+    })
 }
 
 struct ExactAnchorRequest<'a> {
@@ -968,6 +1137,77 @@ mod tests {
         assert_eq!(anchors[0].ref_start, 0);
         assert_eq!(anchors[0].ref_end as usize, query.len());
         assert_eq!(anchors[0].strand, Strand::Reverse);
+    }
+
+    #[test]
+    fn paired_emms_bridges_an_isolated_substitution() {
+        let reference = vec![b'A'; 256];
+        let mut query = reference.clone();
+        query[80] = b'C';
+        let anchor = build_paired_emms_anchor(
+            &query,
+            &reference,
+            &candidate(reference.len(), Strand::Forward),
+            PairedMinimizerPair {
+                q_left: 16,
+                q_right: 112,
+                r_left: 16,
+                r_right: 112,
+            },
+            24,
+            0,
+            reference.len(),
+        )
+        .expect("isolated SNP should retain the paired diagonal");
+        assert_eq!((anchor.q_start, anchor.q_end), (16, 136));
+        assert_eq!((anchor.ref_start, anchor.ref_end), (16, 136));
+        assert_eq!(anchor.score, 119);
+    }
+
+    #[test]
+    fn paired_emms_rejects_a_register_shift_like_block() {
+        let reference = vec![b'A'; 256];
+        let mut query = reference.clone();
+        query[80..96].fill(b'C');
+        assert!(build_paired_emms_anchor(
+            &query,
+            &reference,
+            &candidate(reference.len(), Strand::Forward),
+            PairedMinimizerPair {
+                q_left: 16,
+                q_right: 112,
+                r_left: 16,
+                r_right: 112,
+            },
+            24,
+            0,
+            reference.len(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn paired_emms_uses_reverse_complement_geometry() {
+        let reference = vec![b'A'; 256];
+        let mut query = vec![b'T'; 256];
+        query[80] = b'G';
+        let anchor = build_paired_emms_anchor(
+            &query,
+            &reference,
+            &candidate(reference.len(), Strand::Reverse),
+            PairedMinimizerPair {
+                q_left: 16,
+                q_right: 112,
+                r_left: 112,
+                r_right: 16,
+            },
+            24,
+            0,
+            reference.len(),
+        )
+        .expect("reverse paired span should be accepted");
+        assert_eq!((anchor.ref_start, anchor.ref_end), (16, 136));
+        assert_eq!(anchor.strand, Strand::Reverse);
     }
 
     fn test_complement(base: u8) -> u8 {

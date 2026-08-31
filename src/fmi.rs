@@ -587,6 +587,60 @@ impl SeedIndex for FmiIndex {
             .collect()
     }
 
+    fn lookup(&self, seed: &QuerySeed) -> SeedLookup {
+        let (hash, code) = seed.key().parts();
+        let key = hash as u32;
+        let hashes = self.hashes.as_slice();
+        let (prefix_start, prefix_end) = self.prefix_range(key);
+        if prefix_start >= prefix_end || prefix_end > hashes.len() {
+            return self
+                .capped_total(hash)
+                .map_or_else(SeedLookup::absent, |total| {
+                    SeedLookup::sampled(0, Some(total))
+                });
+        }
+        let window = &hashes[prefix_start..prefix_end];
+        let Ok(relative) = window.binary_search(&key) else {
+            return self
+                .capped_total(hash)
+                .map_or_else(SeedLookup::absent, |total| {
+                    SeedLookup::sampled(0, Some(total))
+                });
+        };
+        let absolute = prefix_start + relative;
+        let mut lo = absolute;
+        while lo > prefix_start && hashes[lo - 1] == key {
+            lo -= 1;
+        }
+        let mut hi = absolute + 1;
+        while hi < prefix_end && hashes[hi] == key {
+            hi += 1;
+        }
+        for index in lo..hi {
+            let range = self.ranges.as_slice()[index];
+            if (range >> FINGERPRINT_SHIFT) & FINGERPRINT_MASK != code & FINGERPRINT_MASK {
+                continue;
+            }
+            let stored = if range & INLINE_BIT != 0 {
+                1
+            } else {
+                ((range >> 32) & 0xffff) as u32
+            };
+            if stored == 0 {
+                return SeedLookup::absent();
+            }
+            return if range & CAPPED_BIT != 0 {
+                SeedLookup::sampled(stored, self.capped_total(hash))
+            } else {
+                SeedLookup::complete(stored)
+            };
+        }
+        self.capped_total(hash)
+            .map_or_else(SeedLookup::absent, |total| {
+                SeedLookup::sampled(0, Some(total))
+            })
+    }
+
     fn visit_hits(&self, seed: &QuerySeed, visit: &mut dyn FnMut(SeedHit)) -> SeedLookup {
         let (hash, code) = seed.key().parts();
         let key = hash as u32;

@@ -31,6 +31,12 @@ pub struct CandidateConfig {
     pub min_anchor_length: usize,
     pub max_anchors_per_region: usize,
     pub diagonal_tolerance: i32,
+    /// Experimental SNP-tolerant bridge between equal-distance minimizers.
+    /// Exact paired staging remains the quality-verified default.
+    pub paired_emms: bool,
+    /// Experimental cheap competitor pass for candidates below 70% of the
+    /// top score. Full candidate refinement remains the default.
+    pub tiered_candidates: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,7 +61,10 @@ impl Default for WorkerPoolConfig {
     fn default() -> Self {
         Self {
             workers: 1,
-            chunk_size: 1024,
+            // Small batches avoid long-tail imbalance when a few repetitive
+            // LR reads monopolize one worker. Ten was the fastest stable
+            // value in the chr20 and centromere benchmarks.
+            chunk_size: 10,
             reader_batch_size: None,
         }
     }
@@ -81,6 +90,8 @@ impl Default for Config {
                 min_anchor_length: 30,
                 max_anchors_per_region: 512,
                 diagonal_tolerance: 2_000,
+                paired_emms: false,
+                tiered_candidates: false,
             },
             alignment: AlignmentConfig {
                 bridge_flank: 256,

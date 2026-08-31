@@ -210,6 +210,18 @@ impl SeedIndex for InMemorySeedIndex {
         query_minimizers(sequence)
     }
 
+    fn lookup(&self, seed: &QuerySeed) -> SeedLookup {
+        let Some(bucket) = self.hits.get(&seed.key()) else {
+            return SeedLookup::absent();
+        };
+
+        if bucket.total as usize > self.max_stored_hits {
+            SeedLookup::sampled(bucket.hits.len() as u32, Some(bucket.total))
+        } else {
+            SeedLookup::complete(bucket.total)
+        }
+    }
+
     fn visit_hits(&self, seed: &QuerySeed, visit: &mut dyn FnMut(SeedHit)) -> SeedLookup {
         let Some(bucket) = self.hits.get(&seed.key()) else {
             return SeedLookup::absent();
@@ -249,6 +261,16 @@ pub trait SeedIndex: Sync {
                 break;
             }
         }
+    }
+
+    /// Return hit-list metadata without requiring callers to decode hits.
+    ///
+    /// Backends with a separate range table should override this method. The
+    /// default preserves compatibility for small/test adapters, while the
+    /// production packed index can answer frequency-selection queries from
+    /// its range metadata alone.
+    fn lookup(&self, seed: &QuerySeed) -> SeedLookup {
+        self.visit_hits(seed, &mut |_| {})
     }
 
     fn visit_hits(&self, seed: &QuerySeed, visit: &mut dyn FnMut(SeedHit)) -> SeedLookup;

@@ -3,12 +3,16 @@
 //! The mapper owns no scheduling state. Stream adapters use the fixed
 //! [`crate::WorkerPool`] and call this kernel from its workers.
 
-use crate::anchors::{cache_query_seed_hits, find_anchors_with_seed_hits, CachedQuerySeedHits};
+use crate::anchors::{
+    cache_query_seed_hits, find_anchors_with_seed_hits, find_sparse_anchors_with_seed_hits,
+    CachedQuerySeedHits,
+};
 use crate::candidates::{cluster_probe_hits_for_read, EndpointSupport};
+use crate::probes::extract_read_probes_from_seeds;
 use crate::{
-    build_chain_alignment, chain_anchors, extract_read_probes, Config, ConfigError,
-    DiagnosticsSink, MapError, MappedRead, MappingResult, OwnedRead, Read, ReadDiagnostics,
-    Reference, SeedIndex, WorkerPool, WorkerPoolError, WorkerPoolStats,
+    build_chain_alignment, chain_anchors, Anchor, Chain, Config, ConfigError, DiagnosticsSink,
+    MapError, MappedRead, MappingResult, OwnedRead, Read, ReadDiagnostics, Reference, SeedIndex,
+    WorkerPool, WorkerPoolError, WorkerPoolStats,
 };
 use std::convert::Infallible;
 use std::time::Instant;
@@ -67,11 +71,41 @@ impl<'a> Aligner<'a> {
             query_bases: saturating_u32(read.sequence.len()),
             ..ReadDiagnostics::default()
         };
-        let probes = extract_read_probes(read, self.index, &self.config);
+        let phase_started = Instant::now();
+        let query_seeds = self.index.query_seeds(read.sequence);
+        diagnostics.query_seed_nanos = elapsed_nanos(phase_started);
+        diagnostics.exact_fastpath_attempts = 1;
+        if let Some((contig_id, chain)) =
+            try_exact_unique_chain(read.sequence, &query_seeds, self.reference, self.index)
+        {
+            let contig = self.reference.contig(contig_id).ok_or(MapError::Anchor(
+                crate::AnchorError::MissingReference(contig_id),
+            ))?;
+            let cigar_started = Instant::now();
+            let primary = build_chain_alignment(read, contig, &chain, 60, &self.config)
+                .map_err(MapError::Cigar)?;
+            diagnostics.cigar_nanos = elapsed_nanos(cigar_started);
+            diagnostics.exact_fastpath_accepted = 1;
+            diagnostics.anchors = 1;
+            diagnostics.chains = 1;
+            diagnostics.mapped_bases = saturating_u32(read.sequence.len());
+            diagnostics.elapsed_nanos = elapsed_nanos(started);
+            self.notify(read.name, &diagnostics);
+            return Ok(MappingResult {
+                primary: Some(primary),
+                supplementary: Vec::new(),
+                diagnostics: self.diagnostics.map(|_| diagnostics),
+            });
+        }
+        let phase_started = Instant::now();
+        let probes = extract_read_probes_from_seeds(read, &query_seeds, self.index, &self.config);
+        diagnostics.probe_nanos = elapsed_nanos(phase_started);
         diagnostics.seeds_seen = saturating_u32(probes.len());
         diagnostics.seeds_used = diagnostics.seeds_seen;
+        let phase_started = Instant::now();
         let candidates =
             cluster_probe_hits_for_read(&probes, read.sequence.len(), self.index, &self.config);
+        diagnostics.candidate_nanos = elapsed_nanos(phase_started);
         diagnostics.candidates = saturating_u32(candidates.len());
 
         // Anchor discovery is attempted for each ranked candidate, but the
@@ -79,16 +113,18 @@ impl<'a> Aligner<'a> {
         // immutable vector so candidate count cannot multiply full-read seed
         // extraction and index lookup work.  Avoid the scan entirely when
         // probe clustering produced no candidate.
+        let phase_started = Instant::now();
         let query_seed_hits = if candidates.is_empty() {
             CachedQuerySeedHits::default()
         } else {
-            let query_seeds = self.index.query_seeds(read.sequence);
             cache_query_seed_hits(&query_seeds, self.index)
         };
+        diagnostics.seed_cache_nanos = elapsed_nanos(phase_started);
 
         let mut placements = Vec::new();
         let top_candidate_score = candidates.first().map(|c| c.score).unwrap_or(0);
         let min_competitive_score = (top_candidate_score as f32 * 0.40) as i32;
+        let min_full_score = (top_candidate_score as f32 * 0.70) as i32;
         let max_candidates = self.config.candidates.max_regions.min(8);
 
         for (idx, candidate) in candidates.iter().take(max_candidates).enumerate() {
@@ -98,14 +134,38 @@ impl<'a> Aligner<'a> {
             if idx >= 3 && placements.is_empty() {
                 break;
             }
-            let anchors = find_anchors_with_seed_hits(
-                read,
-                candidate,
-                self.reference,
-                &self.config,
-                &query_seed_hits,
-            )
+            let full_search = !self.config.candidates.tiered_candidates
+                || candidate.score >= min_full_score
+                || (placements.is_empty() && idx < 3);
+            if full_search {
+                diagnostics.full_anchor_searches =
+                    diagnostics.full_anchor_searches.saturating_add(1);
+            } else {
+                diagnostics.sparse_anchor_searches =
+                    diagnostics.sparse_anchor_searches.saturating_add(1);
+            }
+            let phase_started = Instant::now();
+            let mut anchors = if full_search {
+                find_anchors_with_seed_hits(
+                    read,
+                    candidate,
+                    self.reference,
+                    &self.config,
+                    &query_seed_hits,
+                )
+            } else {
+                find_sparse_anchors_with_seed_hits(
+                    read,
+                    candidate,
+                    self.reference,
+                    &self.config,
+                    &query_seed_hits,
+                )
+            }
             .map_err(MapError::Anchor)?;
+            diagnostics.anchor_nanos = diagnostics
+                .anchor_nanos
+                .saturating_add(elapsed_nanos(phase_started));
             diagnostics.anchors = diagnostics
                 .anchors
                 .saturating_add(saturating_u32(anchors.len()));
@@ -113,21 +173,76 @@ impl<'a> Aligner<'a> {
                 continue;
             }
 
-            let chain_set = chain_anchors(
-                anchors,
+            let phase_started = Instant::now();
+            let mut chain_set = chain_anchors(
+                anchors.clone(),
                 read.sequence.len(),
                 self.config.candidates.diagonal_tolerance,
             );
+            diagnostics.chain_nanos = diagnostics
+                .chain_nanos
+                .saturating_add(elapsed_nanos(phase_started));
             diagnostics.chains = diagnostics.chains.saturating_add(saturating_u32(
                 usize::from(chain_set.primary.is_some()) + chain_set.alternatives.len(),
             ));
-            if let Some(chain) = chain_set.primary {
+            if let Some(mut chain) = chain_set.primary {
                 // Match FlashMap's fixed LR validity floor: a chain must
                 // explain at least one fifth of the read or 300 query bases.
                 // Without this guard, a single isolated exact anchor could
                 // become a MAPQ-60 placement in a repetitive reference.
                 if chain.query_covered_fraction < 0.20 && chain.query_covered_bases < 300 {
                     continue;
+                }
+
+                // Sparse evidence may identify a genuinely stronger locus.
+                // Promote only that threatening candidate to the full search
+                // before it is allowed to become the primary placement.
+                let sparse_rank = endpoint_rank_score(
+                    chain.score,
+                    candidate.endpoint_support,
+                    read.sequence.len(),
+                );
+                let best_existing_rank = placements
+                    .iter()
+                    .map(|placement: &(crate::ContigId, Chain, EndpointSupport)| {
+                        endpoint_rank_score(placement.1.score, placement.2, read.sequence.len())
+                    })
+                    .max();
+                if !full_search && best_existing_rank.is_none_or(|best| sparse_rank >= best) {
+                    diagnostics.sparse_promotions = diagnostics.sparse_promotions.saturating_add(1);
+                    let phase_started = Instant::now();
+                    anchors = find_anchors_with_seed_hits(
+                        read,
+                        candidate,
+                        self.reference,
+                        &self.config,
+                        &query_seed_hits,
+                    )
+                    .map_err(MapError::Anchor)?;
+                    diagnostics.anchor_nanos = diagnostics
+                        .anchor_nanos
+                        .saturating_add(elapsed_nanos(phase_started));
+                    diagnostics.anchors = diagnostics
+                        .anchors
+                        .saturating_add(saturating_u32(anchors.len()));
+                    let phase_started = Instant::now();
+                    chain_set = chain_anchors(
+                        anchors,
+                        read.sequence.len(),
+                        self.config.candidates.diagonal_tolerance,
+                    );
+                    diagnostics.chain_nanos = diagnostics
+                        .chain_nanos
+                        .saturating_add(elapsed_nanos(phase_started));
+                    let Some(full_chain) = chain_set.primary else {
+                        continue;
+                    };
+                    if full_chain.query_covered_fraction < 0.20
+                        && full_chain.query_covered_bases < 300
+                    {
+                        continue;
+                    }
+                    chain = full_chain;
                 }
                 placements.push((candidate.contig, chain, candidate.endpoint_support));
             }
@@ -177,8 +292,10 @@ impl<'a> Aligner<'a> {
         let contig = self.reference.contig(*contig_id).ok_or(MapError::Anchor(
             crate::AnchorError::MissingReference(*contig_id),
         ))?;
+        let phase_started = Instant::now();
         let primary = build_chain_alignment(read, contig, chain, mapq, &self.config)
             .map_err(MapError::Cigar)?;
+        diagnostics.cigar_nanos = elapsed_nanos(phase_started);
         diagnostics.mapped_bases = primary
             .query_end
             .saturating_sub(primary.query_start)
@@ -267,6 +384,104 @@ impl<'a> Aligner<'a> {
     fn notify(&self, read_name: &str, diagnostics: &ReadDiagnostics) {
         if let Some(sink) = self.diagnostics {
             sink.read_complete(read_name, diagnostics);
+        }
+    }
+}
+
+/// Return a full-read chain when a complete unique minimizer projects to a
+/// exact gapless placement. Only three unique seeds are tested: failure falls
+/// through to normal candidate discovery, while success bypasses all local
+/// k-mer tables, chaining alternatives, and gap DP.
+fn try_exact_unique_chain(
+    read: &[u8],
+    query_seeds: &[crate::QuerySeed],
+    reference: &dyn Reference,
+    index: &dyn SeedIndex,
+) -> Option<(crate::ContigId, Chain)> {
+    let k = index.seed_span();
+    if k == 0 || read.len() < k || read.len() > u32::MAX as usize {
+        return None;
+    }
+
+    let mut tested = 0usize;
+    for seed in query_seeds {
+        let lookup = index.lookup(seed);
+        if !matches!(lookup.completeness, crate::HitCompleteness::Complete)
+            || lookup.reported_hits != 1
+        {
+            continue;
+        }
+        tested += 1;
+        let mut unique_hit = None;
+        let visited = index.visit_hits(seed, &mut |hit| {
+            if unique_hit.is_none() {
+                unique_hit = Some(hit);
+            }
+        });
+        if !matches!(visited.completeness, crate::HitCompleteness::Complete)
+            || visited.reported_hits != 1
+        {
+            continue;
+        }
+        let hit = unique_hit?;
+        let strand = if seed.strand == hit.strand {
+            crate::Strand::Forward
+        } else {
+            crate::Strand::Reverse
+        };
+        let q_pos = seed.query_pos as usize;
+        let ref_start = match strand {
+            crate::Strand::Forward => hit.ref_pos.checked_sub(q_pos as u64),
+            crate::Strand::Reverse => {
+                let trailing = read.len().checked_sub(q_pos.checked_add(k)?)?;
+                hit.ref_pos.checked_sub(trailing as u64)
+            }
+        }?;
+        let ref_end = ref_start.checked_add(read.len() as u64)?;
+        let contig = reference.contig(hit.contig)?;
+        if ref_end > contig.sequence.len() as u64 {
+            if tested >= 3 {
+                break;
+            }
+            continue;
+        }
+        let exact = read.iter().enumerate().all(|(offset, &query_base)| {
+            let ref_offset = match strand {
+                crate::Strand::Forward => ref_start as usize + offset,
+                crate::Strand::Reverse => ref_end as usize - 1 - offset,
+            };
+            exact_bases_match(query_base, contig.sequence[ref_offset], strand)
+        });
+        if exact {
+            let anchor = Anchor {
+                ref_id: hit.contig,
+                ref_start,
+                ref_end,
+                q_start: 0,
+                q_end: read.len() as u32,
+                strand,
+                score: read.len().min(i32::MAX as usize) as i32,
+            };
+            let chain = chain_anchors(vec![anchor], read.len(), 0).primary?;
+            return Some((hit.contig, chain));
+        }
+        if tested >= 3 {
+            break;
+        }
+    }
+    None
+}
+
+fn exact_bases_match(query: u8, reference: u8, strand: crate::Strand) -> bool {
+    let query = query.to_ascii_uppercase();
+    let reference = reference.to_ascii_uppercase();
+    match strand {
+        crate::Strand::Forward => query == reference,
+        crate::Strand::Reverse => {
+            matches!(
+                (query, reference),
+                (b'A', b'T') | (b'C', b'G') | (b'G', b'C') | (b'T', b'A')
+            )
         }
     }
 }
