@@ -182,12 +182,14 @@ pub fn build_chain_cigar(
         contig.sequence,
         &oriented_query,
         ref_start,
+        config.alignment.sensitive,
     );
     left_align_indels(
         &mut repaired_ops,
         contig.sequence,
         &oriented_query,
         ref_start,
+        config.alignment.sensitive,
     );
     crate::postprocess::endpoint_score_clip(
         &mut repaired_ops,
@@ -381,10 +383,12 @@ fn append_gap_recursive(
     config: &Config,
     depth: usize,
 ) -> Result<(), ChainCigarError> {
-    const SMALL_GAP_DP_MAX: usize = 1_024;
-    const SMALL_GAP_DP_DELTA_MAX: usize = 256;
-    const MEDIUM_GAP_DP_MAX: usize = 2_048;
-    const MEDIUM_GAP_DP_DELTA_MAX: usize = 512;
+    let (small_gap_dp_max, small_gap_dp_delta_max, medium_gap_dp_max, medium_gap_dp_delta_max) =
+        if config.alignment.sensitive {
+            (1_024, 256, 2_048, 512)
+        } else {
+            (512, 64, 1_536, 128)
+        };
     const RECURSIVE_SPLIT_K: usize = 13;
     const RECURSIVE_SPLIT_MAX_DEPTH: usize = 8;
     // Recursive exact-island lookup is independent of the bounded DP bridge
@@ -433,8 +437,8 @@ fn append_gap_recursive(
     let max_gap = query_len.max(reference_len);
     let delta = query_len.abs_diff(reference_len);
     let can_dp = max_gap <= config.alignment.bridge_max_gap
-        && max_gap <= SMALL_GAP_DP_MAX
-        && delta <= SMALL_GAP_DP_DELTA_MAX
+        && max_gap <= small_gap_dp_max
+        && delta <= small_gap_dp_delta_max
         && query_len.saturating_mul(reference_len) <= 16_000_000;
     if can_dp {
         let band = delta
@@ -496,8 +500,8 @@ fn append_gap_recursive(
     // common 200--1500 bp phase-shift case faithful to FlashMap without
     // allowing a quadratic DP call on an arbitrarily large gap.
     if max_gap <= config.alignment.bridge_max_gap
-        && max_gap <= MEDIUM_GAP_DP_MAX
-        && delta <= MEDIUM_GAP_DP_DELTA_MAX
+        && max_gap <= medium_gap_dp_max
+        && delta <= medium_gap_dp_delta_max
         && query_len.saturating_mul(reference_len) <= 16_000_000
     {
         let band = delta.saturating_add(32).clamp(32, 256);
@@ -737,117 +741,121 @@ fn merge_fragmented_indels(
     reference: &[u8],
     query: &[u8],
     ref_start: usize,
+    sensitive: bool,
 ) {
+    let max_micro_match = if sensitive { 12 } else { 4 };
     if ops.len() < 3 {
         return;
     }
-    let mut merged = Vec::with_capacity(ops.len());
+    let mut changed = false;
+    let mut i = 0;
     let mut q_pos = 0usize;
     let mut r_pos = ref_start;
-    let mut i = 0;
 
-    while i < ops.len() {
-        if i + 2 < ops.len() {
-            match (ops[i], ops[i + 1], ops[i + 2]) {
-                (CigarOp::Del(d1), CigarOp::Match(m), CigarOp::Del(d2)) if m <= 12 => {
-                    let total_d = d1 + d2;
-                    let m_len = m as usize;
-                    let q_slice = query.get(q_pos..q_pos + m_len);
-                    if let Some(q_bytes) = q_slice {
-                        let r_orig =
-                            reference.get(r_pos + d1 as usize..r_pos + d1 as usize + m_len);
-                        let r_del_first = reference
-                            .get(r_pos + total_d as usize..r_pos + total_d as usize + m_len);
-                        let r_match_first = reference.get(r_pos..r_pos + m_len);
+    while i + 2 < ops.len() {
+        match (ops[i], ops[i + 1], ops[i + 2]) {
+            (CigarOp::Del(d1), CigarOp::Match(m), CigarOp::Del(d2))
+                if m as usize <= max_micro_match =>
+            {
+                let total_d = d1 + d2;
+                let m_len = m as usize;
+                let q_slice = query.get(q_pos..q_pos + m_len);
+                if let Some(q_bytes) = q_slice {
+                    let r_orig = reference.get(r_pos + d1 as usize..r_pos + d1 as usize + m_len);
+                    let r_del_first =
+                        reference.get(r_pos + total_d as usize..r_pos + total_d as usize + m_len);
+                    let r_match_first = reference.get(r_pos..r_pos + m_len);
 
-                        let orig_nm = r_orig
-                            .map(|r| mismatch_count(q_bytes, r))
-                            .unwrap_or(usize::MAX);
-                        let del_first_nm = r_del_first
-                            .map(|r| mismatch_count(q_bytes, r))
-                            .unwrap_or(usize::MAX);
-                        let match_first_nm = r_match_first
-                            .map(|r| mismatch_count(q_bytes, r))
-                            .unwrap_or(usize::MAX);
+                    let orig_nm = r_orig
+                        .map(|r| mismatch_count(q_bytes, r))
+                        .unwrap_or(usize::MAX);
+                    let del_first_nm = r_del_first
+                        .map(|r| mismatch_count(q_bytes, r))
+                        .unwrap_or(usize::MAX);
+                    let match_first_nm = r_match_first
+                        .map(|r| mismatch_count(q_bytes, r))
+                        .unwrap_or(usize::MAX);
 
-                        if match_first_nm <= orig_nm || match_first_nm == 0 {
-                            merged.push(CigarOp::Match(m));
-                            merged.push(CigarOp::Del(total_d));
-                            q_pos = q_pos.saturating_add(m_len);
-                            r_pos = r_pos.saturating_add(m_len + total_d as usize);
-                            i += 3;
-                            continue;
-                        } else if del_first_nm <= orig_nm || del_first_nm == 0 {
-                            merged.push(CigarOp::Del(total_d));
-                            merged.push(CigarOp::Match(m));
-                            q_pos = q_pos.saturating_add(m_len);
-                            r_pos = r_pos.saturating_add(total_d as usize + m_len);
-                            i += 3;
-                            continue;
-                        }
+                    if match_first_nm <= orig_nm || match_first_nm == 0 {
+                        ops[i] = CigarOp::Match(m);
+                        ops[i + 1] = CigarOp::Del(total_d);
+                        ops.remove(i + 2);
+                        changed = true;
+                        continue;
+                    } else if del_first_nm <= orig_nm || del_first_nm == 0 {
+                        ops[i] = CigarOp::Del(total_d);
+                        ops[i + 1] = CigarOp::Match(m);
+                        ops.remove(i + 2);
+                        changed = true;
+                        continue;
                     }
                 }
-                (CigarOp::Ins(i1), CigarOp::Match(m), CigarOp::Ins(i2)) if m <= 12 => {
-                    let total_i = i1 + i2;
-                    let m_len = m as usize;
-                    let r_slice = reference.get(r_pos..r_pos + m_len);
-                    if let Some(r_bytes) = r_slice {
-                        let q_orig = query.get(q_pos + i1 as usize..q_pos + i1 as usize + m_len);
-                        let q_ins_first =
-                            query.get(q_pos + total_i as usize..q_pos + total_i as usize + m_len);
-                        let q_match_first = query.get(q_pos..q_pos + m_len);
-
-                        let orig_nm = q_orig
-                            .map(|q| mismatch_count(q, r_bytes))
-                            .unwrap_or(usize::MAX);
-                        let ins_first_nm = q_ins_first
-                            .map(|q| mismatch_count(q, r_bytes))
-                            .unwrap_or(usize::MAX);
-                        let match_first_nm = q_match_first
-                            .map(|q| mismatch_count(q, r_bytes))
-                            .unwrap_or(usize::MAX);
-
-                        if match_first_nm <= orig_nm || match_first_nm == 0 {
-                            merged.push(CigarOp::Match(m));
-                            merged.push(CigarOp::Ins(total_i));
-                            q_pos = q_pos.saturating_add(m_len + total_i as usize);
-                            r_pos = r_pos.saturating_add(m_len);
-                            i += 3;
-                            continue;
-                        } else if ins_first_nm <= orig_nm || ins_first_nm == 0 {
-                            merged.push(CigarOp::Ins(total_i));
-                            merged.push(CigarOp::Match(m));
-                            q_pos = q_pos.saturating_add(total_i as usize + m_len);
-                            r_pos = r_pos.saturating_add(m_len);
-                            i += 3;
-                            continue;
-                        }
-                    }
-                }
-                _ => {}
             }
+            (CigarOp::Ins(i1), CigarOp::Match(m), CigarOp::Ins(i2))
+                if m as usize <= max_micro_match =>
+            {
+                let total_i = i1 + i2;
+                let m_len = m as usize;
+                let r_slice = reference.get(r_pos..r_pos + m_len);
+                if let Some(r_bytes) = r_slice {
+                    let q_orig = query.get(q_pos + i1 as usize..q_pos + i1 as usize + m_len);
+                    let q_ins_first =
+                        query.get(q_pos + total_i as usize..q_pos + total_i as usize + m_len);
+                    let q_match_first = query.get(q_pos..q_pos + m_len);
+
+                    let orig_nm = q_orig
+                        .map(|q| mismatch_count(q, r_bytes))
+                        .unwrap_or(usize::MAX);
+                    let ins_first_nm = q_ins_first
+                        .map(|q| mismatch_count(q, r_bytes))
+                        .unwrap_or(usize::MAX);
+                    let match_first_nm = q_match_first
+                        .map(|q| mismatch_count(q, r_bytes))
+                        .unwrap_or(usize::MAX);
+
+                    if match_first_nm <= orig_nm || match_first_nm == 0 {
+                        ops[i] = CigarOp::Match(m);
+                        ops[i + 1] = CigarOp::Ins(total_i);
+                        ops.remove(i + 2);
+                        changed = true;
+                        continue;
+                    } else if ins_first_nm <= orig_nm || ins_first_nm == 0 {
+                        ops[i] = CigarOp::Ins(total_i);
+                        ops[i + 1] = CigarOp::Match(m);
+                        ops.remove(i + 2);
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+            _ => {}
         }
 
-        let op = ops[i];
-        if op.consumes_query() {
-            q_pos = q_pos.saturating_add(op_len(op));
+        if ops[i].consumes_query() {
+            q_pos = q_pos.saturating_add(op_len(ops[i]));
         }
-        if op.consumes_reference() {
-            r_pos = r_pos.saturating_add(op_len(op));
+        if ops[i].consumes_reference() {
+            r_pos = r_pos.saturating_add(op_len(ops[i]));
         }
-        merged.push(op);
         i += 1;
     }
 
-    normalize_ops(&mut merged);
-    *ops = merged;
+    if changed {
+        normalize_ops(ops);
+    }
 }
 
 /// Shift repeat-compatible insertions/deletions toward the leftmost
 /// reference coordinate. This is the same normalization used by FlashMap's
 /// LR output path and is deliberately restricted to a preceding `M` run, so
 /// it cannot cross another indel or a soft clip.
-fn left_align_indels(ops: &mut Vec<CigarOp>, reference: &[u8], query: &[u8], ref_start: usize) {
+fn left_align_indels(
+    ops: &mut Vec<CigarOp>,
+    reference: &[u8],
+    query: &[u8],
+    ref_start: usize,
+    sensitive: bool,
+) {
     let mut reference_pos = ref_start;
     let mut query_pos = 0usize;
     let mut index = 0usize;
@@ -868,6 +876,7 @@ fn left_align_indels(ops: &mut Vec<CigarOp>, reference: &[u8], query: &[u8], ref
                     &mut query_pos,
                     reference,
                     query,
+                    sensitive,
                 );
                 query_pos = query_pos.saturating_add(length as usize);
                 index += 1;
@@ -881,6 +890,7 @@ fn left_align_indels(ops: &mut Vec<CigarOp>, reference: &[u8], query: &[u8], ref
                     &mut query_pos,
                     reference,
                     query,
+                    sensitive,
                 );
                 reference_pos = reference_pos.saturating_add(length as usize);
                 index += 1;
@@ -903,6 +913,7 @@ fn left_align_insertion(
     query_pos: &mut usize,
     reference: &[u8],
     query: &[u8],
+    sensitive: bool,
 ) {
     if index == 0 || length == 0 {
         return;
@@ -950,7 +961,7 @@ fn left_align_insertion(
     // repeat units in the preceding match window preserves or improves alignment quality.
     let q_pos = *query_pos;
     let r_pos = *reference_pos;
-    let scan_limit = match_len.min(128);
+    let scan_limit = if sensitive { match_len } else { match_len.min(48) };
     if scan_limit > exact_shift {
         if let (Some(q_cur), Some(r_cur)) = (
             query.get(q_pos.saturating_sub(scan_limit)..q_pos.saturating_add(length)),
@@ -1000,6 +1011,7 @@ fn left_align_deletion(
     query_pos: &mut usize,
     reference: &[u8],
     query: &[u8],
+    sensitive: bool,
 ) {
     if index == 0 || length == 0 {
         return;
@@ -1047,7 +1059,7 @@ fn left_align_deletion(
     // repeat units in the preceding match window preserves or improves alignment quality.
     let q_pos = *query_pos;
     let r_pos = *reference_pos;
-    let scan_limit = match_len.min(128);
+    let scan_limit = if sensitive { match_len } else { match_len.min(48) };
     if scan_limit > exact_shift {
         if let (Some(q_cur), Some(r_cur)) = (
             query.get(q_pos.saturating_sub(scan_limit)..q_pos),
@@ -1494,14 +1506,14 @@ mod tests {
     #[test]
     fn left_alignment_moves_repeat_indels_to_the_leftmost_equivalent_site() {
         let mut insertion = vec![CigarOp::Match(2), CigarOp::Ins(1), CigarOp::Match(3)];
-        left_align_indels(&mut insertion, b"CAAAA", b"CAAAAA", 0);
+        left_align_indels(&mut insertion, b"CAAAA", b"CAAAAA", 0, false);
         assert_eq!(
             insertion,
             vec![CigarOp::Match(1), CigarOp::Ins(1), CigarOp::Match(4)]
         );
 
         let mut deletion = vec![CigarOp::Match(2), CigarOp::Del(1), CigarOp::Match(2)];
-        left_align_indels(&mut deletion, b"CAAAA", b"CAAA", 0);
+        left_align_indels(&mut deletion, b"CAAAA", b"CAAA", 0, false);
         assert_eq!(
             deletion,
             vec![CigarOp::Match(1), CigarOp::Del(1), CigarOp::Match(3)]

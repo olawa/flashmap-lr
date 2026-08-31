@@ -47,6 +47,7 @@ pub struct CandidateConfig {
 pub struct AlignmentConfig {
     pub bridge_flank: usize,
     pub bridge_max_gap: usize,
+    pub sensitive: bool,
 }
 
 /// Runtime settings for the one supported scheduler.
@@ -102,6 +103,7 @@ impl Default for Config {
             alignment: AlignmentConfig {
                 bridge_flank: 256,
                 bridge_max_gap: 5_000,
+                sensitive: false,
             },
             worker_pool: WorkerPoolConfig::default(),
         }

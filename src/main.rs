@@ -22,6 +22,7 @@ struct Options {
     emms_max_mismatch_run: usize,
     emms_relock_span: usize,
     tiered_candidates: bool,
+    sensitive: bool,
 }
 
 impl Options {
@@ -46,6 +47,7 @@ impl Options {
         let mut emms_max_mismatch_run = 1;
         let mut emms_relock_span = 24;
         let mut tiered_candidates = false;
+        let mut sensitive = false;
 
         let mut positional = Vec::new();
 
@@ -102,6 +104,18 @@ impl Options {
                 }
                 "--tiered-candidates" => {
                     tiered_candidates = true;
+                }
+                "--sensitive" => {
+                    sensitive = true;
+                }
+                "-x" | "--preset" => {
+                    let val = next_value(&mut args, &argument)?;
+                    if val.contains("sensitive") || val.contains("accurate") {
+                        sensitive = true;
+                    }
+                }
+                "-y" | "--copy-comment" => {
+                    // FASTQ header comments / SAM optional tags are preserved automatically.
                 }
                 option if option.starts_with('-') => {
                     return Err(CliError::UnknownOption(option.to_owned()));
@@ -176,6 +190,7 @@ impl Options {
             emms_max_mismatch_run,
             emms_relock_span,
             tiered_candidates,
+            sensitive,
         })
     }
 }
@@ -267,6 +282,8 @@ Options:\n\
   -c, --chunk-size N     Reads per worker batch (default: 10)\n\
       --quiet            Suppress progress indicators and summary\n\
       --profile          Print aggregate mapper phase timings\n\
+      --sensitive        High-sensitivity mode with deeper DP gap bounds and full STR left-alignment\n\
+  -x, --preset STR       Preset profile: standard (default) or sensitive\n\
       --paired-emms      Experimental mismatch-tolerant paired anchors\n\
       --tiered-candidates Experimental cheap pass for weak candidates\n\
   -h, --help             Show this help\n\
@@ -476,6 +493,7 @@ fn execute_mapping(
     config.candidates.emms_max_mismatch_run = options.emms_max_mismatch_run;
     config.candidates.emms_relock_span = options.emms_relock_span;
     config.candidates.tiered_candidates = options.tiered_candidates;
+    config.alignment.sensitive = options.sensitive;
     let profile = ProfileReporter::default();
     let aligner = Aligner::new(reference, index, config)
         .map_err(|error| CliError::Pool(format!("invalid mapper configuration: {error}")))?;
@@ -794,5 +812,32 @@ mod tests {
             ),
             Err(CliError::ConflictingInput)
         ));
+    }
+
+    #[test]
+    fn parser_accepts_sensitive_flags() {
+        let options = Options::parse(
+            ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "--sensitive"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert!(options.sensitive);
+
+        let options_preset = Options::parse(
+            [
+                "rs-lra",
+                "-i",
+                "ref.fmi",
+                "-q",
+                "reads.fq",
+                "-x",
+                "map-hifi-sensitive",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert!(options_preset.sensitive);
     }
 }
