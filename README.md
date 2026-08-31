@@ -18,10 +18,11 @@ probe selection (including the fixed endpoint probe staging), DNA candidate clus
 Minimap-DP chaining, fixed KSW2 local/end-to-end DP, chain CIGAR assembly, and
 the ordered worker-pool runner. `Aligner::map` now exercises that fixed path,
 including the default exact-island gap split, bounded long-gap flank rescue,
-M-island repair, repeat phase-shift repair, and divergent-terminal cleanup.
-Terminal DP rescue, score-aware endpoint clipping, endpoint attachment, seed
-tier escalation, and output adapters still need differential testing against
-FlashMap before claiming full production parity.
+M-island repair, repeat phase-shift repair, bounded terminal soft-clip rescue,
+fixed endpoint-support ranking, and divergent-terminal cleanup. Score-aware
+endpoint clipping, endpoint attachment, seed tier escalation, and output
+adapters still need differential testing against FlashMap before claiming full
+production parity.
 
 The extraction rule is: design the interface from scratch, but port the
 verified implementation and tests in small commits. FlashMap remains the

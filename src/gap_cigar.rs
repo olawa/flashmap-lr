@@ -151,12 +151,20 @@ pub fn build_chain_cigar(
     }
 
     let cigar = Cigar::new(ops)?;
-    let repaired_ops = repair_match_islands(
-        cigar.into_ops(),
+    let mut repaired_ops = cigar.into_ops();
+    // Terminal rescue is part of the default chain-assembly path and must
+    // run before phase repair/deep cleanup. Otherwise a newly recovered
+    // terminal indel would be invisible to the subsequent LR postprocess
+    // passes (and could be soft-clipped a second time).
+    crate::postprocess::rescue_terminal_softclips(
+        &mut repaired_ops,
         &oriented_query,
         contig.sequence,
-        ref_start,
+        &mut ref_start,
+        config,
     );
+    let repaired_ops =
+        repair_match_islands(repaired_ops, &oriented_query, contig.sequence, ref_start);
     let mut repaired_ops = crate::postprocess::repair_phase_shifted_spans(
         &repaired_ops,
         &oriented_query,
@@ -302,7 +310,7 @@ fn oriented_query(sequence: &[u8], strand: Strand) -> Vec<u8> {
 // This helper receives two slices plus their half-open coordinates so the hot
 // assembly loop can avoid allocating a temporary gap context for every pair.
 #[allow(clippy::too_many_arguments)]
-fn append_gap(
+pub(crate) fn append_gap(
     ops: &mut Vec<CigarOp>,
     query: &[u8],
     reference: &[u8],
@@ -343,6 +351,13 @@ fn append_gap_recursive(
     const MEDIUM_GAP_DP_DELTA_MAX: usize = 64;
     const RECURSIVE_SPLIT_K: usize = 13;
     const RECURSIVE_SPLIT_MAX_DEPTH: usize = 8;
+    // Recursive exact-island lookup is independent of the bounded DP bridge
+    // size.  FlashMap uses it to split long bridges before deciding whether a
+    // DP attempt is affordable; tying it to `bridge_max_gap` would skip the
+    // rescue precisely for the long gaps where it is most useful.  Keep a
+    // generous hard ceiling so a malformed adapter cannot make this linear
+    // scan recurse over an unbounded coordinate range.
+    const RECURSIVE_SPLIT_MAX_GAP: usize = 1_000_000;
 
     let query_len = query_end.saturating_sub(query_start);
     let reference_len = ref_end.saturating_sub(ref_start);
@@ -364,7 +379,17 @@ fn append_gap_recursive(
     let reference_slice = reference
         .get(ref_start..ref_end)
         .ok_or(ChainCigarError::InvalidReferenceCoordinates)?;
-    if query_len == reference_len {
+    // Equal lengths alone do not imply an exact match.  A balanced indel (or
+    // a short phase shift) can consume the same number of query and reference
+    // bases while requiring two indels in the CIGAR.  Only take the cheap `M`
+    // path when every base agrees; otherwise let the bounded DP/repair stages
+    // inspect the sequence.
+    if query_len == reference_len
+        && query_slice
+            .iter()
+            .zip(reference_slice)
+            .all(|(query_base, reference_base)| query_base.eq_ignore_ascii_case(reference_base))
+    {
         ops.push(CigarOp::Match(to_u32(query_len)?));
         return Ok(());
     }
@@ -386,7 +411,7 @@ fn append_gap_recursive(
     }
 
     if depth < RECURSIVE_SPLIT_MAX_DEPTH
-        && max_gap <= config.alignment.bridge_max_gap
+        && max_gap <= RECURSIVE_SPLIT_MAX_GAP
         && query_len >= RECURSIVE_SPLIT_K
         && reference_len >= RECURSIVE_SPLIT_K
     {
@@ -519,9 +544,11 @@ fn find_exact_island(query: &[u8], reference: &[u8], k: usize) -> Option<(usize,
             continue;
         };
         let bucket = reference_buckets.entry(code).or_default();
-        // Keep a marker for repetitive buckets but stop allocating positions
-        // once they can no longer provide safe unique evidence.
-        if bucket.len() <= 16 {
+        // Keep the seventeenth position as an explicit saturation marker, but
+        // never retain the rest of a repetitive bucket.  A lookup with 17
+        // positions is skipped below, so no arbitrary repeat occurrence can
+        // be selected as an exact split point.
+        if bucket.len() < 17 {
             bucket.push(ref_pos);
         }
     }
@@ -1112,6 +1139,37 @@ mod tests {
         let (cigar, _, _) =
             build_chain_cigar(Read::new("r", read), contig, &chain, &config()).unwrap();
         assert!(cigar.ops().iter().any(|op| matches!(op, CigarOp::Ins(1))));
+    }
+
+    #[test]
+    fn equal_length_gap_checks_bases_before_emitting_match() {
+        // The query and reference consume the same number of bases, but the
+        // query has a two-base insertion and the corresponding two-base
+        // deletion later in the span.  Equal lengths must not take the
+        // shortcut to one all-match operation.
+        let reference = b"AAAAACCCCCGGGGGTTTTT";
+        let query = b"AAAAAGGCCCCCGGGGGTTT";
+        assert_eq!(reference.len(), query.len());
+
+        let mut ops = Vec::new();
+        append_gap(
+            &mut ops,
+            query,
+            reference,
+            0,
+            query.len(),
+            0,
+            reference.len(),
+            &config(),
+        )
+        .unwrap();
+        let cigar = Cigar::new(ops).unwrap();
+        assert!(cigar
+            .ops()
+            .iter()
+            .any(|op| matches!(op, CigarOp::Ins(_) | CigarOp::Del(_))));
+        assert_eq!(cigar.query_len(), query.len() as u32);
+        assert_eq!(cigar.reference_len(), reference.len() as u32);
     }
 
     #[test]

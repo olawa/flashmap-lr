@@ -2,11 +2,13 @@
 //!
 //! These passes are deliberately not configurable in the first RS-LRA
 //! profile.  They are the deterministic DNA cleanup that follows sparse
-//! chaining: recover a repeat-induced phase shift, trim a divergent terminal
-//! run only when an internal relock exists, and leave final edge/indel
-//! normalization to the CIGAR assembler.
+//! chaining: recover a repeat-induced phase shift, recover bounded terminal
+//! soft clips, trim a divergent terminal run only when an internal relock
+//! exists, and leave final edge/indel normalization to the CIGAR assembler.
 
-use crate::CigarOp;
+use std::collections::HashMap;
+
+use crate::{align_full, CigarOp, Config};
 
 const MAX_PHASE_SHIFT: i32 = 32;
 const MIN_MATCH_LEN: usize = 32;
@@ -382,6 +384,336 @@ pub(crate) fn deep_terminal_softclip_divergent_ends(
     normalize_ops(ops);
 }
 
+/// Try to turn a bounded terminal soft clip into an anchored alignment.
+///
+/// Sparse chains commonly stop a few bases before a read end. FlashMap's
+/// default LR path first attempts an exact terminal fill and then uses a
+/// small end-to-end DP against a reference window with limited slack. Keep
+/// the same two-stage behavior here, but make it independent of a DP/backend
+/// selector: RS-LRA has one KSW2 implementation. Clips up to 300 bp use the
+/// bounded DP directly; larger clips use the same exact-island gap assembler
+/// as internal bridges, with a fixed 1,000 bp safety ceiling.
+pub(crate) fn rescue_terminal_softclips(
+    ops: &mut Vec<CigarOp>,
+    read_seq: &[u8],
+    ref_seq: &[u8],
+    ref_start: &mut usize,
+    config: &Config,
+) {
+    const MAX_DP_QUERY: usize = 300;
+    const MAX_RECURSIVE_QUERY: usize = 1_000;
+    const REF_SLACK: usize = 50;
+    const MAX_REF_WINDOW: usize = 1_200;
+    const MAX_NM_RATE: f64 = 0.15;
+    const KMER: usize = 13;
+
+    normalize_ops(ops);
+    if ops.is_empty() || read_seq.is_empty() || ref_seq.is_empty() {
+        return;
+    }
+
+    if let Some(clip_len) = leading_softclip_len(ops) {
+        if clip_len > 0 && clip_len <= MAX_RECURSIVE_QUERY && clip_len <= read_seq.len() {
+            let adjacent_ref = (*ref_start).min(ref_seq.len());
+            let window_len = (clip_len + REF_SLACK).min(MAX_REF_WINDOW);
+            let window_start = adjacent_ref.saturating_sub(window_len);
+            let window = &ref_seq[window_start..adjacent_ref];
+            let query = &read_seq[..clip_len];
+
+            if let Some(direct_start) = adjacent_ref.checked_sub(clip_len) {
+                if acceptable_equal_span(query, &ref_seq[direct_start..adjacent_ref], 0.08) {
+                    ops[0] = CigarOp::Match(clip_len as u32);
+                    *ref_start = direct_start;
+                } else if let Some((new_ops, consumed_ref, local_start)) = terminal_fill(
+                    query,
+                    window,
+                    TerminalSide::Leading,
+                    KMER,
+                    MAX_DP_QUERY,
+                    config,
+                    MAX_NM_RATE,
+                ) {
+                    ops.splice(0..1, new_ops);
+                    *ref_start = window_start + local_start;
+                    debug_assert_eq!(consumed_ref, adjacent_ref - *ref_start);
+                }
+            } else if let Some((new_ops, consumed_ref, local_start)) = terminal_fill(
+                query,
+                window,
+                TerminalSide::Leading,
+                KMER,
+                MAX_DP_QUERY,
+                config,
+                MAX_NM_RATE,
+            ) {
+                ops.splice(0..1, new_ops);
+                *ref_start = window_start + local_start;
+                debug_assert_eq!(consumed_ref, adjacent_ref - *ref_start);
+            }
+        }
+    }
+
+    normalize_ops(ops);
+    if let Some(clip_len) = trailing_softclip_len(ops) {
+        if clip_len == 0 || clip_len > MAX_RECURSIVE_QUERY || clip_len > read_seq.len() {
+            return;
+        }
+        let consumed_ref = ops
+            .iter()
+            .filter(|op| op.consumes_reference())
+            .map(|op| op_len(*op))
+            .sum::<usize>();
+        let Some(adjacent_ref) = ref_start.checked_add(consumed_ref) else {
+            return;
+        };
+        let adjacent_ref = adjacent_ref.min(ref_seq.len());
+        let window_len = (clip_len + REF_SLACK).min(MAX_REF_WINDOW);
+        let window_end = adjacent_ref.saturating_add(window_len).min(ref_seq.len());
+        let window = &ref_seq[adjacent_ref..window_end];
+        let query_start = read_seq.len() - clip_len;
+        let query = &read_seq[query_start..];
+
+        if let Some(direct_end) = adjacent_ref.checked_add(clip_len) {
+            if direct_end <= ref_seq.len()
+                && acceptable_equal_span(query, &ref_seq[adjacent_ref..direct_end], 0.08)
+            {
+                let last = ops.len() - 1;
+                ops[last] = CigarOp::Match(clip_len as u32);
+            } else if let Some((new_ops, _, _)) = terminal_fill(
+                query,
+                window,
+                TerminalSide::Trailing,
+                KMER,
+                MAX_DP_QUERY,
+                config,
+                MAX_NM_RATE,
+            ) {
+                let last = ops.len() - 1;
+                ops.splice(last..=last, new_ops);
+            }
+        } else if let Some((new_ops, _, _)) = terminal_fill(
+            query,
+            window,
+            TerminalSide::Trailing,
+            KMER,
+            MAX_DP_QUERY,
+            config,
+            MAX_NM_RATE,
+        ) {
+            let last = ops.len() - 1;
+            ops.splice(last..=last, new_ops);
+        }
+    }
+    normalize_ops(ops);
+}
+
+#[derive(Clone, Copy)]
+enum TerminalSide {
+    Leading,
+    Trailing,
+}
+
+fn terminal_dp_fill(
+    query: &[u8],
+    reference_window: &[u8],
+    side: TerminalSide,
+    k: usize,
+    max_nm_rate: f64,
+) -> Option<(Vec<CigarOp>, usize, usize)> {
+    // Keep at least one query base outside the seed so a small terminal
+    // insertion/deletion can be represented by the inferred span. Tiny clips
+    // are handled by the exact-fill path and otherwise remain soft-clipped.
+    let k = k
+        .min(query.len().saturating_sub(1))
+        .min(reference_window.len());
+    if k < 8 {
+        return None;
+    }
+    let (local_start, local_end) = infer_terminal_reference_span(query, reference_window, side, k)?;
+    let reference = reference_window.get(local_start..local_end)?;
+    let band = query
+        .len()
+        .abs_diff(reference.len())
+        .saturating_add(64)
+        .max(64);
+    let alignment = align_full(query, reference, band)?;
+    if alignment.edit_distance as usize >= query.len()
+        || alignment.edit_distance as f64 / query.len().max(1) as f64 > max_nm_rate
+    {
+        return None;
+    }
+    Some((alignment.cigar.into_ops(), reference.len(), local_start))
+}
+
+fn terminal_fill(
+    query: &[u8],
+    reference_window: &[u8],
+    side: TerminalSide,
+    k: usize,
+    max_dp_query: usize,
+    config: &Config,
+    max_nm_rate: f64,
+) -> Option<(Vec<CigarOp>, usize, usize)> {
+    if query.len() <= max_dp_query {
+        terminal_dp_fill(query, reference_window, side, k, max_nm_rate)
+    } else {
+        terminal_recursive_fill(query, reference_window, side, k, config, max_nm_rate)
+    }
+}
+
+fn terminal_recursive_fill(
+    query: &[u8],
+    reference_window: &[u8],
+    side: TerminalSide,
+    k: usize,
+    config: &Config,
+    max_nm_rate: f64,
+) -> Option<(Vec<CigarOp>, usize, usize)> {
+    let (local_start, local_end) = infer_terminal_reference_span(query, reference_window, side, k)?;
+    let reference = reference_window.get(local_start..local_end)?;
+    let mut ops = Vec::new();
+    crate::gap_cigar::append_gap(
+        &mut ops,
+        query,
+        reference_window,
+        0,
+        query.len(),
+        local_start,
+        local_end,
+        config,
+    )
+    .ok()?;
+    normalize_ops(&mut ops);
+    let reference_consumed = ops
+        .iter()
+        .filter(|op| op.consumes_reference())
+        .map(|op| op_len(*op))
+        .sum::<usize>();
+    if query_consumed(&ops) != query.len() || reference_consumed != reference.len() {
+        return None;
+    }
+    let nm = alignment_nm(&ops, query, reference, 0)?;
+    if nm >= query.len() || nm as f64 / query.len().max(1) as f64 > max_nm_rate {
+        return None;
+    }
+    Some((ops, reference.len(), local_start))
+}
+
+fn infer_terminal_reference_span(
+    query: &[u8],
+    reference_window: &[u8],
+    side: TerminalSide,
+    k: usize,
+) -> Option<(usize, usize)> {
+    if k == 0 || query.len() < k || reference_window.len() < k {
+        return None;
+    }
+
+    let mut buckets = HashMap::<u64, Vec<usize>>::new();
+    for position in 0..=reference_window.len() - k {
+        let Some(code) = encode_kmer(&reference_window[position..position + k]) else {
+            continue;
+        };
+        let bucket = buckets.entry(code).or_default();
+        // Keep an explicit ninth entry as a saturation marker. Repetitive
+        // terminal kmers are not safe evidence for choosing a reference span.
+        if bucket.len() < 9 {
+            bucket.push(position);
+        }
+    }
+
+    let expected_diagonal = match side {
+        TerminalSide::Leading => reference_window.len().saturating_sub(query.len()) as i64,
+        TerminalSide::Trailing => 0,
+    };
+    let query_step = (query.len() / 512).max(1);
+    let mut best: Option<(usize, usize, usize, usize)> = None;
+    for query_pos in (0..=query.len() - k).step_by(query_step) {
+        let Some(code) = encode_kmer(&query[query_pos..query_pos + k]) else {
+            continue;
+        };
+        let Some(ref_positions) = buckets.get(&code) else {
+            continue;
+        };
+        if ref_positions.len() > 8 {
+            continue;
+        }
+        for &ref_pos in ref_positions {
+            let outer_distance = match side {
+                TerminalSide::Leading => query_pos,
+                TerminalSide::Trailing => query.len().saturating_sub(query_pos + k),
+            };
+            let diagonal_distance =
+                (ref_pos as i64 - query_pos as i64).abs_diff(expected_diagonal) as usize;
+            let key = (outer_distance, diagonal_distance, query_pos, ref_pos);
+            if best.map(|current| key < current).unwrap_or(true) {
+                best = Some(key);
+            }
+        }
+    }
+
+    let (_, _, query_pos, ref_pos) = best?;
+    match side {
+        TerminalSide::Leading => {
+            let start = ref_pos.checked_sub(query_pos)?;
+            (start < reference_window.len()).then_some((start, reference_window.len()))
+        }
+        TerminalSide::Trailing => {
+            let end = (ref_pos + k).saturating_add(query.len().saturating_sub(query_pos + k));
+            (end > 0 && end <= reference_window.len()).then_some((0, end))
+        }
+    }
+}
+
+fn encode_kmer(sequence: &[u8]) -> Option<u64> {
+    if sequence.is_empty() || sequence.len() > 32 {
+        return None;
+    }
+    let mut code = 0u64;
+    for &base in sequence {
+        let value = match base.to_ascii_uppercase() {
+            b'A' => 0,
+            b'C' => 1,
+            b'G' => 2,
+            b'T' => 3,
+            _ => return None,
+        };
+        code = (code << 2) | value;
+    }
+    Some(code)
+}
+
+fn exact_equal(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn acceptable_equal_span(left: &[u8], right: &[u8], max_mismatch_rate: f64) -> bool {
+    if !exact_equal(left, right) {
+        let mismatches = mismatch_count(left, right);
+        return left.len() == right.len()
+            && mismatches as f64 / left.len().max(1) as f64 <= max_mismatch_rate;
+    }
+    true
+}
+
+fn leading_softclip_len(ops: &[CigarOp]) -> Option<usize> {
+    match ops.first().copied() {
+        Some(CigarOp::SoftClip(length)) => Some(length as usize),
+        _ => None,
+    }
+}
+
+fn trailing_softclip_len(ops: &[CigarOp]) -> Option<usize> {
+    match ops.last().copied() {
+        Some(CigarOp::SoftClip(length)) => Some(length as usize),
+        _ => None,
+    }
+}
+
 fn consumed_before(ops: &[CigarOp]) -> (usize, usize) {
     let mut q = 0usize;
     let mut r = 0usize;
@@ -539,5 +871,133 @@ mod tests {
         );
         assert_eq!(ops, vec![CigarOp::Match(64)]);
         assert_eq!(ref_start, 0);
+    }
+
+    #[test]
+    fn terminal_rescue_fills_exact_leading_and_trailing_clips() {
+        let reference = b"AACCGGTTAACCGGTT";
+        let query = reference.to_ascii_lowercase();
+        let mut leading = vec![CigarOp::SoftClip(8), CigarOp::Match(8)];
+        let mut leading_start = 8;
+        rescue_terminal_softclips(
+            &mut leading,
+            &query,
+            reference,
+            &mut leading_start,
+            &Config::default(),
+        );
+        assert_eq!(leading, vec![CigarOp::Match(16)]);
+        assert_eq!(leading_start, 0);
+
+        let mut trailing = vec![CigarOp::Match(8), CigarOp::SoftClip(8)];
+        let mut trailing_start = 0;
+        rescue_terminal_softclips(
+            &mut trailing,
+            &query,
+            reference,
+            &mut trailing_start,
+            &Config::default(),
+        );
+        assert_eq!(trailing, vec![CigarOp::Match(16)]);
+        assert_eq!(trailing_start, 0);
+    }
+
+    #[test]
+    fn terminal_rescue_keeps_high_error_clip_soft() {
+        let reference = b"AACCGGTTAACCGGTT";
+        let mut query = reference[..8].to_vec();
+        query.extend_from_slice(b"TTTTTTTT");
+        let mut ops = vec![CigarOp::Match(8), CigarOp::SoftClip(8)];
+        let mut ref_start = 0;
+        rescue_terminal_softclips(
+            &mut ops,
+            &query,
+            reference,
+            &mut ref_start,
+            &Config::default(),
+        );
+        assert_eq!(ops, vec![CigarOp::Match(8), CigarOp::SoftClip(8)]);
+        assert_eq!(ref_start, 0);
+    }
+
+    #[test]
+    fn terminal_rescue_accepts_a_low_error_equal_span() {
+        let reference = b"AACCGGTTAACCGGTTACGTACGTACGTACGT";
+        let mut query = reference[..8].to_vec();
+        query.extend_from_slice(&reference[8..28]);
+        query[8 + 19] = if query[8 + 19] == b'A' { b'C' } else { b'A' };
+        let mut ops = vec![CigarOp::Match(8), CigarOp::SoftClip(20)];
+        let mut ref_start = 0;
+        rescue_terminal_softclips(
+            &mut ops,
+            &query,
+            reference,
+            &mut ref_start,
+            &Config::default(),
+        );
+        assert_eq!(ops, vec![CigarOp::Match(28)]);
+    }
+
+    #[test]
+    fn terminal_rescue_can_represent_a_small_terminal_insertion() {
+        let reference = b"AACCGGTTAACCGGTTACGTACGTACGTACGT";
+        let mut query = reference[..8].to_vec();
+        query.extend_from_slice(b"G");
+        query.extend_from_slice(&reference[8..16]);
+        let mut ops = vec![CigarOp::Match(8), CigarOp::SoftClip(9)];
+        let mut ref_start = 0;
+        rescue_terminal_softclips(
+            &mut ops,
+            &query,
+            reference,
+            &mut ref_start,
+            &Config::default(),
+        );
+        assert!(ops.iter().any(|op| matches!(op, CigarOp::Ins(1))));
+        assert_eq!(ops.iter().map(|op| op_len(*op)).sum::<usize>(), query.len());
+        assert_eq!(
+            ops.iter()
+                .filter(|op| op.consumes_reference())
+                .map(|op| op_len(*op))
+                .sum::<usize>(),
+            16
+        );
+    }
+
+    #[test]
+    fn long_terminal_rescue_uses_the_recursive_gap_assembler() {
+        fn pseudo_sequence(length: usize, mut state: u32) -> Vec<u8> {
+            const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+            (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    BASES[(state >> 30) as usize]
+                })
+                .collect()
+        }
+
+        let reference = pseudo_sequence(450, 19);
+        let mut query = reference[..100].to_vec();
+        query.push(b'G');
+        query.extend_from_slice(&reference[100..]);
+        let mut ops = vec![CigarOp::Match(100), CigarOp::SoftClip(351)];
+        let mut ref_start = 0;
+        rescue_terminal_softclips(
+            &mut ops,
+            &query,
+            &reference,
+            &mut ref_start,
+            &Config::default(),
+        );
+        assert!(ops.iter().any(|op| matches!(op, CigarOp::Ins(1))));
+        assert!(!ops.iter().any(|op| matches!(op, CigarOp::SoftClip(_))));
+        assert_eq!(query_consumed(&ops), query.len());
+        assert_eq!(
+            ops.iter()
+                .filter(|op| op.consumes_reference())
+                .map(|op| op_len(*op))
+                .sum::<usize>(),
+            reference.len()
+        );
     }
 }

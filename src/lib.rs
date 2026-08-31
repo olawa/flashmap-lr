@@ -22,7 +22,7 @@ mod worker_pool;
 
 pub use aligner::Aligner;
 pub use anchors::{find_anchors, Anchor, AnchorError};
-pub use candidates::{cluster_probe_hits, CandidateRegion};
+pub use candidates::{cluster_probe_hits, CandidateRegion, EndpointSupport};
 pub use chain::{chain_anchors, Chain, ChainSet, MAX_ITER as CHAIN_MAX_ITER};
 pub use config::{
     AlignmentConfig, CandidateConfig, Config, ConfigError, SeedingConfig, WorkerPoolConfig,

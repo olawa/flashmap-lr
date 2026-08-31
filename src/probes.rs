@@ -2,6 +2,11 @@
 
 use crate::{segment_read, Config, QuerySeed, Read, SeedIndex, SeedLookup, Segment};
 
+/// Internal markers used to carry fixed endpoint-probe provenance through
+/// candidate clustering without exposing another runtime profile switch.
+pub(crate) const LEFT_ENDPOINT_SEGMENT: usize = usize::MAX - 1;
+pub(crate) const RIGHT_ENDPOINT_SEGMENT: usize = usize::MAX;
+
 /// A selected query seed.  Reference hits are deliberately looked up through
 /// `SeedIndex` later; retaining only the seed token keeps this object small.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -125,7 +130,8 @@ pub fn extract_read_probes(read: Read<'_>, index: &dyn SeedIndex, config: &Confi
     // locus from losing both read ends during candidate clustering.
     const END_WINDOW: usize = 1_000;
     const END_PROBES_PER_END: usize = 4;
-    const END_MAX_FREQUENCY: usize = 200;
+    // Resolved HiFiBalanced/SvSensitive FlashMap default.
+    const END_MAX_FREQUENCY: usize = 250;
     let window_len = END_WINDOW.min(read.sequence.len());
     if window_len > 0 {
         append_endpoint_probes(
@@ -134,7 +140,7 @@ pub fn extract_read_probes(read: Read<'_>, index: &dyn SeedIndex, config: &Confi
             index,
             0,
             window_len,
-            usize::MAX - 1,
+            LEFT_ENDPOINT_SEGMENT,
             END_PROBES_PER_END,
             END_MAX_FREQUENCY,
         );
@@ -145,15 +151,46 @@ pub fn extract_read_probes(read: Read<'_>, index: &dyn SeedIndex, config: &Confi
             index,
             right_start,
             read.sequence.len(),
-            usize::MAX,
+            RIGHT_ENDPOINT_SEGMENT,
             END_PROBES_PER_END,
             END_MAX_FREQUENCY,
         );
     }
 
-    let mut seen = std::collections::HashSet::with_capacity(probes.len());
-    probes.retain(|probe| seen.insert((probe.seed, probe.read_pos)));
+    let mut seen: std::collections::HashMap<(crate::SeedKey, crate::Strand, u32), usize> =
+        std::collections::HashMap::with_capacity(probes.len());
+    // `QuerySeed::query_pos` is segment-local.  Overlapping backbone
+    // segments can therefore describe the same absolute read position with
+    // different seed tokens even when they represent the same reference
+    // k-mer.  Deduplicate on the backend key/orientation and absolute read
+    // coordinate so overlap cannot manufacture extra segment support.
+    let mut deduplicated: Vec<Probe> = Vec::with_capacity(probes.len());
+    for probe in probes.drain(..) {
+        let key = (probe.seed.key(), probe.seed.strand, probe.read_pos);
+        if let Some(&existing) = seen.get(&key) {
+            // Endpoint provenance is useful for the fixed LR candidate score.
+            // If an endpoint seed overlaps a backbone seed at the same
+            // absolute position, retain the endpoint-marked copy rather than
+            // losing that information to first-seen ordering.
+            if is_endpoint_segment(probe.segment_index)
+                && !is_endpoint_segment(deduplicated[existing].segment_index)
+            {
+                deduplicated[existing] = probe;
+            }
+        } else {
+            seen.insert(key, deduplicated.len());
+            deduplicated.push(probe);
+        }
+    }
+    probes = deduplicated;
     probes
+}
+
+fn is_endpoint_segment(segment_index: usize) -> bool {
+    matches!(
+        segment_index,
+        LEFT_ENDPOINT_SEGMENT | RIGHT_ENDPOINT_SEGMENT
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -328,5 +365,46 @@ mod tests {
             .iter()
             .any(|probe| probe.segment_index == usize::MAX - 1));
         assert!(probes.iter().any(|probe| probe.segment_index == usize::MAX));
+    }
+
+    #[test]
+    fn overlapping_segments_do_not_duplicate_an_absolute_probe_position() {
+        struct OverlapIndex;
+        impl SeedIndex for OverlapIndex {
+            fn seed_span(&self) -> usize {
+                3
+            }
+
+            fn query_seeds(&self, sequence: &[u8]) -> Vec<QuerySeed> {
+                // Main segments are 900 bases; endpoint windows are 1,000
+                // bases and intentionally return no seeds for this fixture.
+                (sequence.len() == 900)
+                    .then_some(QuerySeed::new(600, Strand::Forward, SeedKey::new(7, 7)))
+                    .into_iter()
+                    .collect()
+            }
+
+            fn visit_hits(&self, _: &QuerySeed, visit: &mut dyn FnMut(SeedHit)) -> SeedLookup {
+                visit(SeedHit {
+                    contig: ContigId(0),
+                    ref_pos: 100,
+                    strand: Strand::Forward,
+                });
+                SeedLookup::complete(1)
+            }
+        }
+
+        let mut config = Config::default();
+        config.seeding.segment_size = 900;
+        config.seeding.segment_overlap = 450;
+        config.seeding.max_probes_per_segment = 1;
+        let sequence = vec![b'A'; 1_800];
+        let read = Read::new("read", &sequence);
+        let probes = extract_read_probes(read, &OverlapIndex, &config);
+        let at_overlap = probes
+            .iter()
+            .filter(|probe| probe.read_pos == 600 && probe.seed.key() == SeedKey::new(7, 7))
+            .count();
+        assert_eq!(at_overlap, 1);
     }
 }

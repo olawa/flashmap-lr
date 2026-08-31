@@ -1,5 +1,6 @@
 //! Candidate-region clustering from sparse probe hits.
 
+use crate::probes::{LEFT_ENDPOINT_SEGMENT, RIGHT_ENDPOINT_SEGMENT};
 use crate::{Config, ContigId, Probe, SeedHit, SeedIndex, Strand};
 use std::collections::{HashMap, HashSet};
 
@@ -16,6 +17,32 @@ pub struct CandidateRegion {
     pub diagonal_mean: f32,
     pub diagonal_median: f32,
     pub score: i32,
+    pub endpoint_support: EndpointSupport,
+}
+
+/// Fixed endpoint evidence class used by the default LR ranking path.
+///
+/// The values mirror FlashMap's internal endpoint audit, but there is no
+/// runtime switch: adapters can inspect the class while the core always uses
+/// the same score adjustment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndpointSupport {
+    None,
+    InternalOnly,
+    LeftOnly,
+    RightOnly,
+    BothEnds,
+}
+
+impl EndpointSupport {
+    pub(crate) fn score_adjustment(self, read_len: usize) -> i32 {
+        match self {
+            Self::BothEnds => 250,
+            Self::LeftOnly | Self::RightOnly => 60,
+            Self::InternalOnly if read_len >= 2_000 => -50,
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -29,11 +56,29 @@ struct ProbeHit {
 /// Cluster selected sparse probes by contig, orientation, and diagonal.
 ///
 /// This is the first production-facing LR phase moved behind RS-LRA's clean
-/// index API.  It intentionally excludes FlashMap's RNA splice handling,
-/// endpoint telemetry, and rescue bookkeeping; those will be added only when
-/// a differential test demonstrates that the DNA profile needs them.
+/// index API. It intentionally excludes FlashMap's RNA splice handling and
+/// rescue bookkeeping; fixed endpoint support is retained because it affects
+/// default LR candidate ranking rather than being telemetry-only.
 pub fn cluster_probe_hits(
     probes: &[Probe],
+    index: &dyn SeedIndex,
+    config: &Config,
+) -> Vec<CandidateRegion> {
+    let inferred_read_len = probes
+        .iter()
+        .map(|probe| probe.read_pos as usize + index.seed_span())
+        .max()
+        .unwrap_or(0);
+    cluster_probe_hits_for_read(probes, inferred_read_len, index, config)
+}
+
+/// Cluster probes when the adapter can provide the exact read length. The
+/// fixed endpoint score adjustment is defined only for reads at least 2 kb;
+/// keeping this as an internal companion preserves the small public clustering
+/// API for callers that already have a probe list.
+pub(crate) fn cluster_probe_hits_for_read(
+    probes: &[Probe],
+    read_len: usize,
     index: &dyn SeedIndex,
     config: &Config,
 ) -> Vec<CandidateRegion> {
@@ -89,13 +134,25 @@ pub fn cluster_probe_hits(
                     <= config.candidates.diagonal_tolerance as u64
             });
             if !joins && !cluster.is_empty() {
-                add_cluster(&mut candidates, &cluster, index.seed_span(), config);
+                add_cluster(
+                    &mut candidates,
+                    &cluster,
+                    read_len,
+                    index.seed_span(),
+                    config,
+                );
                 cluster.clear();
             }
             cluster.push(hit);
         }
         if !cluster.is_empty() {
-            add_cluster(&mut candidates, &cluster, index.seed_span(), config);
+            add_cluster(
+                &mut candidates,
+                &cluster,
+                read_len,
+                index.seed_span(),
+                config,
+            );
         }
     }
 
@@ -114,6 +171,7 @@ pub fn cluster_probe_hits(
 fn add_cluster(
     candidates: &mut Vec<CandidateRegion>,
     cluster: &[ProbeHit],
+    read_len: usize,
     seed_span: usize,
     config: &Config,
 ) {
@@ -142,8 +200,50 @@ fn add_cluster(
     let diagonals: Vec<i64> = cluster.iter().map(|hit| hit.diagonal).collect();
     let diagonal_mean = diagonals.iter().sum::<i64>() as f32 / diagonals.len() as f32;
     let diagonal_median = median(&diagonals) as f32;
-    let score =
-        (segments.len() as i32 * 100) + (unique_probes.len() as i32 * 10) + cluster.len() as i32;
+    let endpoint_key = |hit: &&ProbeHit| {
+        if !matches!(
+            hit.probe.segment_index,
+            LEFT_ENDPOINT_SEGMENT | RIGHT_ENDPOINT_SEGMENT
+        ) {
+            return false;
+        }
+        let delta_mean = (hit.diagonal - diagonal_mean as i64).unsigned_abs();
+        let delta_median = (hit.diagonal - diagonal_median as i64).unsigned_abs();
+        delta_mean.min(delta_median) <= config.candidates.diagonal_tolerance.max(0) as u64
+    };
+    let left_endpoint_support: HashSet<QueryProbeKey> = cluster
+        .iter()
+        .filter(|hit| hit.probe.segment_index == LEFT_ENDPOINT_SEGMENT)
+        .filter(endpoint_key)
+        .map(|hit| QueryProbeKey {
+            key: hit.probe.seed.key(),
+            read_pos: hit.probe.read_pos,
+        })
+        .collect();
+    let right_endpoint_support: HashSet<QueryProbeKey> = cluster
+        .iter()
+        .filter(|hit| hit.probe.segment_index == RIGHT_ENDPOINT_SEGMENT)
+        .filter(endpoint_key)
+        .map(|hit| QueryProbeKey {
+            key: hit.probe.seed.key(),
+            read_pos: hit.probe.read_pos,
+        })
+        .collect();
+    let endpoint_support = match (
+        left_endpoint_support.is_empty(),
+        right_endpoint_support.is_empty(),
+    ) {
+        (false, false) => EndpointSupport::BothEnds,
+        (false, true) => EndpointSupport::LeftOnly,
+        (true, false) => EndpointSupport::RightOnly,
+        (true, true) if unique_probes.is_empty() => EndpointSupport::None,
+        (true, true) => EndpointSupport::InternalOnly,
+    };
+    let endpoint_bonus = endpoint_support.score_adjustment(read_len);
+    let score = (segments.len() as i32 * 100)
+        + (unique_probes.len() as i32 * 10)
+        + cluster.len() as i32
+        + endpoint_bonus;
 
     candidates.push(CandidateRegion {
         contig,
@@ -157,6 +257,7 @@ fn add_cluster(
         diagonal_mean,
         diagonal_median,
         score,
+        endpoint_support,
     });
 }
 
@@ -246,6 +347,68 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].supporting_segments, 2);
         assert_eq!(candidates[0].strand, Strand::Forward);
+    }
+
+    #[test]
+    fn endpoint_support_changes_default_long_read_candidate_score() {
+        struct EndpointIndex;
+        impl SeedIndex for EndpointIndex {
+            fn seed_span(&self) -> usize {
+                15
+            }
+
+            fn query_seeds(&self, _: &[u8]) -> Vec<QuerySeed> {
+                Vec::new()
+            }
+
+            fn visit_hits(
+                &self,
+                seed: &QuerySeed,
+                visit: &mut dyn FnMut(SeedHit),
+            ) -> crate::SeedLookup {
+                let ref_pos = if seed.key() == SeedKey::new(1, 0) {
+                    100
+                } else if seed.key() == SeedKey::new(2, 0) {
+                    2_100
+                } else {
+                    1_100
+                };
+                visit(SeedHit {
+                    contig: ContigId(0),
+                    ref_pos,
+                    strand: Strand::Forward,
+                });
+                crate::SeedLookup::complete(1)
+            }
+        }
+
+        let mut config = Config::default();
+        config.candidates.min_supporting_segments = 1;
+        let probes = vec![
+            Probe::new(
+                QuerySeed::new(0, Strand::Forward, SeedKey::new(1, 0)),
+                LEFT_ENDPOINT_SEGMENT,
+                0,
+                1,
+            ),
+            Probe::new(
+                QuerySeed::new(0, Strand::Forward, SeedKey::new(2, 0)),
+                RIGHT_ENDPOINT_SEGMENT,
+                2_000,
+                1,
+            ),
+            Probe::new(
+                QuerySeed::new(0, Strand::Forward, SeedKey::new(3, 0)),
+                0,
+                1_000,
+                1,
+            ),
+        ];
+        let candidates = cluster_probe_hits_for_read(&probes, 2_500, &EndpointIndex, &config);
+        assert_eq!(candidates.len(), 1);
+        // Base score: 3 segments * 100 + 3 probes * 10 + 3 hits, plus both
+        // endpoint support (+250) for the resolved long-read default.
+        assert_eq!(candidates[0].score, 583);
     }
 
     #[test]

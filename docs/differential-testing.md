@@ -6,16 +6,19 @@ route. A differential fixture should therefore compare the following records
 for the same read and reference:
 
 1. selected backbone/endpoint probe positions and complete-hit filtering;
-2. candidate contig, strand, diagonal, and reference window;
+2. candidate contig, strand, diagonal, reference window, endpoint-support
+   class, and fixed ranking adjustment;
 3. exact anchor query/reference intervals and anchor lengths;
 4. Minimap-DP chain anchor order, score, covered query bases, and terminal gaps;
-5. post-chain repeat phase repair and divergent-terminal soft clipping;
+5. terminal soft-clip rescue, post-chain repeat phase repair, and
+   divergent-terminal soft clipping;
 6. final reference start, normalized CIGAR, NM, and aligned query/reference
    consumption.
 
-The current core intentionally records terminal DP rescue, score-aware
-endpoint clipping, seed-tier escalation, and endpoint attachment as pending
-parity work rather than silently approximating those policies.
+The current core has the fixed endpoint-probe staging/ranking and bounded
+terminal rescue from the default DNA path. Score-aware endpoint clipping,
+seed-tier escalation, and endpoint attachment remain pending parity work rather
+than being silently approximated.
 
 The first fixtures should be small and deterministic:
 
@@ -27,6 +30,8 @@ The first fixtures should be small and deterministic:
   rescue is exercised;
 - homopolymer/tandem-repeat indels to check left alignment;
 - soft-clipped leading and trailing query sequence;
+- terminal insertion/deletion and high-error clips (rescue versus safe
+  soft-clip fallback);
 - repetitive or sampled seed buckets that must not create a placement.
 
 For every fixture, compare phase outputs before comparing SAM text. A mismatch

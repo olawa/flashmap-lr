@@ -108,10 +108,15 @@ impl LocalKmerMap {
 
         for offset in 0..=sequence.len() - k {
             if let Some(code) = encode_kmer(&sequence[offset..offset + k]) {
-                buckets
-                    .entry(code)
-                    .or_insert_with(Vec::new)
-                    .push((window_start + offset) as u64);
+                let bucket = buckets.entry(code).or_insert_with(Vec::new);
+                // Keep one extra position as a saturation marker.  The
+                // lookup below rejects buckets larger than 128, while this
+                // cap prevents a homopolymer/repeat window from retaining
+                // every occurrence and consuming unbounded per-candidate
+                // memory.
+                if bucket.len() < 129 {
+                    bucket.push((window_start + offset) as u64);
+                }
             }
         }
         Self { buckets }
@@ -849,6 +854,7 @@ mod tests {
             diagonal_mean: 0.0,
             diagonal_median: 0.0,
             score: 1,
+            endpoint_support: crate::EndpointSupport::None,
         }
     }
 

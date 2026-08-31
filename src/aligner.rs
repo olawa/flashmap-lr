@@ -3,10 +3,11 @@
 //! The mapper owns no scheduling state. Stream adapters use the fixed
 //! [`crate::WorkerPool`] and call this kernel from its workers.
 
+use crate::candidates::{cluster_probe_hits_for_read, EndpointSupport};
 use crate::{
-    build_chain_alignment, chain_anchors, cluster_probe_hits, extract_read_probes, find_anchors,
-    Config, ConfigError, DiagnosticsSink, MapError, MappedRead, MappingResult, OwnedRead, Read,
-    ReadDiagnostics, Reference, SeedIndex, WorkerPool, WorkerPoolError, WorkerPoolStats,
+    build_chain_alignment, chain_anchors, extract_read_probes, find_anchors, Config, ConfigError,
+    DiagnosticsSink, MapError, MappedRead, MappingResult, OwnedRead, Read, ReadDiagnostics,
+    Reference, SeedIndex, WorkerPool, WorkerPoolError, WorkerPoolStats,
 };
 use std::convert::Infallible;
 use std::time::Instant;
@@ -69,7 +70,8 @@ impl<'a> Aligner<'a> {
         diagnostics.seeds_seen = saturating_u32(probes.len());
         diagnostics.seeds_used = diagnostics.seeds_seen;
 
-        let candidates = cluster_probe_hits(&probes, self.index, &self.config);
+        let candidates =
+            cluster_probe_hits_for_read(&probes, read.sequence.len(), self.index, &self.config);
         diagnostics.candidates = saturating_u32(candidates.len());
 
         let mut placements = Vec::new();
@@ -92,7 +94,14 @@ impl<'a> Aligner<'a> {
                 usize::from(chain_set.primary.is_some()) + chain_set.alternatives.len(),
             ));
             if let Some(chain) = chain_set.primary {
-                placements.push((candidate.contig, chain));
+                // Match FlashMap's fixed LR validity floor: a chain must
+                // explain at least one fifth of the read or 300 query bases.
+                // Without this guard, a single isolated exact anchor could
+                // become a MAPQ-60 placement in a repetitive reference.
+                if chain.query_covered_fraction < 0.20 && chain.query_covered_bases < 300 {
+                    continue;
+                }
+                placements.push((candidate.contig, chain, candidate.endpoint_support));
             }
         }
 
@@ -101,7 +110,7 @@ impl<'a> Aligner<'a> {
         // manufacture a low MAPQ as if they were independent placements.
         let mut unique_placements = Vec::with_capacity(placements.len());
         for placement in placements {
-            let duplicate = unique_placements.iter().any(|(contig, existing)| {
+            let duplicate = unique_placements.iter().any(|(contig, existing, _)| {
                 *contig == placement.0 && same_chain_placement(existing, &placement.1)
             });
             if !duplicate {
@@ -111,15 +120,17 @@ impl<'a> Aligner<'a> {
         placements = unique_placements;
 
         placements.sort_by(|left, right| {
-            right
-                .1
-                .score
-                .cmp(&left.1.score)
+            endpoint_rank_score(right.1.score, right.2, read.sequence.len())
+                .cmp(&endpoint_rank_score(
+                    left.1.score,
+                    left.2,
+                    read.sequence.len(),
+                ))
                 .then_with(|| right.1.query_covered_bases.cmp(&left.1.query_covered_bases))
                 .then_with(|| left.1.q_start.cmp(&right.1.q_start))
         });
 
-        let Some((contig_id, chain)) = placements.first() else {
+        let Some((contig_id, chain, endpoint_support)) = placements.first() else {
             diagnostics.elapsed_nanos = elapsed_nanos(started);
             self.notify(read.name, &diagnostics);
             return Ok(MappingResult {
@@ -129,8 +140,12 @@ impl<'a> Aligner<'a> {
             });
         };
 
-        let second_score = placements.get(1).map(|placement| placement.1.score);
-        let mapq = mapping_quality(chain.score, second_score);
+        let best_rank_score =
+            endpoint_rank_score(chain.score, *endpoint_support, read.sequence.len());
+        let second_score = placements.get(1).map(|placement| {
+            endpoint_rank_score(placement.1.score, placement.2, read.sequence.len())
+        });
+        let mapq = mapping_quality(best_rank_score, second_score, chain.query_covered_fraction);
         let contig = self.reference.contig(*contig_id).ok_or(MapError::Anchor(
             crate::AnchorError::MissingReference(*contig_id),
         ))?;
@@ -225,14 +240,27 @@ fn elapsed_nanos(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
 
-fn mapping_quality(best_score: i32, second_score: Option<i32>) -> u8 {
-    let Some(second_score) = second_score else {
-        return 60;
-    };
-    best_score
-        .saturating_sub(second_score)
-        .saturating_mul(2)
-        .clamp(0, 60) as u8
+fn mapping_quality(best_score: i32, second_score: Option<i32>, coverage: f64) -> u8 {
+    // The LR chain score margin is useful only when the chain covers a
+    // meaningful part of the read.  This is the same coverage knee used by
+    // FlashMap's default LR emission path: sparse anchors on a short repeat
+    // should not receive MAPQ 60 merely because no competitor was retained.
+    const COVERAGE_KNEE: f64 = 0.80;
+    let margin = second_score
+        .map(|second| {
+            if best_score > 0 {
+                (best_score.saturating_sub(second) as f64 / best_score as f64).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(1.0);
+    let coverage_factor = (coverage.clamp(0.0, 1.0) / COVERAGE_KNEE).min(1.0);
+    (60.0 * margin * coverage_factor).round().clamp(0.0, 60.0) as u8
+}
+
+fn endpoint_rank_score(score: i32, support: EndpointSupport, read_len: usize) -> i32 {
+    score.saturating_add(support.score_adjustment(read_len))
 }
 
 fn same_chain_placement(left: &crate::Chain, right: &crate::Chain) -> bool {
@@ -410,5 +438,13 @@ mod tests {
         assert_eq!(primary.ref_end, 20);
         assert_eq!(primary.cigar.ops(), &[crate::CigarOp::Match(20)]);
         assert_eq!(primary.edit_distance, 0);
+    }
+
+    #[test]
+    fn mapq_is_scaled_for_partial_unique_chains() {
+        assert_eq!(mapping_quality(100, None, 1.0), 60);
+        assert_eq!(mapping_quality(100, None, 0.80), 60);
+        assert_eq!(mapping_quality(100, None, 0.40), 30);
+        assert_eq!(mapping_quality(100, Some(99), 1.0), 1);
     }
 }
