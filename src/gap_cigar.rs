@@ -434,13 +434,7 @@ fn append_gap_recursive(
         let band = delta
             .saturating_add(config.alignment.bridge_flank)
             .clamp(16, 8_192);
-        // Multi-level gap scoring: small gaps (<=256 bp) use (q=4, e=2) matching
-        // Minimap2's short-indel tier for high 1-2bp indel sensitivity, while
-        // larger gaps use (q=6, e=1) to prevent over-opening across long spans.
-        let (q, e) = if max_gap <= 256 { (4, 2) } else { (6, 1) };
-        if let Some(alignment) =
-            crate::dp::align_full_with_scoring(query_slice, reference_slice, band, q, e)
-        {
+        if let Some(alignment) = align_full(query_slice, reference_slice, band) {
             ops.extend(alignment.cigar.into_ops());
             return Ok(());
         }
@@ -501,9 +495,7 @@ fn append_gap_recursive(
         && query_len.saturating_mul(reference_len) <= 16_000_000
     {
         let band = delta.saturating_add(32).clamp(32, 256);
-        if let Some(alignment) =
-            crate::dp::align_full_with_scoring(query_slice, reference_slice, band, 6, 1)
-        {
+        if let Some(alignment) = align_full(query_slice, reference_slice, band) {
             ops.extend(alignment.cigar.into_ops());
             return Ok(());
         }
