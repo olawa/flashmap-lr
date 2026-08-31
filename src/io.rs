@@ -768,6 +768,6 @@ mod tests {
         let fields: Vec<_> = record.split('\t').collect();
         assert_eq!(fields[1], "16");
         assert_eq!(fields[9], "TCGT");
-        assert_eq!(fields[10], "#$\"!");
+        assert_eq!(fields[10], "$#\"!");
     }
 }

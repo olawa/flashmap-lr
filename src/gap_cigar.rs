@@ -57,7 +57,7 @@ impl From<AlignmentError> for ChainCigarError {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OrientedAnchor {
     q_start: usize,
     q_end: usize,
@@ -253,12 +253,19 @@ fn orient_anchors(
 /// doing the same before gap assembly prevents an invalid negative gap from
 /// turning into a dropped read.
 fn normalize_anchor_overlaps(mut anchors: Vec<OrientedAnchor>) -> Vec<OrientedAnchor> {
-    for index in 0..anchors.len().saturating_sub(1) {
+    // Removing an anchor can expose a second overlap between its predecessor
+    // and successor.  Walk back after every removal so the final list is
+    // genuinely monotonic; a single forward pass is insufficient for
+    // repeated/segmentally duplicated sequence (especially on reverse
+    // strands).
+    let mut index = 0usize;
+    while index + 1 < anchors.len() {
         let (left, right) = (&anchors[index], &anchors[index + 1]);
         let overlap_q = left.q_end.saturating_sub(right.q_start);
         let overlap_ref = left.ref_end.saturating_sub(right.ref_start);
         let overlap = overlap_q.max(overlap_ref);
         if overlap == 0 {
+            index += 1;
             continue;
         }
 
@@ -280,6 +287,17 @@ fn normalize_anchor_overlaps(mut anchors: Vec<OrientedAnchor>) -> Vec<OrientedAn
             anchors[index].q_end = anchors[index].q_end.saturating_sub(q_len - ref_len);
         } else if ref_len > q_len {
             anchors[index].ref_end = anchors[index].ref_end.saturating_sub(ref_len - q_len);
+        }
+
+        if anchors[index].q_start >= anchors[index].q_end
+            || anchors[index].ref_start >= anchors[index].ref_end
+            || anchors[index].q_end - anchors[index].q_start
+                != anchors[index].ref_end - anchors[index].ref_start
+        {
+            anchors.remove(index);
+            index = index.saturating_sub(1);
+        } else {
+            index += 1;
         }
     }
     anchors.retain(|anchor| {
@@ -1102,6 +1120,51 @@ mod tests {
         assert_eq!(alignment.strand, Strand::Reverse);
         assert_eq!(alignment.cigar.ops(), &[CigarOp::Match(6)]);
         assert_eq!(alignment.edit_distance, 0);
+    }
+
+    #[test]
+    fn overlap_normalization_rechecks_neighbors_after_dropping_anchor() {
+        let anchors = vec![
+            OrientedAnchor {
+                q_start: 0,
+                q_end: 20,
+                ref_start: 0,
+                ref_end: 20,
+            },
+            OrientedAnchor {
+                q_start: 20,
+                q_end: 30,
+                ref_start: 100,
+                ref_end: 110,
+            },
+            OrientedAnchor {
+                q_start: 30,
+                q_end: 40,
+                ref_start: 10,
+                ref_end: 20,
+            },
+        ];
+        let normalized = normalize_anchor_overlaps(anchors);
+        assert_eq!(
+            normalized,
+            vec![
+                OrientedAnchor {
+                    q_start: 0,
+                    q_end: 10,
+                    ref_start: 0,
+                    ref_end: 10,
+                },
+                OrientedAnchor {
+                    q_start: 30,
+                    q_end: 40,
+                    ref_start: 10,
+                    ref_end: 20,
+                },
+            ]
+        );
+        assert!(normalized.windows(2).all(|pair| {
+            pair[1].q_start >= pair[0].q_end && pair[1].ref_start >= pair[0].ref_end
+        }));
     }
 
     #[test]
