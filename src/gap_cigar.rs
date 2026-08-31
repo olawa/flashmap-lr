@@ -381,10 +381,10 @@ fn append_gap_recursive(
     config: &Config,
     depth: usize,
 ) -> Result<(), ChainCigarError> {
-    const SMALL_GAP_DP_MAX: usize = 1_024;
-    const SMALL_GAP_DP_DELTA_MAX: usize = 256;
-    const MEDIUM_GAP_DP_MAX: usize = 2_048;
-    const MEDIUM_GAP_DP_DELTA_MAX: usize = 512;
+    const SMALL_GAP_DP_MAX: usize = 512;
+    const SMALL_GAP_DP_DELTA_MAX: usize = 64;
+    const MEDIUM_GAP_DP_MAX: usize = 1_536;
+    const MEDIUM_GAP_DP_DELTA_MAX: usize = 128;
     const RECURSIVE_SPLIT_K: usize = 13;
     const RECURSIVE_SPLIT_MAX_DEPTH: usize = 8;
     // Recursive exact-island lookup is independent of the bounded DP bridge
@@ -942,28 +942,31 @@ fn left_align_insertion(
     // repeat units in the preceding match window preserves or improves alignment quality.
     let q_pos = *query_pos;
     let r_pos = *reference_pos;
-    if let (Some(q_cur), Some(r_cur)) = (
-        query.get(q_pos.saturating_sub(match_len)..q_pos.saturating_add(length)),
-        reference.get(r_pos.saturating_sub(match_len)..r_pos.saturating_add(length)),
-    ) {
-        let q_prefix = &q_cur[..match_len];
-        let r_prefix = &r_cur[..match_len];
-        let orig_nm = mismatch_count(q_prefix, r_prefix);
+    let scan_limit = match_len.min(48);
+    if scan_limit > exact_shift {
+        if let (Some(q_cur), Some(r_cur)) = (
+            query.get(q_pos.saturating_sub(scan_limit)..q_pos.saturating_add(length)),
+            reference.get(r_pos.saturating_sub(scan_limit)..r_pos.saturating_add(length)),
+        ) {
+            let q_prefix = &q_cur[..scan_limit];
+            let r_prefix = &r_cur[..scan_limit];
+            let orig_nm = mismatch_count(q_prefix, r_prefix);
 
-        for s in (exact_shift + 1..=match_len).rev() {
-            if r_pos < s || q_pos < s {
-                continue;
-            }
-            let q_sub_a = query.get(q_pos - match_len..q_pos - s);
-            let r_sub_a = reference.get(r_pos - match_len..r_pos - s);
-            let q_sub_b = query.get(q_pos + length - s..q_pos + length);
-            let r_sub_b = reference.get(r_pos - s..r_pos);
+            for s in (exact_shift + 1..=scan_limit).rev() {
+                if r_pos < s || q_pos < s {
+                    continue;
+                }
+                let q_sub_a = query.get(q_pos - scan_limit..q_pos - s);
+                let r_sub_a = reference.get(r_pos - scan_limit..r_pos - s);
+                let q_sub_b = query.get(q_pos + length - s..q_pos + length);
+                let r_sub_b = reference.get(r_pos - s..r_pos);
 
-            if let (Some(qa), Some(ra), Some(qb), Some(rb)) = (q_sub_a, r_sub_a, q_sub_b, r_sub_b) {
-                let shifted_nm = mismatch_count(qa, ra) + mismatch_count(qb, rb);
-                if shifted_nm <= orig_nm {
-                    best_shift = s;
-                    break;
+                if let (Some(qa), Some(ra), Some(qb), Some(rb)) = (q_sub_a, r_sub_a, q_sub_b, r_sub_b) {
+                    let shifted_nm = mismatch_count(qa, ra) + mismatch_count(qb, rb);
+                    if shifted_nm <= orig_nm {
+                        best_shift = s;
+                        break;
+                    }
                 }
             }
         }
@@ -1034,27 +1037,30 @@ fn left_align_deletion(
     // repeat units in the preceding match window preserves or improves alignment quality.
     let q_pos = *query_pos;
     let r_pos = *reference_pos;
-    if let (Some(q_cur), Some(r_cur)) = (
-        query.get(q_pos.saturating_sub(match_len)..q_pos),
-        reference.get(r_pos.saturating_sub(match_len)..r_pos.saturating_add(length)),
-    ) {
-        let r_prefix = &r_cur[..match_len];
-        let orig_nm = mismatch_count(q_cur, r_prefix);
+    let scan_limit = match_len.min(48);
+    if scan_limit > exact_shift {
+        if let (Some(q_cur), Some(r_cur)) = (
+            query.get(q_pos.saturating_sub(scan_limit)..q_pos),
+            reference.get(r_pos.saturating_sub(scan_limit)..r_pos.saturating_add(length)),
+        ) {
+            let r_prefix = &r_cur[..scan_limit];
+            let orig_nm = mismatch_count(q_cur, r_prefix);
 
-        for s in (exact_shift + 1..=match_len).rev() {
-            if r_pos < s || q_pos < s {
-                continue;
-            }
-            let q_sub_a = query.get(q_pos - match_len..q_pos - s);
-            let r_sub_a = reference.get(r_pos - match_len..r_pos - s);
-            let q_sub_b = query.get(q_pos - s..q_pos);
-            let r_sub_b = reference.get(r_pos + length - s..r_pos + length);
+            for s in (exact_shift + 1..=scan_limit).rev() {
+                if r_pos < s || q_pos < s {
+                    continue;
+                }
+                let q_sub_a = query.get(q_pos - scan_limit..q_pos - s);
+                let r_sub_a = reference.get(r_pos - scan_limit..r_pos - s);
+                let q_sub_b = query.get(q_pos - s..q_pos);
+                let r_sub_b = reference.get(r_pos + length - s..r_pos + length);
 
-            if let (Some(qa), Some(ra), Some(qb), Some(rb)) = (q_sub_a, r_sub_a, q_sub_b, r_sub_b) {
-                let shifted_nm = mismatch_count(qa, ra) + mismatch_count(qb, rb);
-                if shifted_nm <= orig_nm {
-                    best_shift = s;
-                    break;
+                if let (Some(qa), Some(ra), Some(qb), Some(rb)) = (q_sub_a, r_sub_a, q_sub_b, r_sub_b) {
+                    let shifted_nm = mismatch_count(qa, ra) + mismatch_count(qb, rb);
+                    if shifted_nm <= orig_nm {
+                        best_shift = s;
+                        break;
+                    }
                 }
             }
         }
