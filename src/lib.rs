@@ -12,6 +12,7 @@ mod config;
 mod diagnostics;
 mod dp;
 mod errors;
+mod fmi;
 mod gap_cigar;
 mod index;
 pub mod io;
@@ -31,6 +32,7 @@ pub use config::{
 pub use diagnostics::{DiagnosticsSink, ReadDiagnostics};
 pub use dp::{align_full, align_local, LocalAlignment};
 pub use errors::MapError;
+pub use fmi::{FmiContigInfo, FmiError, FmiIndex};
 pub use gap_cigar::{build_chain_alignment, build_chain_cigar, ChainCigarError};
 pub use index::{
     collect_hits, InMemoryReference, InMemorySeedIndex, OwnedContig, Reference, SeedIndex,

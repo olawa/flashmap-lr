@@ -1,5 +1,7 @@
 use rs_lra::io::{load_reference_path, open_fastx, SamWriter};
-use rs_lra::{Aligner, Config, InMemorySeedIndex, WorkerPool, WorkerPoolError};
+use rs_lra::{
+    Aligner, Config, FmiIndex, InMemorySeedIndex, Reference, SeedIndex, WorkerPool, WorkerPoolError,
+};
 use std::env;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -7,7 +9,8 @@ use std::path::PathBuf;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Options {
-    reference: PathBuf,
+    reference: Option<PathBuf>,
+    index: Option<PathBuf>,
     reads: PathBuf,
     output: PathBuf,
     workers: usize,
@@ -22,6 +25,7 @@ impl Options {
         let mut args = args.into_iter();
         let _program = args.next();
         let mut reference = None;
+        let mut index = None;
         let mut reads = None;
         let mut output = PathBuf::from("-");
         let mut workers = std::thread::available_parallelism()
@@ -36,6 +40,9 @@ impl Options {
                 "--version" => return Err(CliError::Version),
                 "-r" | "--reference" => {
                     reference = Some(PathBuf::from(next_value(&mut args, &argument)?));
+                }
+                "--index" => {
+                    index = Some(PathBuf::from(next_value(&mut args, &argument)?));
                 }
                 "-i" | "--reads" => {
                     reads = Some(PathBuf::from(next_value(&mut args, &argument)?));
@@ -56,8 +63,16 @@ impl Options {
             }
         }
 
+        if reference.is_some() && index.is_some() {
+            return Err(CliError::ConflictingInput);
+        }
+        if reference.is_none() && index.is_none() {
+            return Err(CliError::MissingInput);
+        }
+
         Ok(Self {
-            reference: reference.ok_or(CliError::MissingOption("--reference"))?,
+            reference,
+            index,
             reads: reads.ok_or(CliError::MissingOption("--reads"))?,
             output,
             workers,
@@ -71,11 +86,14 @@ enum CliError {
     Help,
     Version,
     MissingValue(String),
+    MissingInput,
+    ConflictingInput,
     MissingOption(&'static str),
     InvalidNumber { option: &'static str, value: String },
     UnknownOption(String),
     UnexpectedArgument(String),
     Reference(rs_lra::ReferenceIoError),
+    Index(rs_lra::FmiError),
     Reads(rs_lra::FastxError),
     Output(io::Error),
     Pool(String),
@@ -87,6 +105,8 @@ impl std::fmt::Display for CliError {
             Self::Help => f.write_str(usage()),
             Self::Version => write!(f, "RS-LRA {}", rs_lra::VERSION),
             Self::MissingValue(option) => write!(f, "missing value for {option}"),
+            Self::MissingInput => f.write_str("one of --index or --reference is required"),
+            Self::ConflictingInput => f.write_str("--index and --reference are mutually exclusive"),
             Self::MissingOption(option) => write!(f, "missing required option {option}"),
             Self::InvalidNumber { option, value } => {
                 write!(f, "{option} must be a positive integer, got {value:?}")
@@ -96,6 +116,7 @@ impl std::fmt::Display for CliError {
                 write!(f, "unexpected positional argument {value:?}\n\n{}", usage())
             }
             Self::Reference(error) => write!(f, "reference: {error}"),
+            Self::Index(error) => write!(f, "index: {error}"),
             Self::Reads(error) => write!(f, "reads: {error}"),
             Self::Output(error) => write!(f, "output: {error}"),
             Self::Pool(error) => f.write_str(error),
@@ -122,35 +143,58 @@ fn parse_positive(value: String, option: &'static str) -> Result<usize, CliError
 }
 
 fn usage() -> &'static str {
-    "Usage: rs-lra --reference REF.fa --reads READS.fa[stq] [options]\n\n\
+    "Usage: rs-lra (--index REF.fmi | --reference REF.fa) --reads READS.fa[stq] [options]\n\n\
 Options:\n\
-  -r, --reference PATH   Reference FASTA (required)\n\
+      --index PATH       FlashMap v13 persistent index (recommended)\n\
+  -r, --reference PATH   Reference FASTA (small-fixture adapter)\n\
   -i, --reads PATH       FASTA or FASTQ reads (required)\n\
   -o, --output PATH      SAM output path, or - for stdout (default: -)\n\
   -w, --workers N        Mapper worker count (default: available CPUs)\n\
       --chunk-size N     Reads per worker batch (default: 1024)\n\
   -h, --help             Show this help\n\
       --version          Show version\n\n\
-The first CLI adapter builds a bounded in-memory k=15 DNA index. It is intended\n\
-for small fixtures and differential tests; use a persistent index adapter for\n\
-whole-genome runs."
+The --index path uses the read-only FlashMap v13 packed minimizer adapter.\n\
+The --reference path builds a bounded in-memory k=15 index for small fixtures."
 }
 
 fn run(options: Options) -> Result<(), CliError> {
-    let reference = load_reference_path(&options.reference).map_err(CliError::Reference)?;
-    let index = InMemorySeedIndex::new(&reference);
+    if let Some(index_path) = &options.index {
+        let index = FmiIndex::open(index_path).map_err(CliError::Index)?;
+        let metadata = index.reference_metadata();
+        return execute_mapping(&index, &index, metadata, &options);
+    }
 
+    let reference_path = options
+        .reference
+        .as_ref()
+        .expect("CLI input validation guarantees a reference or index");
+    let reference = load_reference_path(reference_path).map_err(CliError::Reference)?;
+    let index = InMemorySeedIndex::new(&reference);
+    let metadata = reference
+        .contigs()
+        .iter()
+        .map(|contig| (contig.id, contig.name.clone(), contig.sequence.len()))
+        .collect();
+    execute_mapping(&reference, &index, metadata, &options)
+}
+
+fn execute_mapping(
+    reference: &dyn Reference,
+    index: &dyn SeedIndex,
+    metadata: Vec<(rs_lra::ContigId, String, usize)>,
+    options: &Options,
+) -> Result<(), CliError> {
     let mut config = Config::default();
     config.worker_pool.workers = options.workers;
     config.worker_pool.chunk_size = options.chunk_size;
-    let aligner = Aligner::new(&reference, &index, config)
+    let aligner = Aligner::new(reference, index, config)
         .map_err(|error| CliError::Pool(format!("invalid mapper configuration: {error}")))?;
     let pool = WorkerPool::new(aligner.config().worker_pool.clone())
         .map_err(|error| CliError::Pool(error.to_string()))?;
 
     let reads = open_fastx(&options.reads).map_err(CliError::Reads)?;
     let output = open_output(&options.output).map_err(CliError::Output)?;
-    let mut writer = SamWriter::new(BufWriter::new(output), &reference)
+    let mut writer = SamWriter::from_contigs(BufWriter::new(output), metadata)
         .map_err(|error| CliError::Pool(error.to_string()))?;
     let stats = aligner
         .map_with_worker_pool_sink(&pool, reads, |mapped| {
@@ -216,10 +260,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parser_requires_reference_and_reads() {
+    fn parser_requires_an_input_and_reads() {
         assert!(matches!(
             Options::parse(["rs-lra".to_owned()]),
-            Err(CliError::MissingOption("--reference"))
+            Err(CliError::MissingInput)
         ));
     }
 
@@ -243,10 +287,40 @@ mod tests {
             .map(str::to_owned),
         )
         .unwrap();
-        assert_eq!(options.reference, PathBuf::from("ref.fa"));
+        assert_eq!(options.reference, Some(PathBuf::from("ref.fa")));
+        assert_eq!(options.index, None);
         assert_eq!(options.reads, PathBuf::from("reads.fq"));
         assert_eq!(options.output, PathBuf::from("out.sam"));
         assert_eq!(options.workers, 3);
         assert_eq!(options.chunk_size, 17);
+    }
+
+    #[test]
+    fn parser_accepts_persistent_index_and_rejects_mixed_inputs() {
+        let options = Options::parse(
+            ["rs-lra", "--index", "ref.fmi", "--reads", "reads.fq"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(options.reference, None);
+        assert_eq!(options.index, Some(PathBuf::from("ref.fmi")));
+
+        assert!(matches!(
+            Options::parse(
+                [
+                    "rs-lra",
+                    "--index",
+                    "ref.fmi",
+                    "--reference",
+                    "ref.fa",
+                    "--reads",
+                    "reads.fq"
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            ),
+            Err(CliError::ConflictingInput)
+        ));
     }
 }

@@ -357,9 +357,16 @@ impl From<FastxError> for ReferenceIoError {
 }
 
 /// SAM text output for ordered [`crate::MappedRead`] values.
-pub struct SamWriter<'a, W: Write> {
+pub struct SamWriter<W: Write> {
     writer: W,
-    reference: &'a InMemoryReference,
+    reference: Vec<SamContig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SamContig {
+    id: ContigId,
+    name: String,
+    length: usize,
 }
 
 #[derive(Debug)]
@@ -404,17 +411,38 @@ impl From<io::Error> for SamError {
     }
 }
 
-impl<'a, W: Write> SamWriter<'a, W> {
-    pub fn new(mut writer: W, reference: &'a InMemoryReference) -> Result<Self, SamError> {
+impl<W: Write> SamWriter<W> {
+    pub fn new(writer: W, reference: &InMemoryReference) -> Result<Self, SamError> {
+        Self::from_contigs(
+            writer,
+            reference
+                .contigs()
+                .iter()
+                .map(|contig| (contig.id, contig.name.clone(), contig.sequence.len())),
+        )
+    }
+
+    /// Construct a writer from any reference metadata provider.  The metadata
+    /// is copied once (names are tiny compared with a WGS index), so this
+    /// output adapter works equally with the in-memory FASTA fixture and an
+    /// mmap-backed [`crate::FmiIndex`].
+    pub fn from_contigs<I, N>(mut writer: W, contigs: I) -> Result<Self, SamError>
+    where
+        I: IntoIterator<Item = (ContigId, N, usize)>,
+        N: Into<String>,
+    {
+        let reference: Vec<SamContig> = contigs
+            .into_iter()
+            .map(|(id, name, length)| SamContig {
+                id,
+                name: name.into(),
+                length,
+            })
+            .collect();
         writeln!(writer, "@HD\tVN:1.6\tSO:unknown")?;
-        for contig in reference.contigs() {
+        for contig in &reference {
             ensure_sam_field(&contig.name, "reference name")?;
-            writeln!(
-                writer,
-                "@SQ\tSN:{}\tLN:{}",
-                contig.name,
-                contig.sequence.len()
-            )?;
+            writeln!(writer, "@SQ\tSN:{}\tLN:{}", contig.name, contig.length)?;
         }
         Ok(Self { writer, reference })
     }
@@ -469,7 +497,6 @@ impl<'a, W: Write> SamWriter<'a, W> {
     ) -> Result<(), SamError> {
         let name = self
             .reference
-            .contigs()
             .iter()
             .find(|contig| contig.id == alignment.contig)
             .map(|contig| contig.name.as_str())
