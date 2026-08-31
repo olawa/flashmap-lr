@@ -375,10 +375,10 @@ fn append_gap_recursive(
     config: &Config,
     depth: usize,
 ) -> Result<(), ChainCigarError> {
-    const SMALL_GAP_DP_MAX: usize = 512;
-    const SMALL_GAP_DP_DELTA_MAX: usize = 64;
-    const MEDIUM_GAP_DP_MAX: usize = 1_536;
-    const MEDIUM_GAP_DP_DELTA_MAX: usize = 128;
+    const SMALL_GAP_DP_MAX: usize = 1_024;
+    const SMALL_GAP_DP_DELTA_MAX: usize = 256;
+    const MEDIUM_GAP_DP_MAX: usize = 2_048;
+    const MEDIUM_GAP_DP_DELTA_MAX: usize = 512;
     const RECURSIVE_SPLIT_K: usize = 13;
     const RECURSIVE_SPLIT_MAX_DEPTH: usize = 8;
     // Recursive exact-island lookup is independent of the bounded DP bridge
