@@ -128,8 +128,21 @@ impl<'a> Aligner<'a> {
         let max_candidates = self.config.candidates.max_regions.min(8);
 
         for (idx, candidate) in candidates.iter().take(max_candidates).enumerate() {
-            if idx > 0 && !placements.is_empty() && candidate.score < min_competitive_score {
-                break;
+            if idx > 0 && !placements.is_empty() {
+                if candidate.score < min_competitive_score {
+                    break;
+                }
+                // When an existing placement already has near-perfect anchor coverage (>=90%),
+                // weaker candidate regions (<50% of top seed score) cannot compete.
+                let best_covered_fraction = placements
+                    .iter()
+                    .map(|p: &(crate::ContigId, Chain, EndpointSupport)| p.1.query_covered_fraction)
+                    .fold(0.0f64, f64::max);
+                if best_covered_fraction >= 0.90
+                    && candidate.score < (top_candidate_score as f32 * 0.50) as i32
+                {
+                    break;
+                }
             }
             if idx >= 3 && placements.is_empty() {
                 break;
@@ -171,6 +184,26 @@ impl<'a> Aligner<'a> {
                 .saturating_add(saturating_u32(anchors.len()));
             if anchors.is_empty() {
                 continue;
+            }
+
+            // Early anchor coverage prune: if the best candidate already has high coverage
+            // and this candidate's raw anchor span is far too small, skip chaining.
+            if idx > 0 && !placements.is_empty() {
+                let best_covered_fraction = placements
+                    .iter()
+                    .map(|p: &(crate::ContigId, Chain, EndpointSupport)| p.1.query_covered_fraction)
+                    .fold(0.0f64, f64::max);
+                if best_covered_fraction >= 0.85 {
+                    let total_anchor_span: usize = anchors
+                        .iter()
+                        .map(|a| a.q_end.saturating_sub(a.q_start) as usize)
+                        .sum();
+                    let approx_coverage =
+                        total_anchor_span as f64 / read.sequence.len().max(1) as f64;
+                    if approx_coverage < best_covered_fraction * 0.40 {
+                        continue;
+                    }
+                }
             }
 
             let phase_started = Instant::now();
