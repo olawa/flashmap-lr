@@ -725,7 +725,7 @@ fn mismatch_count(query: &[u8], reference: &[u8]) -> usize {
     query
         .iter()
         .zip(reference)
-        .filter(|(q, r)| !q.eq_ignore_ascii_case(r) && **r != b'N' && **r != b'n')
+        .filter(|(q, r)| !q.eq_ignore_ascii_case(r))
         .count()
 }
 
@@ -961,7 +961,9 @@ fn left_align_insertion(
                 let q_sub_b = query.get(q_pos + length - s..q_pos + length);
                 let r_sub_b = reference.get(r_pos - s..r_pos);
 
-                if let (Some(qa), Some(ra), Some(qb), Some(rb)) = (q_sub_a, r_sub_a, q_sub_b, r_sub_b) {
+                if let (Some(qa), Some(ra), Some(qb), Some(rb)) =
+                    (q_sub_a, r_sub_a, q_sub_b, r_sub_b)
+                {
                     let shifted_nm = mismatch_count(qa, ra) + mismatch_count(qb, rb);
                     if shifted_nm <= orig_nm {
                         best_shift = s;
@@ -1055,7 +1057,9 @@ fn left_align_deletion(
                 let q_sub_b = query.get(q_pos - s..q_pos);
                 let r_sub_b = reference.get(r_pos + length - s..r_pos + length);
 
-                if let (Some(qa), Some(ra), Some(qb), Some(rb)) = (q_sub_a, r_sub_a, q_sub_b, r_sub_b) {
+                if let (Some(qa), Some(ra), Some(qb), Some(rb)) =
+                    (q_sub_a, r_sub_a, q_sub_b, r_sub_b)
+                {
                     let shifted_nm = mismatch_count(qa, ra) + mismatch_count(qb, rb);
                     if shifted_nm <= orig_nm {
                         best_shift = s;

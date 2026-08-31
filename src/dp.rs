@@ -211,15 +211,11 @@ fn encode_dna5(sequence: &[u8], output: &mut Vec<u8>) {
 
 fn dna5_matrix() -> [i8; 25] {
     let mut matrix = [-MISMATCH_PENALTY; 25];
-    for base in 0..4 {
+    for base in 0..5 {
         matrix[base * 5 + base] = MATCH_SCORE;
     }
-    // Ambiguous bases (N) neither reward nor penalize an aligned comparison,
-    // matching Minimap2 / KSW2 standard (all row 4 and col 4 entries are 0).
-    for base in 0..5 {
-        matrix[base * 5 + 4] = 0;
-        matrix[4 * 5 + base] = 0;
-    }
+    // Ambiguous bases neither reward nor penalize an aligned comparison.
+    matrix[24] = 0;
     matrix
 }
 
