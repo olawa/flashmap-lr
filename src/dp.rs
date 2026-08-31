@@ -116,6 +116,17 @@ pub fn align_local(query: &[u8], reference: &[u8], band_width: usize) -> Option<
 /// truncated/soft-clipped traceback keeps callers from silently emitting a
 /// CIGAR that does not cover the complete internal gap.
 pub fn align_full(query: &[u8], reference: &[u8], band_width: usize) -> Option<LocalAlignment> {
+    align_full_with_scoring(query, reference, band_width, GAP_OPEN, GAP_EXTEND)
+}
+
+/// Run KSW2 affine-gap alignment with explicit gap opening and extension penalties.
+pub fn align_full_with_scoring(
+    query: &[u8],
+    reference: &[u8],
+    band_width: usize,
+    gap_open: i8,
+    gap_extend: i8,
+) -> Option<LocalAlignment> {
     if query.is_empty() || reference.is_empty() {
         return None;
     }
@@ -140,8 +151,8 @@ pub fn align_full(query: &[u8], reference: &[u8], band_width: usize) -> Option<L
                     target: &reference_dna5,
                     m: 5,
                     mat: &matrix,
-                    q: GAP_OPEN,
-                    e: GAP_EXTEND,
+                    q: gap_open,
+                    e: gap_extend,
                     w: band_width as i32,
                     zdrop: 100,
                     end_bonus: 0,
