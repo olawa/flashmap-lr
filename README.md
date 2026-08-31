@@ -68,5 +68,11 @@ FASTQ reads. The `--reference` route is intentionally limited to small
 references and differential tests; `--index` is the persistent route. Compressed
 reads are not part of this first adapter.
 
+The local LR verification anchor is `k=15` in the default profile, but that is
+independent of the persisted minimizer index span. `FmiIndex` accepts any
+contiguous packed minimizer index with `1 <= k <= 32` (for example the common
+`k=19,w=6` GRCh38 index); the index span is used for seed lookup while local
+exact-anchor verification continues to use the resolved LR anchor length.
+
 The library crate is named `rs_lra`; the command-line binary is named
 `rs-lra`.

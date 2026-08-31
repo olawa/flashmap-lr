@@ -457,16 +457,15 @@ impl<W: Write> SamWriter<W> {
                 });
             }
         }
-        let sequence = sam_sequence(&mapped.sequence);
-        let quality = mapped
-            .qualities
-            .as_deref()
-            .map(sam_quality)
-            .unwrap_or_else(|| "*".to_owned());
-
         if let Some(primary) = mapped.mapping.primary.as_ref() {
-            self.write_alignment(mapped, primary, false, &sequence, &quality)?;
+            self.write_alignment(mapped, primary, false)?;
         } else {
+            let sequence = sam_sequence(&mapped.sequence);
+            let quality = mapped
+                .qualities
+                .as_deref()
+                .map(sam_quality)
+                .unwrap_or_else(|| "*".to_owned());
             writeln!(
                 self.writer,
                 "{}\t4\t*\t0\t0\t*\t*\t0\t0\t{}\t{}",
@@ -474,7 +473,7 @@ impl<W: Write> SamWriter<W> {
             )?;
         }
         for supplementary in &mapped.mapping.supplementary {
-            self.write_alignment(mapped, supplementary, true, &sequence, &quality)?;
+            self.write_alignment(mapped, supplementary, true)?;
         }
         Ok(())
     }
@@ -492,8 +491,6 @@ impl<W: Write> SamWriter<W> {
         mapped: &MappedRead,
         alignment: &Alignment,
         supplementary: bool,
-        sequence: &str,
-        quality: &str,
     ) -> Result<(), SamError> {
         let name = self
             .reference
@@ -514,6 +511,13 @@ impl<W: Write> SamWriter<W> {
             flag |= 0x800;
         }
         ensure_sam_field(name, "reference name")?;
+        let reverse = alignment.strand == Strand::Reverse;
+        let sequence = sam_sequence_oriented(&mapped.sequence, reverse);
+        let quality = mapped
+            .qualities
+            .as_deref()
+            .map(|qualities| sam_quality_oriented(qualities, reverse))
+            .unwrap_or_else(|| "*".to_owned());
         writeln!(
             self.writer,
             "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}\tNM:i:{}\tAS:i:{}",
@@ -555,6 +559,56 @@ fn sam_sequence(sequence: &[u8]) -> String {
         .collect()
 }
 
+fn sam_sequence_oriented(sequence: &[u8], reverse: bool) -> String {
+    if reverse {
+        sequence
+            .iter()
+            .rev()
+            .map(|&byte| complement_sam_base(byte))
+            .collect()
+    } else {
+        sam_sequence(sequence)
+    }
+}
+
+fn complement_sam_base(byte: u8) -> char {
+    match byte {
+        b'A' => 'T',
+        b'C' => 'G',
+        b'G' => 'C',
+        b'T' => 'A',
+        b'a' => 't',
+        b'c' => 'g',
+        b'g' => 'c',
+        b't' => 'a',
+        // Preserve the common IUPAC ambiguity alphabet while reversing it.
+        b'R' => 'Y',
+        b'Y' => 'R',
+        b'S' => 'S',
+        b'W' => 'W',
+        b'K' => 'M',
+        b'M' => 'K',
+        b'B' => 'V',
+        b'V' => 'B',
+        b'D' => 'H',
+        b'H' => 'D',
+        b'N' => 'N',
+        b'r' => 'y',
+        b'y' => 'r',
+        b's' => 's',
+        b'w' => 'w',
+        b'k' => 'm',
+        b'm' => 'k',
+        b'b' => 'v',
+        b'v' => 'b',
+        b'd' => 'h',
+        b'h' => 'd',
+        b'n' => 'n',
+        value if value.is_ascii_graphic() => value as char,
+        _ => 'N',
+    }
+}
+
 fn sam_quality(qualities: &[u8]) -> String {
     qualities
         .iter()
@@ -566,6 +620,24 @@ fn sam_quality(qualities: &[u8]) -> String {
             }
         })
         .collect()
+}
+
+fn sam_quality_oriented(qualities: &[u8], reverse: bool) -> String {
+    if reverse {
+        qualities
+            .iter()
+            .rev()
+            .map(|&byte| {
+                if (33..=126).contains(&byte) {
+                    byte as char
+                } else {
+                    '!'
+                }
+            })
+            .collect()
+    } else {
+        sam_quality(qualities)
+    }
 }
 
 fn cigar_string(alignment: &Alignment) -> String {
@@ -665,5 +737,37 @@ mod tests {
         assert!(text.contains("@SQ\tSN:chr0\tLN:8"));
         assert!(text.contains("r0\t0\tchr0\t3\t42\t4M"));
         assert!(text.contains("unmapped\t4\t*\t0\t0\t*"));
+    }
+
+    #[test]
+    fn sam_writer_reverse_records_emit_reverse_complement_and_reversed_quality() {
+        let reference = InMemoryReference::from_sequences([("chr0", b"TCGT".to_vec())]);
+        let cigar = crate::Cigar::new([CigarOp::Match(4)]).unwrap();
+        let alignment =
+            Alignment::new(ContigId(0), 0, Strand::Reverse, 0, cigar, 4, 42, 0).unwrap();
+        let mapped = MappedRead {
+            name: "reverse".to_owned(),
+            sequence: b"ACGA".to_vec(),
+            qualities: Some(b"!\"#$".to_vec()),
+            mapping: crate::MappingResult {
+                primary: Some(alignment),
+                supplementary: Vec::new(),
+                diagnostics: None,
+            },
+        };
+        let mut output = Vec::new();
+        let mut writer = SamWriter::new(&mut output, &reference).unwrap();
+        writer.write_mapped_read(&mapped).unwrap();
+        writer.flush().unwrap();
+
+        let text = String::from_utf8(output).unwrap();
+        let record = text
+            .lines()
+            .find(|line| line.starts_with("reverse\t"))
+            .expect("reverse alignment record");
+        let fields: Vec<_> = record.split('\t').collect();
+        assert_eq!(fields[1], "16");
+        assert_eq!(fields[9], "TCGT");
+        assert_eq!(fields[10], "#$\"!");
     }
 }

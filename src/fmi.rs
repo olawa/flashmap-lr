@@ -122,7 +122,7 @@ impl FmiSeedShape {
 /// Exact v13 metadata field order.  Do not reorder fields: bincode serializes
 /// this as a positional sequence, just as FlashMap's private metadata struct.
 #[allow(dead_code)]
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct FmiMetadata {
     k: usize,
     w: usize,
@@ -651,11 +651,16 @@ fn validate_metadata(metadata: &FmiMetadata) -> Result<(), FmiError> {
             metadata.index_format_version
         )));
     }
-    if metadata.k != crate::LR_SEED_K {
+    // The persisted minimizer span and the local LR verification anchor are
+    // deliberately different parameters.  FlashMap's current LR default
+    // uses a k=15 exact anchor while its primary `.fmi` is commonly built
+    // with k=19 (or another contiguous packed k).  The query/index span is
+    // carried by `SeedIndex::seed_span`; local anchor verification continues
+    // to use `Config::candidates.anchor_k`.
+    if metadata.k == 0 || metadata.k > 32 {
         return Err(FmiError::Unsupported(format!(
-            "k={} is incompatible with the fixed RS-LRA anchor k={}",
-            metadata.k,
-            crate::LR_SEED_K
+            "index k={} is outside the packed 2-bit range 1..=32",
+            metadata.k
         )));
     }
     if metadata.w == 0 || metadata.w > u8::MAX as usize {
@@ -1211,6 +1216,24 @@ mod tests {
         assert_eq!(((raw >> 48) & 0xffff) as u32, 7);
         assert_eq!(((raw >> 16) & 0xffff_ffff) as u32, 1234);
         assert_ne!(raw & RC_BIT, 0);
+    }
+
+    #[test]
+    fn accepts_index_k_independently_of_local_anchor_k() {
+        let metadata = FmiMetadata {
+            k: 19,
+            w: 6,
+            index_format_version: 13,
+            seed_type: FmiSeedType::Minimizer,
+            seed_shape: FmiSeedShape {
+                span: 19,
+                weight: 19,
+                offsets: (0..19).map(|offset| offset as u8).collect(),
+                mask_string: "1".repeat(19),
+            },
+            ..FmiMetadata::default()
+        };
+        assert!(validate_metadata(&metadata).is_ok());
     }
 
     #[test]

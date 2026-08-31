@@ -10,7 +10,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{CandidateRegion, Config, ContigId, Read, Reference, SeedIndex, Strand};
+use crate::{
+    CandidateRegion, Config, ContigId, QuerySeed, Read, Reference, SeedHit, SeedIndex, SeedLookup,
+    Strand,
+};
 
 /// A minimal anchor passed from local discovery to the chain phase.
 ///
@@ -92,6 +95,48 @@ impl Default for DefaultAnchorPolicy {
 struct MatchingSeedHits {
     query_pos: usize,
     ref_positions: Vec<u64>,
+}
+
+/// Read-global seed lookups reused by every candidate region.
+///
+/// The hit payload is kept in one flat vector rather than one allocation per
+/// minimizer.  At most the first 128 callback hits are retained for each seed;
+/// `callback_counts` preserves the over-cap signal used by the anchor safety
+/// checks below.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CachedQuerySeedHits {
+    seeds: Vec<QuerySeed>,
+    offsets: Vec<usize>,
+    hits: Vec<SeedHit>,
+    lookups: Vec<SeedLookup>,
+    callback_counts: Vec<usize>,
+}
+
+pub(crate) fn cache_query_seed_hits(
+    query_seeds: &[QuerySeed],
+    index: &dyn SeedIndex,
+) -> CachedQuerySeedHits {
+    let mut cached = CachedQuerySeedHits {
+        seeds: query_seeds.to_vec(),
+        offsets: Vec::with_capacity(query_seeds.len() + 1),
+        hits: Vec::with_capacity(query_seeds.len()),
+        lookups: Vec::with_capacity(query_seeds.len()),
+        callback_counts: Vec::with_capacity(query_seeds.len()),
+    };
+    cached.offsets.push(0);
+    for &seed in query_seeds {
+        let mut callback_count = 0usize;
+        let lookup = index.visit_hits(&seed, &mut |hit| {
+            callback_count = callback_count.saturating_add(1);
+            if callback_count <= 128 {
+                cached.hits.push(hit);
+            }
+        });
+        cached.offsets.push(cached.hits.len());
+        cached.lookups.push(lookup);
+        cached.callback_counts.push(callback_count);
+    }
+    cached
 }
 
 #[derive(Default)]
@@ -195,6 +240,21 @@ pub fn find_anchors(
     index: &dyn SeedIndex,
     config: &Config,
 ) -> Result<Vec<Anchor>, AnchorError> {
+    let query_seeds = index.query_seeds(read.sequence);
+    let query_seed_hits = cache_query_seed_hits(&query_seeds, index);
+    find_anchors_with_seed_hits(read, candidate, reference, config, &query_seed_hits)
+}
+
+/// Discover anchors using query seed hits that were already collected for this
+/// read. [`crate::Aligner::map`] uses this entry point so the same minimizer
+/// extraction and index lookups are shared across all candidate regions.
+pub(crate) fn find_anchors_with_seed_hits(
+    read: Read<'_>,
+    candidate: &CandidateRegion,
+    reference: &dyn Reference,
+    config: &Config,
+    query_seed_hits: &CachedQuerySeedHits,
+) -> Result<Vec<Anchor>, AnchorError> {
     read.validate().map_err(AnchorError::InvalidRead)?;
     let policy = DefaultAnchorPolicy::default();
     let k = config.candidates.anchor_k;
@@ -232,8 +292,14 @@ pub fn find_anchors(
         return Err(AnchorError::InvalidCandidateBounds);
     }
 
-    let (mut raw_minimizer_positions, mut matching_seed_hits) =
-        collect_matching_seed_hits(read.sequence, candidate, index, k, window_start, window_end);
+    let (mut raw_minimizer_positions, mut matching_seed_hits) = collect_matching_seed_hits(
+        query_seed_hits,
+        read.sequence.len(),
+        candidate,
+        k,
+        window_start,
+        window_end,
+    );
     raw_minimizer_positions.sort_unstable();
     raw_minimizer_positions.dedup();
     matching_seed_hits.sort_unstable_by_key(|seed| seed.query_pos);
@@ -393,38 +459,38 @@ pub fn find_anchors(
 }
 
 fn collect_matching_seed_hits(
-    read: &[u8],
+    query_seed_hits: &CachedQuerySeedHits,
+    read_len: usize,
     candidate: &CandidateRegion,
-    index: &dyn SeedIndex,
     k: usize,
     window_start: usize,
     window_end: usize,
 ) -> (Vec<usize>, Vec<MatchingSeedHits>) {
     let mut raw_minimizer_positions = Vec::new();
     let mut matching_seed_hits = Vec::new();
-    for seed in index.query_seeds(read) {
+    for seed_index in 0..query_seed_hits.seeds.len() {
+        let seed = query_seed_hits.seeds[seed_index];
         let query_pos = seed.query_pos as usize;
-        if query_pos > read.len().saturating_sub(k) {
+        if query_pos > read_len.saturating_sub(k) {
             continue;
         }
         raw_minimizer_positions.push(query_pos);
 
-        let mut callback_count = 0usize;
         let mut ref_positions = Vec::new();
-        let lookup = index.visit_hits(&seed, &mut |hit| {
-            callback_count = callback_count.saturating_add(1);
-            if callback_count > 128 {
-                return;
-            }
+        let hit_start = query_seed_hits.offsets[seed_index];
+        let hit_end = query_seed_hits.offsets[seed_index + 1];
+        for &hit in &query_seed_hits.hits[hit_start..hit_end] {
             if hit.contig != candidate.contig
                 || effective_strand(seed.strand, hit.strand) != candidate.strand
                 || hit.ref_pos < window_start as u64
                 || hit.ref_pos.saturating_add(k as u64) > window_end as u64
             {
-                return;
+                continue;
             }
             ref_positions.push(hit.ref_pos);
-        });
+        }
+        let lookup = query_seed_hits.lookups[seed_index];
+        let callback_count = query_seed_hits.callback_counts[seed_index];
 
         // A capped/sampled or over-cap list is never allowed to seed a local
         // anchor. It can remain in `raw_minimizer_positions`, so staging still

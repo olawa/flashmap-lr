@@ -3,9 +3,10 @@
 //! The mapper owns no scheduling state. Stream adapters use the fixed
 //! [`crate::WorkerPool`] and call this kernel from its workers.
 
+use crate::anchors::{cache_query_seed_hits, find_anchors_with_seed_hits, CachedQuerySeedHits};
 use crate::candidates::{cluster_probe_hits_for_read, EndpointSupport};
 use crate::{
-    build_chain_alignment, chain_anchors, extract_read_probes, find_anchors, Config, ConfigError,
+    build_chain_alignment, chain_anchors, extract_read_probes, Config, ConfigError,
     DiagnosticsSink, MapError, MappedRead, MappingResult, OwnedRead, Read, ReadDiagnostics,
     Reference, SeedIndex, WorkerPool, WorkerPoolError, WorkerPoolStats,
 };
@@ -69,15 +70,32 @@ impl<'a> Aligner<'a> {
         let probes = extract_read_probes(read, self.index, &self.config);
         diagnostics.seeds_seen = saturating_u32(probes.len());
         diagnostics.seeds_used = diagnostics.seeds_seen;
-
         let candidates =
             cluster_probe_hits_for_read(&probes, read.sequence.len(), self.index, &self.config);
         diagnostics.candidates = saturating_u32(candidates.len());
 
+        // Anchor discovery is attempted for each ranked candidate, but the
+        // query minimizers are read-global.  Extract them once and share the
+        // immutable vector so candidate count cannot multiply full-read seed
+        // extraction and index lookup work.  Avoid the scan entirely when
+        // probe clustering produced no candidate.
+        let query_seed_hits = if candidates.is_empty() {
+            CachedQuerySeedHits::default()
+        } else {
+            let query_seeds = self.index.query_seeds(read.sequence);
+            cache_query_seed_hits(&query_seeds, self.index)
+        };
+
         let mut placements = Vec::new();
         for candidate in &candidates {
-            let anchors = find_anchors(read, candidate, self.reference, self.index, &self.config)
-                .map_err(MapError::Anchor)?;
+            let anchors = find_anchors_with_seed_hits(
+                read,
+                candidate,
+                self.reference,
+                &self.config,
+                &query_seed_hits,
+            )
+            .map_err(MapError::Anchor)?;
             diagnostics.anchors = diagnostics
                 .anchors
                 .saturating_add(saturating_u32(anchors.len()));
