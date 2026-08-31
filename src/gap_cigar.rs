@@ -177,6 +177,12 @@ pub fn build_chain_cigar(
         32,
         0.20,
     );
+    merge_fragmented_indels(
+        &mut repaired_ops,
+        contig.sequence,
+        &oriented_query,
+        ref_start,
+    );
     left_align_indels(
         &mut repaired_ops,
         contig.sequence,
@@ -715,6 +721,119 @@ fn to_u32_lossy(value: usize) -> u32 {
     value.min(u32::MAX as usize) as u32
 }
 
+fn mismatch_count(a: &[u8], b: &[u8]) -> usize {
+    a.iter()
+        .zip(b)
+        .filter(|(x, y)| !x.eq_ignore_ascii_case(y))
+        .count()
+}
+
+/// Merge fragmented adjacent indels of the same type separated by a spurious
+/// micro-match (<= 4 bp) inside repetitive regions, reconstructing the true
+/// continuous biological insertion or deletion.
+fn merge_fragmented_indels(
+    ops: &mut Vec<CigarOp>,
+    reference: &[u8],
+    query: &[u8],
+    ref_start: usize,
+) {
+    if ops.len() < 3 {
+        return;
+    }
+    let mut changed = false;
+    let mut i = 0;
+    let mut q_pos = 0usize;
+    let mut r_pos = ref_start;
+
+    while i + 2 < ops.len() {
+        match (ops[i], ops[i + 1], ops[i + 2]) {
+            (CigarOp::Del(d1), CigarOp::Match(m), CigarOp::Del(d2)) if m <= 12 => {
+                let total_d = d1 + d2;
+                let m_len = m as usize;
+                let q_slice = query.get(q_pos..q_pos + m_len);
+                if let Some(q_bytes) = q_slice {
+                    let r_orig = reference.get(r_pos + d1 as usize..r_pos + d1 as usize + m_len);
+                    let r_del_first =
+                        reference.get(r_pos + total_d as usize..r_pos + total_d as usize + m_len);
+                    let r_match_first = reference.get(r_pos..r_pos + m_len);
+
+                    let orig_nm = r_orig
+                        .map(|r| mismatch_count(q_bytes, r))
+                        .unwrap_or(usize::MAX);
+                    let del_first_nm = r_del_first
+                        .map(|r| mismatch_count(q_bytes, r))
+                        .unwrap_or(usize::MAX);
+                    let match_first_nm = r_match_first
+                        .map(|r| mismatch_count(q_bytes, r))
+                        .unwrap_or(usize::MAX);
+
+                    if match_first_nm <= orig_nm || match_first_nm == 0 {
+                        ops[i] = CigarOp::Match(m);
+                        ops[i + 1] = CigarOp::Del(total_d);
+                        ops.remove(i + 2);
+                        changed = true;
+                        continue;
+                    } else if del_first_nm <= orig_nm || del_first_nm == 0 {
+                        ops[i] = CigarOp::Del(total_d);
+                        ops[i + 1] = CigarOp::Match(m);
+                        ops.remove(i + 2);
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+            (CigarOp::Ins(i1), CigarOp::Match(m), CigarOp::Ins(i2)) if m <= 12 => {
+                let total_i = i1 + i2;
+                let m_len = m as usize;
+                let r_slice = reference.get(r_pos..r_pos + m_len);
+                if let Some(r_bytes) = r_slice {
+                    let q_orig = query.get(q_pos + i1 as usize..q_pos + i1 as usize + m_len);
+                    let q_ins_first =
+                        query.get(q_pos + total_i as usize..q_pos + total_i as usize + m_len);
+                    let q_match_first = query.get(q_pos..q_pos + m_len);
+
+                    let orig_nm = q_orig
+                        .map(|q| mismatch_count(q, r_bytes))
+                        .unwrap_or(usize::MAX);
+                    let ins_first_nm = q_ins_first
+                        .map(|q| mismatch_count(q, r_bytes))
+                        .unwrap_or(usize::MAX);
+                    let match_first_nm = q_match_first
+                        .map(|q| mismatch_count(q, r_bytes))
+                        .unwrap_or(usize::MAX);
+
+                    if match_first_nm <= orig_nm || match_first_nm == 0 {
+                        ops[i] = CigarOp::Match(m);
+                        ops[i + 1] = CigarOp::Ins(total_i);
+                        ops.remove(i + 2);
+                        changed = true;
+                        continue;
+                    } else if ins_first_nm <= orig_nm || ins_first_nm == 0 {
+                        ops[i] = CigarOp::Ins(total_i);
+                        ops[i + 1] = CigarOp::Match(m);
+                        ops.remove(i + 2);
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if ops[i].consumes_query() {
+            q_pos = q_pos.saturating_add(op_len(ops[i]));
+        }
+        if ops[i].consumes_reference() {
+            r_pos = r_pos.saturating_add(op_len(ops[i]));
+        }
+        i += 1;
+    }
+
+    if changed {
+        normalize_ops(ops);
+    }
+}
+
 /// Shift repeat-compatible insertions/deletions toward the leftmost
 /// reference coordinate. This is the same normalization used by FlashMap's
 /// LR output path and is deliberately restricted to a preceding `M` run, so
@@ -752,6 +871,7 @@ fn left_align_indels(ops: &mut Vec<CigarOp>, reference: &[u8], query: &[u8], ref
                     &mut reference_pos,
                     &mut query_pos,
                     reference,
+                    query,
                 );
                 reference_pos = reference_pos.saturating_add(length as usize);
                 index += 1;
@@ -779,22 +899,28 @@ fn left_align_insertion(
         return;
     }
 
-    let mut shift = 0usize;
+    let Some(CigarOp::Match(match_len)) = ops.get(index.saturating_sub(1)).copied() else {
+        return;
+    };
+    let match_len = match_len as usize;
+    if match_len == 0 {
+        return;
+    }
+
+    // 1. First attempt exact homopolymer / single-base left shift.
+    let mut exact_shift = 0usize;
     loop {
-        if *reference_pos <= shift || query_pos.saturating_add(length) <= shift {
+        if *reference_pos <= exact_shift || query_pos.saturating_add(length) <= exact_shift {
             break;
         }
-        let Some(CigarOp::Match(match_len)) = ops.get(index.saturating_sub(1)).copied() else {
-            break;
-        };
-        if match_len as usize <= shift {
+        if match_len <= exact_shift {
             break;
         }
         let query_index = query_pos
             .saturating_add(length)
             .saturating_sub(1)
-            .saturating_sub(shift);
-        let reference_index = reference_pos.saturating_sub(1).saturating_sub(shift);
+            .saturating_sub(exact_shift);
+        let reference_index = reference_pos.saturating_sub(1).saturating_sub(exact_shift);
         let Some(&inserted_base) = query.get(query_index) else {
             break;
         };
@@ -806,16 +932,49 @@ fn left_align_insertion(
         {
             break;
         }
-        shift += 1;
+        exact_shift += 1;
     }
 
-    if shift > 0 {
-        if let Some(CigarOp::Match(match_len)) = ops.get_mut(index - 1) {
-            *match_len = match_len.saturating_sub(to_u32_lossy(shift));
+    let mut best_shift = exact_shift;
+
+    // 2. Tandem repeat / STR left-alignment: check if shifting left across
+    // repeat units in the preceding match window preserves or improves alignment quality.
+    let q_pos = *query_pos;
+    let r_pos = *reference_pos;
+    if let (Some(q_cur), Some(r_cur)) = (
+        query.get(q_pos.saturating_sub(match_len)..q_pos.saturating_add(length)),
+        reference.get(r_pos.saturating_sub(match_len)..r_pos.saturating_add(length)),
+    ) {
+        let q_prefix = &q_cur[..match_len];
+        let r_prefix = &r_cur[..match_len];
+        let orig_nm = mismatch_count(q_prefix, r_prefix);
+
+        for s in (exact_shift + 1..=match_len).rev() {
+            if r_pos < s || q_pos < s {
+                continue;
+            }
+            let q_sub_a = query.get(q_pos - match_len..q_pos - s);
+            let r_sub_a = reference.get(r_pos - match_len..r_pos - s);
+            let q_sub_b = query.get(q_pos + length - s..q_pos + length);
+            let r_sub_b = reference.get(r_pos - s..r_pos);
+
+            if let (Some(qa), Some(ra), Some(qb), Some(rb)) = (q_sub_a, r_sub_a, q_sub_b, r_sub_b) {
+                let shifted_nm = mismatch_count(qa, ra) + mismatch_count(qb, rb);
+                if shifted_nm <= orig_nm {
+                    best_shift = s;
+                    break;
+                }
+            }
         }
-        ops.insert(index + 1, CigarOp::Match(to_u32_lossy(shift)));
-        *reference_pos = reference_pos.saturating_sub(shift);
-        *query_pos = query_pos.saturating_sub(shift);
+    }
+
+    if best_shift > 0 {
+        if let Some(CigarOp::Match(match_len_op)) = ops.get_mut(index - 1) {
+            *match_len_op = match_len_op.saturating_sub(to_u32_lossy(best_shift));
+        }
+        ops.insert(index + 1, CigarOp::Match(to_u32_lossy(best_shift)));
+        *reference_pos = reference_pos.saturating_sub(best_shift);
+        *query_pos = query_pos.saturating_sub(best_shift);
     }
 }
 
@@ -826,27 +985,34 @@ fn left_align_deletion(
     reference_pos: &mut usize,
     query_pos: &mut usize,
     reference: &[u8],
+    query: &[u8],
 ) {
     if index == 0 || length == 0 {
         return;
     }
 
-    let mut shift = 0usize;
+    let Some(CigarOp::Match(match_len)) = ops.get(index.saturating_sub(1)).copied() else {
+        return;
+    };
+    let match_len = match_len as usize;
+    if match_len == 0 {
+        return;
+    }
+
+    // 1. First attempt exact homopolymer / single-base left shift.
+    let mut exact_shift = 0usize;
     loop {
-        if *reference_pos <= shift {
+        if *reference_pos <= exact_shift {
             break;
         }
-        let Some(CigarOp::Match(match_len)) = ops.get(index.saturating_sub(1)).copied() else {
-            break;
-        };
-        if match_len as usize <= shift {
+        if match_len <= exact_shift {
             break;
         }
         let deleted_index = reference_pos
             .saturating_add(length)
             .saturating_sub(1)
-            .saturating_sub(shift);
-        let previous_index = reference_pos.saturating_sub(1).saturating_sub(shift);
+            .saturating_sub(exact_shift);
+        let previous_index = reference_pos.saturating_sub(1).saturating_sub(exact_shift);
         let Some(&deleted_base) = reference.get(deleted_index) else {
             break;
         };
@@ -858,16 +1024,48 @@ fn left_align_deletion(
         {
             break;
         }
-        shift += 1;
+        exact_shift += 1;
     }
 
-    if shift > 0 {
-        if let Some(CigarOp::Match(match_len)) = ops.get_mut(index - 1) {
-            *match_len = match_len.saturating_sub(to_u32_lossy(shift));
+    let mut best_shift = exact_shift;
+
+    // 2. Tandem repeat / STR left-alignment: check if shifting left across
+    // repeat units in the preceding match window preserves or improves alignment quality.
+    let q_pos = *query_pos;
+    let r_pos = *reference_pos;
+    if let (Some(q_cur), Some(r_cur)) = (
+        query.get(q_pos.saturating_sub(match_len)..q_pos),
+        reference.get(r_pos.saturating_sub(match_len)..r_pos.saturating_add(length)),
+    ) {
+        let r_prefix = &r_cur[..match_len];
+        let orig_nm = mismatch_count(q_cur, r_prefix);
+
+        for s in (exact_shift + 1..=match_len).rev() {
+            if r_pos < s || q_pos < s {
+                continue;
+            }
+            let q_sub_a = query.get(q_pos - match_len..q_pos - s);
+            let r_sub_a = reference.get(r_pos - match_len..r_pos - s);
+            let q_sub_b = query.get(q_pos - s..q_pos);
+            let r_sub_b = reference.get(r_pos + length - s..r_pos + length);
+
+            if let (Some(qa), Some(ra), Some(qb), Some(rb)) = (q_sub_a, r_sub_a, q_sub_b, r_sub_b) {
+                let shifted_nm = mismatch_count(qa, ra) + mismatch_count(qb, rb);
+                if shifted_nm <= orig_nm {
+                    best_shift = s;
+                    break;
+                }
+            }
         }
-        ops.insert(index + 1, CigarOp::Match(to_u32_lossy(shift)));
-        *reference_pos = reference_pos.saturating_sub(shift);
-        *query_pos = query_pos.saturating_sub(shift);
+    }
+
+    if best_shift > 0 {
+        if let Some(CigarOp::Match(match_len_op)) = ops.get_mut(index - 1) {
+            *match_len_op = match_len_op.saturating_sub(to_u32_lossy(best_shift));
+        }
+        ops.insert(index + 1, CigarOp::Match(to_u32_lossy(best_shift)));
+        *reference_pos = reference_pos.saturating_sub(best_shift);
+        *query_pos = query_pos.saturating_sub(best_shift);
     }
 }
 
