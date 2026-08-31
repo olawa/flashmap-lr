@@ -1,11 +1,10 @@
-use rs_lra::io::{load_reference_path, open_fastx, SamWriter};
+use rs_lra::io::{load_reference_path, open_fastx, AlignmentSink, SamWriter};
 use rs_lra::{
     Aligner, CigarOp, Config, FmiIndex, InMemorySeedIndex, MappedRead, Reference, SeedIndex,
     WorkerPool, WorkerPoolError, WorkerPoolStats,
 };
 use std::env;
-use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -364,8 +363,8 @@ fn execute_mapping(
         .map_err(|error| CliError::Pool(error.to_string()))?;
 
     let reads = open_fastx(&options.reads).map_err(CliError::Reads)?;
-    let output = open_output(&options.output).map_err(CliError::Output)?;
-    let mut writer = SamWriter::from_contigs(BufWriter::new(output), metadata)
+    let output = AlignmentSink::open(&options.output, options.workers).map_err(CliError::Output)?;
+    let mut writer = SamWriter::from_contigs(output, metadata)
         .map_err(|error| CliError::Pool(error.to_string()))?;
     let mut progress = ProgressReporter::new(options.quiet);
     let stats = aligner
@@ -377,18 +376,10 @@ fn execute_mapping(
         })
         .map_err(pool_error_to_cli)?;
     writer
-        .flush()
+        .finish()
         .map_err(|error| CliError::Pool(error.to_string()))?;
     progress.finish(&stats);
     Ok(())
-}
-
-fn open_output(path: &PathBuf) -> Result<Box<dyn Write>, io::Error> {
-    if path == std::path::Path::new("-") {
-        Ok(Box::new(io::stdout()))
-    } else {
-        Ok(Box::new(File::create(path)?))
-    }
 }
 
 fn pool_error_to_cli<SE, ME, WE>(error: WorkerPoolError<SE, ME, WE>) -> CliError

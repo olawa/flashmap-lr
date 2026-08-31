@@ -88,10 +88,14 @@ impl<'a> Aligner<'a> {
 
         let mut placements = Vec::new();
         let top_candidate_score = candidates.first().map(|c| c.score).unwrap_or(0);
-        let min_competitive_score = ((top_candidate_score as f32 * 0.70) as i32).max(100);
+        let min_competitive_score = (top_candidate_score as f32 * 0.40) as i32;
+        let max_candidates = self.config.candidates.max_regions.min(8);
 
-        for (idx, candidate) in candidates.iter().enumerate() {
-            if idx > 0 && candidate.score < min_competitive_score {
+        for (idx, candidate) in candidates.iter().take(max_candidates).enumerate() {
+            if idx > 0 && !placements.is_empty() && candidate.score < min_competitive_score {
+                break;
+            }
+            if idx >= 3 && placements.is_empty() {
                 break;
             }
             let anchors = find_anchors_with_seed_hits(

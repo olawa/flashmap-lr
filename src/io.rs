@@ -10,7 +10,8 @@
 use crate::{Alignment, CigarOp, ContigId, InMemoryReference, MappedRead, OwnedRead, Strand};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
 
 /// FASTA or FASTQ record framing detected from the first record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -476,6 +477,10 @@ impl<W: Write> SamWriter<W> {
         self.writer.flush().map_err(Into::into)
     }
 
+    pub fn finish(&mut self) -> Result<(), SamError> {
+        self.writer.flush().map_err(Into::into)
+    }
+
     pub fn into_inner(self) -> W {
         self.writer
     }
@@ -523,6 +528,187 @@ impl<W: Write> SamWriter<W> {
             alignment.edit_distance, alignment.score
         )?;
         Ok(())
+    }
+}
+
+/// An output sink for SAM/BAM records.
+///
+/// If the output path ends in `.bam`, it automatically pipes into `samtools sort`
+/// and indexes the output upon completion.
+pub enum AlignmentSink {
+    File(io::BufWriter<File>),
+    Stdout(io::BufWriter<io::Stdout>),
+    SamtoolsSort(SamtoolsSortSink),
+}
+
+impl AlignmentSink {
+    pub fn open(path: &Path, threads: usize) -> io::Result<Self> {
+        if path == Path::new("-") {
+            Ok(Self::Stdout(io::BufWriter::new(io::stdout())))
+        } else if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("bam"))
+            .unwrap_or(false)
+        {
+            Ok(Self::SamtoolsSort(SamtoolsSortSink::new(path, threads)?))
+        } else {
+            let file = File::create(path)?;
+            Ok(Self::File(io::BufWriter::new(file)))
+        }
+    }
+
+    pub fn finish(&mut self) -> io::Result<()> {
+        match self {
+            Self::File(w) => w.flush(),
+            Self::Stdout(w) => w.flush(),
+            Self::SamtoolsSort(s) => s.finish(),
+        }
+    }
+}
+
+impl Write for AlignmentSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::File(w) => w.write(buf),
+            Self::Stdout(w) => w.write(buf),
+            Self::SamtoolsSort(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::File(w) => w.flush(),
+            Self::Stdout(w) => w.flush(),
+            Self::SamtoolsSort(s) => s.flush(),
+        }
+    }
+}
+
+/// Streaming writer that pipes SAM text directly into `samtools sort` to produce
+/// coordinate-sorted, indexed BAM files without external crate dependencies.
+pub struct SamtoolsSortSink {
+    child: Child,
+    writer: Option<io::BufWriter<ChildStdin>>,
+    output_path: PathBuf,
+    threads: usize,
+    finished: bool,
+}
+
+impl SamtoolsSortSink {
+    pub fn new(output_path: &Path, threads: usize) -> io::Result<Self> {
+        let threads = threads.max(1);
+        let mut command = Command::new("samtools");
+        command
+            .arg("sort")
+            .arg("-@")
+            .arg(threads.to_string())
+            .arg("-O")
+            .arg("BAM")
+            .arg("-o")
+            .arg(output_path)
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        let mut child = command.spawn().map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to spawn 'samtools sort' for {}: {e}. Ensure 'samtools' is installed in PATH, or specify a .sam output file.",
+                    output_path.display()
+                ),
+            )
+        })?;
+
+        let stdin = child.stdin.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "samtools sort stdin unavailable")
+        })?;
+
+        Ok(Self {
+            child,
+            writer: Some(io::BufWriter::new(stdin)),
+            output_path: output_path.to_path_buf(),
+            threads,
+            finished: false,
+        })
+    }
+
+    pub fn finish(&mut self) -> io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+
+        if let Some(mut writer) = self.writer.take() {
+            writer.flush()?;
+            drop(writer); // Closes stdin to signal EOF to samtools sort
+        }
+
+        let status = self.child.wait()?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "samtools sort failed with status {status}"
+            )));
+        }
+
+        // Build BAM index
+        let index_start = std::time::Instant::now();
+        eprintln!(
+            "[rs-lra] Generating BAM index for {}...",
+            self.output_path.display()
+        );
+        let index_status = Command::new("samtools")
+            .arg("index")
+            .arg("-@")
+            .arg(self.threads.to_string())
+            .arg(&self.output_path)
+            .status();
+
+        match index_status {
+            Ok(s) if s.success() => {
+                eprintln!(
+                    "[rs-lra] BAM index finished in {:.2}s.",
+                    index_start.elapsed().as_secs_f64()
+                );
+            }
+            Ok(s) => {
+                eprintln!("[rs-lra] Warning: 'samtools index' exited with status {s}");
+            }
+            Err(e) => {
+                eprintln!("[rs-lra] Warning: failed to run 'samtools index': {e}");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Write for SamtoolsSortSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(writer) = self.writer.as_mut() {
+            writer.write(buf)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "samtools sort sink already closed",
+            ))
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(writer) = self.writer.as_mut() {
+            writer.flush()
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for SamtoolsSortSink {
+    fn drop(&mut self) {
+        let _ = self.finish();
     }
 }
 
