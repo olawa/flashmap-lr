@@ -1,11 +1,12 @@
 use rs_lra::io::{load_reference_path, open_fastx, AlignmentSink, SamWriter};
 use rs_lra::{
-    Aligner, CigarOp, Config, FmiIndex, InMemorySeedIndex, MappedRead, Reference, SeedIndex,
-    WorkerPool, WorkerPoolError, WorkerPoolStats,
+    Aligner, CigarOp, Config, DiagnosticsSink, FmiIndex, InMemorySeedIndex, MappedRead,
+    ReadDiagnostics, Reference, SeedIndex, WorkerPool, WorkerPoolError, WorkerPoolStats,
 };
 use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Options {
@@ -16,6 +17,9 @@ struct Options {
     workers: usize,
     chunk_size: usize,
     quiet: bool,
+    profile: bool,
+    paired_emms: bool,
+    tiered_candidates: bool,
 }
 
 impl Options {
@@ -35,36 +39,96 @@ impl Options {
             .max(1);
         let mut chunk_size = Config::default().worker_pool.chunk_size;
         let mut quiet = false;
+        let mut profile = false;
+        let mut paired_emms = false;
+        let mut tiered_candidates = false;
+
+        let mut positional = Vec::new();
 
         while let Some(argument) = args.next() {
             match argument.as_str() {
                 "-h" | "--help" => return Err(CliError::Help),
-                "--version" => return Err(CliError::Version),
-                "-r" | "--reference" => {
+                "-v" | "--version" => return Err(CliError::Version),
+                "-r" | "--ref" | "--reference" => {
                     reference = Some(PathBuf::from(next_value(&mut args, &argument)?));
                 }
-                "--index" => {
+                "-i" | "--index" => {
                     index = Some(PathBuf::from(next_value(&mut args, &argument)?));
                 }
-                "-i" | "--reads" => {
+                "-q" | "--query" | "-f" | "--fastq" | "--reads" | "--fastx" => {
                     reads = Some(PathBuf::from(next_value(&mut args, &argument)?));
                 }
                 "-o" | "--output" => {
                     output = PathBuf::from(next_value(&mut args, &argument)?);
                 }
-                "-w" | "--workers" => {
+                "-t" | "--threads" | "-w" | "--workers" => {
                     workers = parse_positive(next_value(&mut args, &argument)?, "workers")?;
                 }
-                "--chunk-size" => {
+                "-c" | "--chunk-size" => {
                     chunk_size = parse_positive(next_value(&mut args, &argument)?, "chunk-size")?;
                 }
-                "-q" | "--quiet" => {
+                "--quiet" => {
                     quiet = true;
+                }
+                "--profile" => {
+                    profile = true;
+                }
+                "--paired-emms" => {
+                    paired_emms = true;
+                }
+                "--tiered-candidates" => {
+                    tiered_candidates = true;
                 }
                 option if option.starts_with('-') => {
                     return Err(CliError::UnknownOption(option.to_owned()));
                 }
-                value => return Err(CliError::UnexpectedArgument(value.to_owned())),
+                value => {
+                    positional.push(PathBuf::from(value));
+                }
+            }
+        }
+
+        // Handle positional arguments (Minimap2-style: rs-lra [options] <ref|index> <reads>)
+        match positional.len() {
+            0 => {}
+            1 => {
+                let pos = positional.remove(0);
+                if index.is_none() && reference.is_none() && reads.is_some() {
+                    if is_index_path(&pos) {
+                        index = Some(pos);
+                    } else {
+                        reference = Some(pos);
+                    }
+                } else if reads.is_none() && (index.is_some() || reference.is_some()) {
+                    reads = Some(pos);
+                } else if index.is_none() && reference.is_none() && reads.is_none() {
+                    if is_index_path(&pos) {
+                        index = Some(pos);
+                    } else {
+                        reference = Some(pos);
+                    }
+                } else {
+                    return Err(CliError::UnexpectedArgument(pos.display().to_string()));
+                }
+            }
+            2 => {
+                let pos2 = positional.remove(1);
+                let pos1 = positional.remove(0);
+                if index.is_none() && reference.is_none() && reads.is_none() {
+                    if is_index_path(&pos1) {
+                        index = Some(pos1);
+                    } else {
+                        reference = Some(pos1);
+                    }
+                    reads = Some(pos2);
+                } else {
+                    return Err(CliError::UnexpectedArgument(pos1.display().to_string()));
+                }
+            }
+            _ => {
+                return Err(CliError::UnexpectedArgument(
+                    positional[0].display().to_string(),
+                ));
             }
         }
 
@@ -78,12 +142,23 @@ impl Options {
         Ok(Self {
             reference,
             index,
-            reads: reads.ok_or(CliError::MissingOption("--reads"))?,
+            reads: reads.ok_or(CliError::MissingOption("-q/--query/--reads"))?,
             output,
             workers,
             chunk_size,
             quiet,
+            profile,
+            paired_emms,
+            tiered_candidates,
         })
+    }
+}
+
+fn is_index_path(path: &std::path::Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        matches!(ext.to_ascii_lowercase().as_str(), "fmi" | "hfi" | "idx")
+    } else {
+        false
     }
 }
 
@@ -111,7 +186,9 @@ impl std::fmt::Display for CliError {
             Self::Help => f.write_str(usage()),
             Self::Version => write!(f, "RS-LRA {}", rs_lra::VERSION),
             Self::MissingValue(option) => write!(f, "missing value for {option}"),
-            Self::MissingInput => f.write_str("one of --index or --reference is required"),
+            Self::MissingInput => {
+                f.write_str("one of --index (-i) or --reference (-r) is required")
+            }
             Self::ConflictingInput => f.write_str("--index and --reference are mutually exclusive"),
             Self::MissingOption(option) => write!(f, "missing required option {option}"),
             Self::InvalidNumber { option, value } => {
@@ -149,19 +226,27 @@ fn parse_positive(value: String, option: &'static str) -> Result<usize, CliError
 }
 
 fn usage() -> &'static str {
-    "Usage: rs-lra (--index REF.fmi | --reference REF.fa) --reads READS.fa[stq] [options]\n\n\
+    "Usage: rs-lra [options] -i INDEX.fmi -q READS.fq\n\
+     Usage: rs-lra [options] INDEX.fmi READS.fq\n\n\
 Options:\n\
-      --index PATH       FlashMap v13 persistent index (recommended)\n\
-  -r, --reference PATH   Reference FASTA (small-fixture adapter)\n\
-  -i, --reads PATH       FASTA or FASTQ reads (required)\n\
-  -o, --output PATH      SAM output path, or - for stdout (default: -)\n\
-  -w, --workers N        Mapper worker count (default: available CPUs)\n\
-      --chunk-size N     Reads per worker batch (default: 1024)\n\
-  -q, --quiet            Suppress progress indicators and summary\n\
+  -i, --index PATH       FlashMap persistent index (.fmi) [required unless positional or -r]\n\
+  -r, --ref, --reference PATH\n\
+                         Reference FASTA (small-fixture adapter)\n\
+  -q, -f, --query, --fastq, --reads PATH\n\
+                         FASTA or FASTQ reads [required unless positional]\n\
+  -o, --output PATH      SAM/BAM output path, or - for stdout (default: -)\n\
+                         (automatically sorted and indexed when ending in .bam)\n\
+  -t, -w, --threads, --workers N\n\
+                         Parallel mapper worker threads (default: available CPUs)\n\
+  -c, --chunk-size N     Reads per worker batch (default: 10)\n\
+      --quiet            Suppress progress indicators and summary\n\
+      --profile          Print aggregate mapper phase timings\n\
+      --paired-emms      Experimental mismatch-tolerant paired anchors\n\
+      --tiered-candidates Experimental cheap pass for weak candidates\n\
   -h, --help             Show this help\n\
-      --version          Show version\n\n\
-The --index path uses the read-only FlashMap v13 packed minimizer adapter.\n\
-The --reference path builds a bounded in-memory k=15 index for small fixtures."
+  -v, --version          Show version\n\n\
+The index path uses the read-only FlashMap v13 packed minimizer adapter.\n\
+The reference path builds a bounded in-memory k=15 index for small fixtures."
 }
 
 fn run(options: Options) -> Result<(), CliError> {
@@ -175,6 +260,10 @@ fn run(options: Options) -> Result<(), CliError> {
         .reference
         .as_ref()
         .expect("CLI input validation guarantees a reference or index");
+    if let Ok(index) = FmiIndex::open(reference_path) {
+        let metadata = index.reference_metadata();
+        return execute_mapping(&index, &index, metadata, &options);
+    }
     let reference = load_reference_path(reference_path).map_err(CliError::Reference)?;
     let index = InMemorySeedIndex::new(&reference);
     let metadata = reference
@@ -357,8 +446,16 @@ fn execute_mapping(
     let mut config = Config::default();
     config.worker_pool.workers = options.workers;
     config.worker_pool.chunk_size = options.chunk_size;
+    config.candidates.paired_emms = options.paired_emms;
+    config.candidates.tiered_candidates = options.tiered_candidates;
+    let profile = ProfileReporter::default();
     let aligner = Aligner::new(reference, index, config)
         .map_err(|error| CliError::Pool(format!("invalid mapper configuration: {error}")))?;
+    let aligner = if options.profile {
+        aligner.with_diagnostics_sink(&profile)
+    } else {
+        aligner
+    };
     let pool = WorkerPool::new(aligner.config().worker_pool.clone())
         .map_err(|error| CliError::Pool(error.to_string()))?;
 
@@ -379,7 +476,102 @@ fn execute_mapping(
         .finish()
         .map_err(|error| CliError::Pool(error.to_string()))?;
     progress.finish(&stats);
+    if options.profile {
+        profile.print();
+    }
     Ok(())
+}
+
+#[derive(Default)]
+struct ProfileReporter {
+    reads: AtomicU64,
+    exact_accepted: AtomicU64,
+    full_anchor_searches: AtomicU64,
+    sparse_anchor_searches: AtomicU64,
+    sparse_promotions: AtomicU64,
+    query_seed_nanos: AtomicU64,
+    probe_nanos: AtomicU64,
+    candidate_nanos: AtomicU64,
+    seed_cache_nanos: AtomicU64,
+    anchor_nanos: AtomicU64,
+    chain_nanos: AtomicU64,
+    cigar_nanos: AtomicU64,
+    total_nanos: AtomicU64,
+}
+
+impl DiagnosticsSink for ProfileReporter {
+    fn read_complete(&self, _read_name: &str, diagnostics: &ReadDiagnostics) {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.exact_accepted.fetch_add(
+            diagnostics.exact_fastpath_accepted as u64,
+            Ordering::Relaxed,
+        );
+        self.full_anchor_searches
+            .fetch_add(diagnostics.full_anchor_searches as u64, Ordering::Relaxed);
+        self.sparse_anchor_searches
+            .fetch_add(diagnostics.sparse_anchor_searches as u64, Ordering::Relaxed);
+        self.sparse_promotions
+            .fetch_add(diagnostics.sparse_promotions as u64, Ordering::Relaxed);
+        for (target, value) in [
+            (&self.query_seed_nanos, diagnostics.query_seed_nanos),
+            (&self.probe_nanos, diagnostics.probe_nanos),
+            (&self.candidate_nanos, diagnostics.candidate_nanos),
+            (&self.seed_cache_nanos, diagnostics.seed_cache_nanos),
+            (&self.anchor_nanos, diagnostics.anchor_nanos),
+            (&self.chain_nanos, diagnostics.chain_nanos),
+            (&self.cigar_nanos, diagnostics.cigar_nanos),
+            (&self.total_nanos, diagnostics.elapsed_nanos),
+        ] {
+            target.fetch_add(value, Ordering::Relaxed);
+        }
+    }
+}
+
+impl ProfileReporter {
+    fn print(&self) {
+        let reads = self.reads.load(Ordering::Relaxed);
+        let total = self.total_nanos.load(Ordering::Relaxed).max(1);
+        eprintln!("======================= RS-LRA Phase Profile =========================");
+        eprintln!("  Reads observed:        {reads:>10}");
+        eprintln!(
+            "  Exact fastpath:        {:>10}  ({:.2}%)",
+            self.exact_accepted.load(Ordering::Relaxed),
+            if reads > 0 {
+                100.0 * self.exact_accepted.load(Ordering::Relaxed) as f64 / reads as f64
+            } else {
+                0.0
+            }
+        );
+        eprintln!(
+            "  Anchor searches:       {:>10} full / {} sparse / {} promoted",
+            self.full_anchor_searches.load(Ordering::Relaxed),
+            self.sparse_anchor_searches.load(Ordering::Relaxed),
+            self.sparse_promotions.load(Ordering::Relaxed)
+        );
+        for (name, value) in [
+            ("Query seeds", self.query_seed_nanos.load(Ordering::Relaxed)),
+            ("Probe selection", self.probe_nanos.load(Ordering::Relaxed)),
+            ("Candidates", self.candidate_nanos.load(Ordering::Relaxed)),
+            (
+                "Seed-hit cache",
+                self.seed_cache_nanos.load(Ordering::Relaxed),
+            ),
+            ("Anchors", self.anchor_nanos.load(Ordering::Relaxed)),
+            ("Chains", self.chain_nanos.load(Ordering::Relaxed)),
+            ("CIGAR / DP", self.cigar_nanos.load(Ordering::Relaxed)),
+        ] {
+            eprintln!(
+                "  {name:<20} {:>10.3} worker-s  ({:>5.1}%)",
+                value as f64 / 1_000_000_000.0,
+                100.0 * value as f64 / total as f64
+            );
+        }
+        eprintln!(
+            "  Accounted read time:  {:>10.3} worker-s",
+            total as f64 / 1_000_000_000.0
+        );
+        eprintln!("======================================================================");
+    }
 }
 
 fn pool_error_to_cli<SE, ME, WE>(error: WorkerPoolError<SE, ME, WE>) -> CliError
@@ -460,7 +652,7 @@ mod tests {
     #[test]
     fn parser_accepts_quiet_flag() {
         let options = Options::parse(
-            ["rs-lra", "--index", "ref.fmi", "--reads", "reads.fq", "-q"]
+            ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "--quiet"]
                 .into_iter()
                 .map(str::to_owned),
         )
@@ -469,9 +661,73 @@ mod tests {
     }
 
     #[test]
+    fn parser_accepts_flashmap_flags() {
+        let options = Options::parse(
+            [
+                "rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "-t", "18", "-o", "out.bam", "-c", "5",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(options.index, Some(PathBuf::from("ref.fmi")));
+        assert_eq!(options.reads, PathBuf::from("reads.fq"));
+        assert_eq!(options.workers, 18);
+        assert_eq!(options.output, PathBuf::from("out.bam"));
+        assert_eq!(options.chunk_size, 5);
+    }
+
+    #[test]
+    fn parser_accepts_fastq_and_workers_flags() {
+        let options = Options::parse(
+            ["rs-lra", "-i", "ref.fmi", "-f", "reads.fq", "-w", "8"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(options.index, Some(PathBuf::from("ref.fmi")));
+        assert_eq!(options.reads, PathBuf::from("reads.fq"));
+        assert_eq!(options.workers, 8);
+    }
+
+    #[test]
+    fn parser_accepts_minimap2_positional_arguments() {
+        let options = Options::parse(
+            [
+                "rs-lra",
+                "-t",
+                "16",
+                "-o",
+                "out.bam",
+                "GRCh38.fmi",
+                "reads.fastq",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(options.index, Some(PathBuf::from("GRCh38.fmi")));
+        assert_eq!(options.reads, PathBuf::from("reads.fastq"));
+        assert_eq!(options.workers, 16);
+        assert_eq!(options.output, PathBuf::from("out.bam"));
+    }
+
+    #[test]
+    fn parser_accepts_reference_positional_arguments() {
+        let options = Options::parse(
+            ["rs-lra", "reference.fasta", "reads.fastq"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(options.reference, Some(PathBuf::from("reference.fasta")));
+        assert_eq!(options.reads, PathBuf::from("reads.fastq"));
+    }
+
+    #[test]
     fn parser_accepts_persistent_index_and_rejects_mixed_inputs() {
         let options = Options::parse(
-            ["rs-lra", "--index", "ref.fmi", "--reads", "reads.fq"]
+            ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq"]
                 .into_iter()
                 .map(str::to_owned),
         )
