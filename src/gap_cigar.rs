@@ -741,98 +741,106 @@ fn merge_fragmented_indels(
     if ops.len() < 3 {
         return;
     }
-    let mut changed = false;
-    let mut i = 0;
+    let mut merged = Vec::with_capacity(ops.len());
     let mut q_pos = 0usize;
     let mut r_pos = ref_start;
+    let mut i = 0;
 
-    while i + 2 < ops.len() {
-        match (ops[i], ops[i + 1], ops[i + 2]) {
-            (CigarOp::Del(d1), CigarOp::Match(m), CigarOp::Del(d2)) if m <= 12 => {
-                let total_d = d1 + d2;
-                let m_len = m as usize;
-                let q_slice = query.get(q_pos..q_pos + m_len);
-                if let Some(q_bytes) = q_slice {
-                    let r_orig = reference.get(r_pos + d1 as usize..r_pos + d1 as usize + m_len);
-                    let r_del_first =
-                        reference.get(r_pos + total_d as usize..r_pos + total_d as usize + m_len);
-                    let r_match_first = reference.get(r_pos..r_pos + m_len);
+    while i < ops.len() {
+        if i + 2 < ops.len() {
+            match (ops[i], ops[i + 1], ops[i + 2]) {
+                (CigarOp::Del(d1), CigarOp::Match(m), CigarOp::Del(d2)) if m <= 12 => {
+                    let total_d = d1 + d2;
+                    let m_len = m as usize;
+                    let q_slice = query.get(q_pos..q_pos + m_len);
+                    if let Some(q_bytes) = q_slice {
+                        let r_orig =
+                            reference.get(r_pos + d1 as usize..r_pos + d1 as usize + m_len);
+                        let r_del_first = reference
+                            .get(r_pos + total_d as usize..r_pos + total_d as usize + m_len);
+                        let r_match_first = reference.get(r_pos..r_pos + m_len);
 
-                    let orig_nm = r_orig
-                        .map(|r| mismatch_count(q_bytes, r))
-                        .unwrap_or(usize::MAX);
-                    let del_first_nm = r_del_first
-                        .map(|r| mismatch_count(q_bytes, r))
-                        .unwrap_or(usize::MAX);
-                    let match_first_nm = r_match_first
-                        .map(|r| mismatch_count(q_bytes, r))
-                        .unwrap_or(usize::MAX);
+                        let orig_nm = r_orig
+                            .map(|r| mismatch_count(q_bytes, r))
+                            .unwrap_or(usize::MAX);
+                        let del_first_nm = r_del_first
+                            .map(|r| mismatch_count(q_bytes, r))
+                            .unwrap_or(usize::MAX);
+                        let match_first_nm = r_match_first
+                            .map(|r| mismatch_count(q_bytes, r))
+                            .unwrap_or(usize::MAX);
 
-                    if match_first_nm <= orig_nm || match_first_nm == 0 {
-                        ops[i] = CigarOp::Match(m);
-                        ops[i + 1] = CigarOp::Del(total_d);
-                        ops.remove(i + 2);
-                        changed = true;
-                        continue;
-                    } else if del_first_nm <= orig_nm || del_first_nm == 0 {
-                        ops[i] = CigarOp::Del(total_d);
-                        ops[i + 1] = CigarOp::Match(m);
-                        ops.remove(i + 2);
-                        changed = true;
-                        continue;
+                        if match_first_nm <= orig_nm || match_first_nm == 0 {
+                            merged.push(CigarOp::Match(m));
+                            merged.push(CigarOp::Del(total_d));
+                            q_pos = q_pos.saturating_add(m_len);
+                            r_pos = r_pos.saturating_add(m_len + total_d as usize);
+                            i += 3;
+                            continue;
+                        } else if del_first_nm <= orig_nm || del_first_nm == 0 {
+                            merged.push(CigarOp::Del(total_d));
+                            merged.push(CigarOp::Match(m));
+                            q_pos = q_pos.saturating_add(m_len);
+                            r_pos = r_pos.saturating_add(total_d as usize + m_len);
+                            i += 3;
+                            continue;
+                        }
                     }
                 }
-            }
-            (CigarOp::Ins(i1), CigarOp::Match(m), CigarOp::Ins(i2)) if m <= 12 => {
-                let total_i = i1 + i2;
-                let m_len = m as usize;
-                let r_slice = reference.get(r_pos..r_pos + m_len);
-                if let Some(r_bytes) = r_slice {
-                    let q_orig = query.get(q_pos + i1 as usize..q_pos + i1 as usize + m_len);
-                    let q_ins_first =
-                        query.get(q_pos + total_i as usize..q_pos + total_i as usize + m_len);
-                    let q_match_first = query.get(q_pos..q_pos + m_len);
+                (CigarOp::Ins(i1), CigarOp::Match(m), CigarOp::Ins(i2)) if m <= 12 => {
+                    let total_i = i1 + i2;
+                    let m_len = m as usize;
+                    let r_slice = reference.get(r_pos..r_pos + m_len);
+                    if let Some(r_bytes) = r_slice {
+                        let q_orig = query.get(q_pos + i1 as usize..q_pos + i1 as usize + m_len);
+                        let q_ins_first =
+                            query.get(q_pos + total_i as usize..q_pos + total_i as usize + m_len);
+                        let q_match_first = query.get(q_pos..q_pos + m_len);
 
-                    let orig_nm = q_orig
-                        .map(|q| mismatch_count(q, r_bytes))
-                        .unwrap_or(usize::MAX);
-                    let ins_first_nm = q_ins_first
-                        .map(|q| mismatch_count(q, r_bytes))
-                        .unwrap_or(usize::MAX);
-                    let match_first_nm = q_match_first
-                        .map(|q| mismatch_count(q, r_bytes))
-                        .unwrap_or(usize::MAX);
+                        let orig_nm = q_orig
+                            .map(|q| mismatch_count(q, r_bytes))
+                            .unwrap_or(usize::MAX);
+                        let ins_first_nm = q_ins_first
+                            .map(|q| mismatch_count(q, r_bytes))
+                            .unwrap_or(usize::MAX);
+                        let match_first_nm = q_match_first
+                            .map(|q| mismatch_count(q, r_bytes))
+                            .unwrap_or(usize::MAX);
 
-                    if match_first_nm <= orig_nm || match_first_nm == 0 {
-                        ops[i] = CigarOp::Match(m);
-                        ops[i + 1] = CigarOp::Ins(total_i);
-                        ops.remove(i + 2);
-                        changed = true;
-                        continue;
-                    } else if ins_first_nm <= orig_nm || ins_first_nm == 0 {
-                        ops[i] = CigarOp::Ins(total_i);
-                        ops[i + 1] = CigarOp::Match(m);
-                        ops.remove(i + 2);
-                        changed = true;
-                        continue;
+                        if match_first_nm <= orig_nm || match_first_nm == 0 {
+                            merged.push(CigarOp::Match(m));
+                            merged.push(CigarOp::Ins(total_i));
+                            q_pos = q_pos.saturating_add(m_len + total_i as usize);
+                            r_pos = r_pos.saturating_add(m_len);
+                            i += 3;
+                            continue;
+                        } else if ins_first_nm <= orig_nm || ins_first_nm == 0 {
+                            merged.push(CigarOp::Ins(total_i));
+                            merged.push(CigarOp::Match(m));
+                            q_pos = q_pos.saturating_add(total_i as usize + m_len);
+                            r_pos = r_pos.saturating_add(m_len);
+                            i += 3;
+                            continue;
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
 
-        if ops[i].consumes_query() {
-            q_pos = q_pos.saturating_add(op_len(ops[i]));
+        let op = ops[i];
+        if op.consumes_query() {
+            q_pos = q_pos.saturating_add(op_len(op));
         }
-        if ops[i].consumes_reference() {
-            r_pos = r_pos.saturating_add(op_len(ops[i]));
+        if op.consumes_reference() {
+            r_pos = r_pos.saturating_add(op_len(op));
         }
+        merged.push(op);
         i += 1;
     }
 
-    if changed {
-        normalize_ops(ops);
-    }
+    normalize_ops(&mut merged);
+    *ops = merged;
 }
 
 /// Shift repeat-compatible insertions/deletions toward the leftmost
