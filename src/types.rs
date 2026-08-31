@@ -10,6 +10,7 @@ pub struct Read<'a> {
     pub name: &'a str,
     pub sequence: &'a [u8],
     pub qualities: Option<&'a [u8]>,
+    pub tags: Option<&'a str>,
 }
 
 /// An owned read suitable for hand-off to [`crate::WorkerPool`].
@@ -21,6 +22,7 @@ pub struct OwnedRead {
     pub name: String,
     pub sequence: Vec<u8>,
     pub qualities: Option<Vec<u8>>,
+    pub tags: Option<String>,
 }
 
 impl OwnedRead {
@@ -29,6 +31,7 @@ impl OwnedRead {
             name: name.into(),
             sequence: sequence.into(),
             qualities: None,
+            tags: None,
         }
     }
 
@@ -41,13 +44,30 @@ impl OwnedRead {
             name: name.into(),
             sequence: sequence.into(),
             qualities: Some(qualities.into()),
+            tags: None,
+        }
+    }
+
+    pub fn with_qualities_and_tags(
+        name: impl Into<String>,
+        sequence: impl Into<Vec<u8>>,
+        qualities: Option<Vec<u8>>,
+        tags: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            sequence: sequence.into(),
+            qualities,
+            tags,
         }
     }
 
     pub fn as_read(&self) -> Read<'_> {
-        match self.qualities.as_deref() {
-            Some(qualities) => Read::with_qualities(&self.name, &self.sequence, qualities),
-            None => Read::new(&self.name, &self.sequence),
+        Read {
+            name: &self.name,
+            sequence: &self.sequence,
+            qualities: self.qualities.as_deref(),
+            tags: self.tags.as_deref(),
         }
     }
 }
@@ -58,6 +78,7 @@ impl<'a> Read<'a> {
             name,
             sequence,
             qualities: None,
+            tags: None,
         }
     }
 
@@ -66,6 +87,21 @@ impl<'a> Read<'a> {
             name,
             sequence,
             qualities: Some(qualities),
+            tags: None,
+        }
+    }
+
+    pub const fn with_qualities_and_tags(
+        name: &'a str,
+        sequence: &'a [u8],
+        qualities: Option<&'a [u8]>,
+        tags: Option<&'a str>,
+    ) -> Self {
+        Self {
+            name,
+            sequence,
+            qualities,
+            tags,
         }
     }
 
@@ -529,6 +565,7 @@ pub struct MappedRead {
     pub name: String,
     pub sequence: Vec<u8>,
     pub qualities: Option<Vec<u8>>,
+    pub tags: Option<String>,
     pub mapping: MappingResult,
 }
 

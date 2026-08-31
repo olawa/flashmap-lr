@@ -400,16 +400,19 @@ impl<'a> Aligner<'a> {
             name,
             sequence,
             qualities,
+            tags,
         } = owned_read;
         let mapping = self.map(Read {
             name: &name,
             sequence: &sequence,
             qualities: qualities.as_deref(),
+            tags: tags.as_deref(),
         })?;
         Ok(MappedRead {
             name,
             sequence,
             qualities,
+            tags,
             mapping,
         })
     }

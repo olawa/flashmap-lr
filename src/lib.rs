@@ -20,6 +20,7 @@ pub mod io;
 mod postprocess;
 mod probes;
 mod segment;
+pub mod tags;
 mod types;
 mod worker_pool;
 

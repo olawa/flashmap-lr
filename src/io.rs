@@ -141,7 +141,7 @@ impl<R: BufRead> FastxReader<R> {
         }
     }
 
-    fn next_header(&mut self) -> Result<Option<(usize, String)>, FastxError> {
+    fn next_header(&mut self) -> Result<Option<(usize, String, Option<String>)>, FastxError> {
         let next = match self.pending_header.take() {
             Some(header) => Some(header),
             None => self.next_nonempty_line()?,
@@ -165,21 +165,25 @@ impl<R: BufRead> FastxReader<R> {
         } else {
             self.format = Some(observed);
         }
-        let name = trimmed[1..]
-            .split_whitespace()
+        let header_body = &trimmed[1..];
+        let mut parts = header_body.splitn(2, |c: char| c.is_ascii_whitespace());
+        let name = parts.next().unwrap_or_default().trim().to_owned();
+        let tags = parts
             .next()
-            .unwrap_or_default()
-            .to_owned();
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_owned());
         if name.is_empty() {
             return Err(FastxError::EmptyName { line });
         }
-        Ok(Some((line, name)))
+        Ok(Some((line, name, tags)))
     }
 
     fn read_fasta_record(
         &mut self,
         header_line: usize,
         name: String,
+        tags: Option<String>,
     ) -> Result<OwnedRead, FastxError> {
         let mut sequence = Vec::new();
         while let Some((line, text)) = self.read_line()? {
@@ -199,13 +203,16 @@ impl<R: BufRead> FastxReader<R> {
                 name,
             });
         }
-        Ok(OwnedRead::new(name, sequence))
+        Ok(OwnedRead::with_qualities_and_tags(
+            name, sequence, None, tags,
+        ))
     }
 
     fn read_fastq_record(
         &mut self,
         header_line: usize,
         name: String,
+        tags: Option<String>,
     ) -> Result<OwnedRead, FastxError> {
         let mut sequence = Vec::new();
         let mut separator_line = None;
@@ -252,16 +259,21 @@ impl<R: BufRead> FastxReader<R> {
                 return Err(FastxError::QualityTooLong { line, name });
             }
         }
-        Ok(OwnedRead::with_qualities(name, sequence, qualities))
+        Ok(OwnedRead::with_qualities_and_tags(
+            name,
+            sequence,
+            Some(qualities),
+            tags,
+        ))
     }
 
     fn next_record(&mut self) -> Result<Option<OwnedRead>, FastxError> {
-        let Some((line, name)) = self.next_header()? else {
+        let Some((line, name, tags)) = self.next_header()? else {
             return Ok(None);
         };
         match self.format.expect("next_header sets format") {
-            FastxFormat::Fasta => self.read_fasta_record(line, name).map(Some),
-            FastxFormat::Fastq => self.read_fastq_record(line, name).map(Some),
+            FastxFormat::Fasta => self.read_fasta_record(line, name, tags).map(Some),
+            FastxFormat::Fastq => self.read_fastq_record(line, name, tags).map(Some),
         }
     }
 }
@@ -465,6 +477,12 @@ impl<W: Write> SamWriter<W> {
             write_sam_sequence(&mut self.writer, &mapped.sequence, false)?;
             self.writer.write_all(b"\t")?;
             write_sam_quality(&mut self.writer, mapped.qualities.as_deref(), false)?;
+            if let Some(tags) = &mapped.tags {
+                let normalized = tags.split_whitespace().collect::<Vec<_>>().join("\t");
+                if !normalized.is_empty() {
+                    write!(self.writer, "\t{}", normalized)?;
+                }
+            }
             self.writer.write_all(b"\n")?;
         }
         for supplementary in &mapped.mapping.supplementary {
@@ -522,11 +540,26 @@ impl<W: Write> SamWriter<W> {
         write_sam_sequence(&mut self.writer, &mapped.sequence, reverse)?;
         self.writer.write_all(b"\t")?;
         write_sam_quality(&mut self.writer, mapped.qualities.as_deref(), reverse)?;
-        writeln!(
+        write!(
             self.writer,
             "\tNM:i:{}\tAS:i:{}",
             alignment.edit_distance, alignment.score
         )?;
+        if let Some(tags) = &mapped.tags {
+            if reverse {
+                let transformed =
+                    crate::tags::transform_tags_for_reverse_strand(tags, &mapped.sequence);
+                if !transformed.is_empty() {
+                    write!(self.writer, "\t{}", transformed)?;
+                }
+            } else {
+                let normalized = tags.split_whitespace().collect::<Vec<_>>().join("\t");
+                if !normalized.is_empty() {
+                    write!(self.writer, "\t{}", normalized)?;
+                }
+            }
+        }
+        writeln!(self.writer)?;
         Ok(())
     }
 }
@@ -894,6 +927,7 @@ mod tests {
             name: "r0".to_owned(),
             sequence: b"ACGT".to_vec(),
             qualities: Some(b"!!!!".to_vec()),
+            tags: None,
             mapping: crate::MappingResult {
                 primary: Some(alignment),
                 supplementary: Vec::new(),
@@ -908,6 +942,7 @@ mod tests {
                 name: "unmapped".to_owned(),
                 sequence: b"NN".to_vec(),
                 qualities: None,
+                tags: None,
                 mapping: crate::MappingResult::default(),
             })
             .unwrap();
@@ -928,6 +963,7 @@ mod tests {
             name: "reverse".to_owned(),
             sequence: b"ACGA".to_vec(),
             qualities: Some(b"!\"#$".to_vec()),
+            tags: None,
             mapping: crate::MappingResult {
                 primary: Some(alignment),
                 supplementary: Vec::new(),
@@ -948,5 +984,55 @@ mod tests {
         assert_eq!(fields[1], "16");
         assert_eq!(fields[9], "TCGT");
         assert_eq!(fields[10], "$#\"!");
+    }
+
+    #[test]
+    fn sam_writer_transfers_and_reverses_methylation_tags() {
+        let reference = InMemoryReference::from_sequences([("chr0", b"ACACCCCCAA".to_vec())]);
+        let cigar = crate::Cigar::new([CigarOp::Match(10)]).unwrap();
+        let alignment_fwd =
+            Alignment::new(ContigId(0), 0, Strand::Forward, 0, cigar.clone(), 10, 42, 0).unwrap();
+        let alignment_rev =
+            Alignment::new(ContigId(0), 0, Strand::Reverse, 0, cigar, 10, 42, 0).unwrap();
+
+        let mapped_fwd = MappedRead {
+            name: "read_fwd".to_owned(),
+            sequence: b"ACACCCCCAA".to_vec(),
+            qualities: Some(b"IIIIIIIIII".to_vec()),
+            tags: Some("MM:Z:C+m?,1,2; ML:B:C,100,200 RG:Z:sample1".to_owned()),
+            mapping: crate::MappingResult {
+                primary: Some(alignment_fwd),
+                supplementary: Vec::new(),
+                diagnostics: None,
+            },
+        };
+
+        let mapped_rev = MappedRead {
+            name: "read_rev".to_owned(),
+            sequence: b"ACACCCCCAA".to_vec(),
+            qualities: Some(b"IIIIIIIIII".to_vec()),
+            tags: Some("MM:Z:C+m?,1,2; ML:B:C,100,200 RG:Z:sample1".to_owned()),
+            mapping: crate::MappingResult {
+                primary: Some(alignment_rev),
+                supplementary: Vec::new(),
+                diagnostics: None,
+            },
+        };
+
+        let mut output = Vec::new();
+        let mut writer = SamWriter::new(&mut output, &reference).unwrap();
+        writer.write_mapped_read(&mapped_fwd).unwrap();
+        writer.write_mapped_read(&mapped_rev).unwrap();
+        writer.flush().unwrap();
+
+        let text = String::from_utf8(output).unwrap();
+        let line_fwd = text.lines().find(|l| l.starts_with("read_fwd\t")).unwrap();
+        let line_rev = text.lines().find(|l| l.starts_with("read_rev\t")).unwrap();
+
+        // Forward preserves verbatim
+        assert!(line_fwd.contains("MM:Z:C+m?,1,2;\tML:B:C,100,200\tRG:Z:sample1"));
+
+        // Reverse inverts strand (+ -> -), recalculates deltas, and reverses ML probabilities
+        assert!(line_rev.contains("MM:Z:C-m?,1,2;\tML:B:C,200,100\tRG:Z:sample1"));
     }
 }
