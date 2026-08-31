@@ -382,6 +382,8 @@ pub(crate) fn cigar_edit_distance(cigar: &Cigar, query: &[u8], reference: &[u8])
                         .zip(reference_window)
                         .filter(|(query_base, reference_base)| {
                             !query_base.eq_ignore_ascii_case(reference_base)
+                                && **reference_base != b'N'
+                                && **reference_base != b'n'
                         })
                         .count() as u32,
                 )?;

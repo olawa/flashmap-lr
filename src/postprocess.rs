@@ -757,12 +757,12 @@ fn mismatch_count(query: &[u8], reference: &[u8]) -> usize {
     query
         .iter()
         .zip(reference)
-        .filter(|(q, r)| !q.eq_ignore_ascii_case(r))
+        .filter(|(q, r)| !bases_equal(**q, **r))
         .count()
 }
 
 fn bases_equal(query: u8, reference: u8) -> bool {
-    query.eq_ignore_ascii_case(&reference)
+    query.eq_ignore_ascii_case(&reference) || reference == b'N' || reference == b'n'
 }
 
 fn query_consumed(ops: &[CigarOp]) -> usize {

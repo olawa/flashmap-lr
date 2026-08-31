@@ -721,10 +721,11 @@ fn to_u32_lossy(value: usize) -> u32 {
     value.min(u32::MAX as usize) as u32
 }
 
-fn mismatch_count(a: &[u8], b: &[u8]) -> usize {
-    a.iter()
-        .zip(b)
-        .filter(|(x, y)| !x.eq_ignore_ascii_case(y))
+fn mismatch_count(query: &[u8], reference: &[u8]) -> usize {
+    query
+        .iter()
+        .zip(reference)
+        .filter(|(q, r)| !q.eq_ignore_ascii_case(r) && **r != b'N' && **r != b'n')
         .count()
 }
 
