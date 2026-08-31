@@ -9,10 +9,10 @@ use std::cell::RefCell;
 
 const MAX_WINDOW: usize = 8_192;
 const MAX_CELLS: usize = 16_000_000;
-const MATCH_SCORE: i8 = 2;
-const MISMATCH_PENALTY: i8 = 4;
-const GAP_OPEN: i8 = 6;
-const GAP_EXTEND: i8 = 1;
+pub(crate) const MATCH_SCORE: i8 = 2;
+pub(crate) const MISMATCH_PENALTY: i8 = 4;
+pub(crate) const GAP_OPEN: i8 = 6;
+pub(crate) const GAP_EXTEND: i8 = 1;
 
 thread_local! {
     static KSW2_ALIGNER: RefCell<ksw2rs::Aligner> = RefCell::new(ksw2rs::Aligner::new());
@@ -287,20 +287,20 @@ mod tests {
 
     #[test]
     fn mismatch_stays_inside_match_operation_and_counts_in_nm() {
-        let alignment = align_local(b"ACGTTCGT", b"ACGTACGT", 32).unwrap();
-        assert_eq!(alignment.cigar.ops(), &[CigarOp::Match(8)]);
+        let alignment = align_local(b"ACGTACGTTCGTACGT", b"ACGTACGTACGTACGT", 32).unwrap();
+        assert_eq!(alignment.cigar.ops(), &[CigarOp::Match(16)]);
         assert_eq!(alignment.edit_distance, 1);
     }
 
     #[test]
     fn short_insertion_is_reported_as_an_indel() {
-        let alignment = align_local(b"ACGTTACGT", b"ACGTACGT", 32).unwrap();
+        let alignment = align_full(b"ACGTACGTTTACGTACGT", b"ACGTACGTACGTACGT", 32).unwrap();
         assert!(alignment
             .cigar
             .ops()
             .iter()
-            .any(|op| matches!(op, CigarOp::Ins(1))));
-        assert_eq!(alignment.edit_distance, 1);
+            .any(|op| matches!(op, CigarOp::Ins(2))));
+        assert_eq!(alignment.edit_distance, 2);
     }
 
     #[test]

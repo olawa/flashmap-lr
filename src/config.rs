@@ -103,7 +103,7 @@ impl Default for Config {
             alignment: AlignmentConfig {
                 bridge_flank: 256,
                 bridge_max_gap: 5_000,
-                sensitive: false,
+                sensitive: true,
             },
             worker_pool: WorkerPoolConfig::default(),
         }

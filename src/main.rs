@@ -47,7 +47,7 @@ impl Options {
         let mut emms_max_mismatch_run = 1;
         let mut emms_relock_span = 24;
         let mut tiered_candidates = false;
-        let mut sensitive = false;
+        let mut sensitive = true;
 
         let mut positional = Vec::new();
 
@@ -107,6 +107,9 @@ impl Options {
                 }
                 "--sensitive" => {
                     sensitive = true;
+                }
+                "--fast" | "--no-sensitive" => {
+                    sensitive = false;
                 }
                 "-x" | "--preset" => {
                     let val = next_value(&mut args, &argument)?;
@@ -543,6 +546,8 @@ struct ProfileReporter {
     chain_nanos: AtomicU64,
     cigar_nanos: AtomicU64,
     total_nanos: AtomicU64,
+    cigar_time_reads: [AtomicU64; 8],
+    cigar_time_nanos: [AtomicU64; 8],
 }
 
 impl DiagnosticsSink for ProfileReporter {
@@ -570,6 +575,18 @@ impl DiagnosticsSink for ProfileReporter {
         ] {
             target.fetch_add(value, Ordering::Relaxed);
         }
+        let cigar_bucket = match diagnostics.cigar_nanos {
+            0..=99_999 => 0,
+            100_000..=499_999 => 1,
+            500_000..=999_999 => 2,
+            1_000_000..=4_999_999 => 3,
+            5_000_000..=9_999_999 => 4,
+            10_000_000..=49_999_999 => 5,
+            50_000_000..=99_999_999 => 6,
+            _ => 7,
+        };
+        self.cigar_time_reads[cigar_bucket].fetch_add(1, Ordering::Relaxed);
+        self.cigar_time_nanos[cigar_bucket].fetch_add(diagnostics.cigar_nanos, Ordering::Relaxed);
     }
 }
 
@@ -616,6 +633,24 @@ impl ProfileReporter {
             "  Accounted read time:  {:>10.3} worker-s",
             total as f64 / 1_000_000_000.0
         );
+        eprintln!("  CIGAR time distribution:");
+        for (label, index) in [
+            ("<0.1 ms", 0),
+            ("0.1-0.5 ms", 1),
+            ("0.5-1 ms", 2),
+            ("1-5 ms", 3),
+            ("5-10 ms", 4),
+            ("10-50 ms", 5),
+            ("50-100 ms", 6),
+            (">=100 ms", 7),
+        ] {
+            let bucket_reads = self.cigar_time_reads[index].load(Ordering::Relaxed);
+            let bucket_nanos = self.cigar_time_nanos[index].load(Ordering::Relaxed);
+            eprintln!(
+                "    {label:<12} {bucket_reads:>9} reads  {:>9.3} worker-s",
+                bucket_nanos as f64 / 1_000_000_000.0
+            );
+        }
         eprintln!("======================================================================");
     }
 }
@@ -839,5 +874,13 @@ mod tests {
         )
         .unwrap();
         assert!(options_preset.sensitive);
+
+        let options_fast = Options::parse(
+            ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "--fast"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert!(!options_fast.sensitive);
     }
 }

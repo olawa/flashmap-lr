@@ -114,7 +114,10 @@ pub fn build_chain_cigar(
     config: &Config,
 ) -> Result<(Cigar, usize, Vec<u8>), ChainCigarError> {
     let oriented_query = oriented_query(read.sequence, chain_strand(chain)?);
-    let anchors = normalize_anchor_overlaps(orient_anchors(chain, read.sequence.len(), contig)?);
+    let raw_anchors =
+        normalize_anchor_overlaps(orient_anchors(chain, read.sequence.len(), contig)?);
+    let anchors =
+        unlock_register_shifted_str_anchors(raw_anchors, &oriented_query, contig.sequence, config);
     let first = anchors.first().ok_or(ChainCigarError::EmptyChain)?;
     let last = anchors.last().ok_or(ChainCigarError::EmptyChain)?;
     let mut ref_start = first.ref_start;
@@ -184,12 +187,26 @@ pub fn build_chain_cigar(
         ref_start,
         config.alignment.sensitive,
     );
+    collapse_balanced_indels_to_mnvs(
+        &mut repaired_ops,
+        contig.sequence,
+        &oriented_query,
+        ref_start,
+    );
     left_align_indels(
         &mut repaired_ops,
         contig.sequence,
         &oriented_query,
         ref_start,
         config.alignment.sensitive,
+    );
+    // STR normalization can bring a balanced indel pair together even when
+    // it was not adjacent in the raw DP CIGAR.
+    collapse_balanced_indels_to_mnvs(
+        &mut repaired_ops,
+        contig.sequence,
+        &oriented_query,
+        ref_start,
     );
     crate::postprocess::endpoint_score_clip(
         &mut repaired_ops,
@@ -325,6 +342,227 @@ fn normalize_anchor_overlaps(mut anchors: Vec<OrientedAnchor>) -> Vec<OrientedAn
             && anchor.ref_start < anchor.ref_end
             && anchor.q_end - anchor.q_start == anchor.ref_end - anchor.ref_start
     });
+    anchors
+}
+
+/// Check if a sequence is predominantly a low-complexity tandem repeat (STR, homopolymer, dinucleotide, etc.)
+fn is_low_complexity_str(sequence: &[u8]) -> bool {
+    if sequence.len() < 8 {
+        return false;
+    }
+    for period in 1..=6 {
+        if sequence.len() <= period {
+            continue;
+        }
+        let matches = sequence[period..]
+            .iter()
+            .zip(&sequence[..sequence.len() - period])
+            .filter(|(a, b)| a.eq_ignore_ascii_case(b))
+            .count();
+        let total = sequence.len() - period;
+        if total > 0 && (matches * 100) / total >= 80 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Count the number of gap opens (Ins or Del operations) in a CIGAR slice
+fn count_gap_opens(ops: &[CigarOp]) -> usize {
+    ops.iter()
+        .filter(|op| matches!(op, CigarOp::Ins(_) | CigarOp::Del(_)))
+        .count()
+}
+
+/// Score a sequence of CigarOps against query and reference slices
+fn score_cigar_ops(ops: &[CigarOp], query: &[u8], reference: &[u8]) -> i32 {
+    let mut score = 0i32;
+    let mut q_pos = 0usize;
+    let mut r_pos = 0usize;
+    for &op in ops {
+        match op {
+            CigarOp::Match(len) => {
+                let l = len as usize;
+                if let (Some(q), Some(r)) =
+                    (query.get(q_pos..q_pos + l), reference.get(r_pos..r_pos + l))
+                {
+                    let nm = mismatch_count(q, r);
+                    let matches = l - nm;
+                    score += (matches as i32) * (crate::dp::MATCH_SCORE as i32)
+                        - (nm as i32) * (crate::dp::MISMATCH_PENALTY as i32);
+                }
+                q_pos += l;
+                r_pos += l;
+            }
+            CigarOp::Ins(len) => {
+                let l = len as usize;
+                score -= (crate::dp::GAP_OPEN as i32) + (l as i32) * (crate::dp::GAP_EXTEND as i32);
+                q_pos += l;
+            }
+            CigarOp::Del(len) => {
+                let l = len as usize;
+                score -= (crate::dp::GAP_OPEN as i32) + (l as i32) * (crate::dp::GAP_EXTEND as i32);
+                r_pos += l;
+            }
+            CigarOp::SoftClip(len) => {
+                q_pos += len as usize;
+            }
+        }
+    }
+    score
+}
+
+/// Guarded register-shift realignment:
+/// Identifies inner anchors (<= 48 bp) in low-complexity / STR repeats that are flanked
+/// by non-zero gap deltas, either opposing or in the same direction.
+/// Re-aligns the entire span continuously with DP; if the continuous alignment is score-neutral
+/// or better (with fewer gap opens), the spurious middle anchor is unlocked and removed.
+fn unlock_register_shifted_str_anchors(
+    mut anchors: Vec<OrientedAnchor>,
+    query: &[u8],
+    reference: &[u8],
+    config: &Config,
+) -> Vec<OrientedAnchor> {
+    if anchors.len() < 3 {
+        return anchors;
+    }
+    let mut i = 1usize;
+    while i + 1 < anchors.len() {
+        let (left, mid, right) = (&anchors[i - 1], &anchors[i], &anchors[i + 1]);
+        let mid_len = mid.q_end.saturating_sub(mid.q_start);
+
+        // 1. Must be a short inner anchor (<= 48 bp)
+        if mid_len > 48 {
+            i += 1;
+            continue;
+        }
+
+        // 2. Compute net gap deltas on both sides
+        let q_gap1 = mid.q_start.saturating_sub(left.q_end);
+        let ref_gap1 = mid.ref_start.saturating_sub(left.ref_end);
+        let d1 = (q_gap1 as i32) - (ref_gap1 as i32);
+
+        let q_gap2 = right.q_start.saturating_sub(mid.q_end);
+        let ref_gap2 = right.ref_start.saturating_sub(mid.ref_end);
+        let d2 = (q_gap2 as i32) - (ref_gap2 as i32);
+
+        // Both sides must contain a register-changing gap. This includes
+        // opposing indels as well as same-direction fragments such as
+        // 2D <short STR anchor> 2D, where the middle anchor prevents one 4D.
+        if d1 == 0 || d2 == 0 {
+            i += 1;
+            continue;
+        }
+
+        // 3. Must be in a low-complexity / STR repeat
+        let mid_seq = query.get(mid.q_start..mid.q_end);
+        let is_str = mid_seq.map(is_low_complexity_str).unwrap_or(false);
+        if !is_str {
+            i += 1;
+            continue;
+        }
+
+        // 4. Span must be bounded for DP
+        let total_q_span = right.q_start.saturating_sub(left.q_end);
+        let total_ref_span = right.ref_start.saturating_sub(left.ref_end);
+        let max_dp_span = if config.alignment.sensitive {
+            2048
+        } else {
+            1024
+        };
+        if total_q_span > max_dp_span
+            || total_ref_span > max_dp_span
+            || total_q_span == 0
+            || total_ref_span == 0
+        {
+            i += 1;
+            continue;
+        }
+
+        // 5. Build and score split path (with mid anchor pinned)
+        let q_sub = match query.get(left.q_end..right.q_start) {
+            Some(s) => s,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        let ref_sub = match reference.get(left.ref_end..right.ref_start) {
+            Some(s) => s,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+
+        let mut split_ops = Vec::new();
+        let gap1_ok = append_gap(
+            &mut split_ops,
+            query,
+            reference,
+            left.q_end,
+            mid.q_start,
+            left.ref_end,
+            mid.ref_start,
+            config,
+        )
+        .is_ok();
+        if !gap1_ok {
+            i += 1;
+            continue;
+        }
+        split_ops.push(CigarOp::Match(mid_len as u32));
+        let gap2_ok = append_gap(
+            &mut split_ops,
+            query,
+            reference,
+            mid.q_end,
+            right.q_start,
+            mid.ref_end,
+            right.ref_start,
+            config,
+        )
+        .is_ok();
+        if !gap2_ok {
+            i += 1;
+            continue;
+        }
+
+        let split_score = score_cigar_ops(&split_ops, q_sub, ref_sub);
+        let split_gaps = count_gap_opens(&split_ops);
+
+        // 6. Build and score continuous path (without mid anchor)
+        let mut continuous_ops = Vec::new();
+        let cont_ok = append_gap(
+            &mut continuous_ops,
+            query,
+            reference,
+            left.q_end,
+            right.q_start,
+            left.ref_end,
+            right.ref_start,
+            config,
+        )
+        .is_ok();
+        if !cont_ok {
+            i += 1;
+            continue;
+        }
+
+        let continuous_score = score_cigar_ops(&continuous_ops, q_sub, ref_sub);
+        let continuous_gaps = count_gap_opens(&continuous_ops);
+
+        // Accept continuous alignment if score is better, or equal with fewer gap opens
+        if continuous_score > split_score
+            || (continuous_score == split_score && continuous_gaps < split_gaps)
+        {
+            anchors.remove(i);
+            // Re-check from previous position if possible
+            i = i.saturating_sub(1).max(1);
+        } else {
+            i += 1;
+        }
+    }
     anchors
 }
 
@@ -733,6 +971,67 @@ fn mismatch_count(query: &[u8], reference: &[u8]) -> usize {
         .count()
 }
 
+/// Return the largest shift whose mismatch count does not exceed the
+/// unshifted prefix mismatch count.
+///
+/// `shift_query` and `shift_reference` are aligned by their right endpoint.
+/// The old implementation recomputed both mismatch spans for every shift,
+/// making an unrestricted sensitive STR scan quadratic in the preceding
+/// match length.  Prefix and shrinking-suffix mismatch counts make the same
+/// decision in linear time.
+fn largest_nm_preserving_shift(
+    prefix_query: &[u8],
+    prefix_reference: &[u8],
+    shift_query: &[u8],
+    shift_reference: &[u8],
+    minimum_shift: usize,
+) -> Option<usize> {
+    let scan_limit = prefix_query.len();
+    if prefix_reference.len() != scan_limit
+        || shift_query.len() != scan_limit
+        || shift_reference.len() != scan_limit
+        || minimum_shift > scan_limit
+    {
+        return None;
+    }
+
+    let original_nm = mismatch_count(prefix_query, prefix_reference);
+    let mut retained_prefix_nm = 0usize;
+    let mut shifted_suffix_nm = mismatch_count(shift_query, shift_reference);
+
+    for shift in (minimum_shift..=scan_limit).rev() {
+        if retained_prefix_nm + shifted_suffix_nm <= original_nm {
+            return Some(shift);
+        }
+        if shift > minimum_shift {
+            let removed = scan_limit - shift;
+            retained_prefix_nm += usize::from(
+                !prefix_query[removed].eq_ignore_ascii_case(&prefix_reference[removed]),
+            );
+            shifted_suffix_nm = shifted_suffix_nm.saturating_sub(usize::from(
+                !shift_query[removed].eq_ignore_ascii_case(&shift_reference[removed]),
+            ));
+        }
+    }
+    None
+}
+
+/// Compute the change in alignment score when merging two adjacent indels
+/// separated by a micro-match span:
+/// ΔScore = GAP_OPEN - ΔNM * (MATCH_SCORE + MISMATCH_PENALTY)
+/// A non-negative result means the merged CIGAR is score-neutral or score-improving
+/// and has 1 fewer gap open.
+fn merge_score_diff(orig_nm: usize, candidate_nm: usize) -> i32 {
+    if orig_nm == usize::MAX || candidate_nm == usize::MAX {
+        return i32::MIN;
+    }
+    let penalty_per_mismatch =
+        (crate::dp::MATCH_SCORE as i32) + (crate::dp::MISMATCH_PENALTY as i32);
+    let gap_open_saved = crate::dp::GAP_OPEN as i32;
+    let nm_diff = (candidate_nm as i32) - (orig_nm as i32);
+    gap_open_saved - nm_diff * penalty_per_mismatch
+}
+
 /// Merge fragmented adjacent indels of the same type separated by a spurious
 /// micro-match (<= 4 bp) inside repetitive regions, reconstructing the true
 /// continuous biological insertion or deletion.
@@ -776,13 +1075,18 @@ fn merge_fragmented_indels(
                         .map(|r| mismatch_count(q_bytes, r))
                         .unwrap_or(usize::MAX);
 
-                    if match_first_nm <= orig_nm || match_first_nm == 0 {
+                    let score_diff_match = merge_score_diff(orig_nm, match_first_nm);
+                    let score_diff_del = merge_score_diff(orig_nm, del_first_nm);
+
+                    if score_diff_match >= 0
+                        && (match_first_nm <= del_first_nm || score_diff_del < 0)
+                    {
                         ops[i] = CigarOp::Match(m);
                         ops[i + 1] = CigarOp::Del(total_d);
                         ops.remove(i + 2);
                         changed = true;
                         continue;
-                    } else if del_first_nm <= orig_nm || del_first_nm == 0 {
+                    } else if score_diff_del >= 0 {
                         ops[i] = CigarOp::Del(total_d);
                         ops[i + 1] = CigarOp::Match(m);
                         ops.remove(i + 2);
@@ -813,13 +1117,18 @@ fn merge_fragmented_indels(
                         .map(|q| mismatch_count(q, r_bytes))
                         .unwrap_or(usize::MAX);
 
-                    if match_first_nm <= orig_nm || match_first_nm == 0 {
+                    let score_diff_match = merge_score_diff(orig_nm, match_first_nm);
+                    let score_diff_ins = merge_score_diff(orig_nm, ins_first_nm);
+
+                    if score_diff_match >= 0
+                        && (match_first_nm <= ins_first_nm || score_diff_ins < 0)
+                    {
                         ops[i] = CigarOp::Match(m);
                         ops[i + 1] = CigarOp::Ins(total_i);
                         ops.remove(i + 2);
                         changed = true;
                         continue;
-                    } else if ins_first_nm <= orig_nm || ins_first_nm == 0 {
+                    } else if score_diff_ins >= 0 {
                         ops[i] = CigarOp::Ins(total_i);
                         ops[i + 1] = CigarOp::Match(m);
                         ops.remove(i + 2);
@@ -829,6 +1138,92 @@ fn merge_fragmented_indels(
                 }
             }
             _ => {}
+        }
+
+        if ops[i].consumes_query() {
+            q_pos = q_pos.saturating_add(op_len(ops[i]));
+        }
+        if ops[i].consumes_reference() {
+            r_pos = r_pos.saturating_add(op_len(ops[i]));
+        }
+        i += 1;
+    }
+
+    if changed {
+        normalize_ops(ops);
+    }
+}
+
+/// Convert a tightly balanced pair of opposing indels into the equivalent
+/// mismatch/MNV span. With the LR score matrix, three clustered substitutions
+/// can otherwise score below `1D 4M 1I`, even though the latter creates two
+/// artificial variant events. The score override is capped at one gap-open
+/// penalty and requires at least one matching base in the replacement span.
+fn collapse_balanced_indels_to_mnvs(
+    ops: &mut Vec<CigarOp>,
+    reference: &[u8],
+    query: &[u8],
+    ref_start: usize,
+) {
+    if ops.len() < 3 {
+        return;
+    }
+
+    let mut changed = false;
+    let mut i = 0usize;
+    let mut q_pos = 0usize;
+    let mut r_pos = ref_start;
+
+    while i + 2 < ops.len() {
+        let candidate = match (ops[i], ops[i + 1], ops[i + 2]) {
+            (CigarOp::Del(d), CigarOp::Match(m), CigarOp::Ins(ins))
+                if m <= 4 && d == ins && d <= 2 =>
+            {
+                Some((d as usize, m as usize, q_pos, r_pos + d as usize))
+            }
+            (CigarOp::Ins(ins), CigarOp::Match(m), CigarOp::Del(d))
+                if m <= 4 && d == ins && d <= 2 =>
+            {
+                Some((d as usize, m as usize, q_pos + d as usize, r_pos))
+            }
+            _ => None,
+        };
+
+        if let Some((indel_len, match_len, orig_q_start, orig_r_start)) = candidate {
+            let total_len = match_len + indel_len;
+            let candidate_query = query.get(q_pos..q_pos + total_len);
+            let candidate_reference = reference.get(r_pos..r_pos + total_len);
+            let original_query = query.get(orig_q_start..orig_q_start + match_len);
+            let original_reference = reference.get(orig_r_start..orig_r_start + match_len);
+            if let (
+                Some(candidate_query),
+                Some(candidate_reference),
+                Some(original_query),
+                Some(original_reference),
+            ) = (
+                candidate_query,
+                candidate_reference,
+                original_query,
+                original_reference,
+            ) {
+                let original_nm = mismatch_count(original_query, original_reference);
+                let candidate_nm = mismatch_count(candidate_query, candidate_reference);
+                let penalty_per_mismatch =
+                    (crate::dp::MATCH_SCORE + crate::dp::MISMATCH_PENALTY) as i32;
+                let gap_saving = 2 * crate::dp::GAP_OPEN as i32
+                    + indel_len as i32
+                        * (2 * crate::dp::GAP_EXTEND as i32 + crate::dp::MATCH_SCORE as i32);
+                let score_diff =
+                    gap_saving - (candidate_nm as i32 - original_nm as i32) * penalty_per_mismatch;
+
+                if score_diff >= -(crate::dp::GAP_OPEN as i32) && candidate_nm < total_len {
+                    ops[i] = CigarOp::Match(total_len as u32);
+                    ops.remove(i + 2);
+                    ops.remove(i + 1);
+                    changed = true;
+                    continue;
+                }
+            }
         }
 
         if ops[i].consumes_query() {
@@ -961,7 +1356,11 @@ fn left_align_insertion(
     // repeat units in the preceding match window preserves or improves alignment quality.
     let q_pos = *query_pos;
     let r_pos = *reference_pos;
-    let scan_limit = if sensitive { match_len } else { match_len.min(48) };
+    let scan_limit = if sensitive {
+        match_len
+    } else {
+        match_len.min(48)
+    };
     if scan_limit > exact_shift {
         if let (Some(q_cur), Some(r_cur)) = (
             query.get(q_pos.saturating_sub(scan_limit)..q_pos.saturating_add(length)),
@@ -969,25 +1368,20 @@ fn left_align_insertion(
         ) {
             let q_prefix = &q_cur[..scan_limit];
             let r_prefix = &r_cur[..scan_limit];
-            let orig_nm = mismatch_count(q_prefix, r_prefix);
-
-            for s in (exact_shift + 1..=scan_limit).rev() {
-                if r_pos < s || q_pos < s {
-                    continue;
-                }
-                let q_sub_a = query.get(q_pos - scan_limit..q_pos - s);
-                let r_sub_a = reference.get(r_pos - scan_limit..r_pos - s);
-                let q_sub_b = query.get(q_pos + length - s..q_pos + length);
-                let r_sub_b = reference.get(r_pos - s..r_pos);
-
-                if let (Some(qa), Some(ra), Some(qb), Some(rb)) =
-                    (q_sub_a, r_sub_a, q_sub_b, r_sub_b)
-                {
-                    let shifted_nm = mismatch_count(qa, ra) + mismatch_count(qb, rb);
-                    if shifted_nm <= orig_nm {
-                        best_shift = s;
-                        break;
-                    }
+            let shift_query = query.get(
+                q_pos.saturating_add(length).saturating_sub(scan_limit)
+                    ..q_pos.saturating_add(length),
+            );
+            let shift_reference = reference.get(r_pos - scan_limit..r_pos);
+            if let (Some(shift_query), Some(shift_reference)) = (shift_query, shift_reference) {
+                if let Some(shift) = largest_nm_preserving_shift(
+                    q_prefix,
+                    r_prefix,
+                    shift_query,
+                    shift_reference,
+                    exact_shift + 1,
+                ) {
+                    best_shift = shift;
                 }
             }
         }
@@ -1059,32 +1453,30 @@ fn left_align_deletion(
     // repeat units in the preceding match window preserves or improves alignment quality.
     let q_pos = *query_pos;
     let r_pos = *reference_pos;
-    let scan_limit = if sensitive { match_len } else { match_len.min(48) };
+    let scan_limit = if sensitive {
+        match_len
+    } else {
+        match_len.min(48)
+    };
     if scan_limit > exact_shift {
         if let (Some(q_cur), Some(r_cur)) = (
             query.get(q_pos.saturating_sub(scan_limit)..q_pos),
             reference.get(r_pos.saturating_sub(scan_limit)..r_pos.saturating_add(length)),
         ) {
             let r_prefix = &r_cur[..scan_limit];
-            let orig_nm = mismatch_count(q_cur, r_prefix);
-
-            for s in (exact_shift + 1..=scan_limit).rev() {
-                if r_pos < s || q_pos < s {
-                    continue;
-                }
-                let q_sub_a = query.get(q_pos - scan_limit..q_pos - s);
-                let r_sub_a = reference.get(r_pos - scan_limit..r_pos - s);
-                let q_sub_b = query.get(q_pos - s..q_pos);
-                let r_sub_b = reference.get(r_pos + length - s..r_pos + length);
-
-                if let (Some(qa), Some(ra), Some(qb), Some(rb)) =
-                    (q_sub_a, r_sub_a, q_sub_b, r_sub_b)
-                {
-                    let shifted_nm = mismatch_count(qa, ra) + mismatch_count(qb, rb);
-                    if shifted_nm <= orig_nm {
-                        best_shift = s;
-                        break;
-                    }
+            let shift_reference = reference.get(
+                r_pos.saturating_add(length).saturating_sub(scan_limit)
+                    ..r_pos.saturating_add(length),
+            );
+            if let Some(shift_reference) = shift_reference {
+                if let Some(shift) = largest_nm_preserving_shift(
+                    q_cur,
+                    r_prefix,
+                    q_cur,
+                    shift_reference,
+                    exact_shift + 1,
+                ) {
+                    best_shift = shift;
                 }
             }
         }
@@ -1518,5 +1910,152 @@ mod tests {
             deletion,
             vec![CigarOp::Match(1), CigarOp::Del(1), CigarOp::Match(3)]
         );
+    }
+
+    #[test]
+    fn linear_repeat_shift_search_matches_exhaustive_search() {
+        fn exhaustive(
+            prefix_query: &[u8],
+            prefix_reference: &[u8],
+            shift_query: &[u8],
+            shift_reference: &[u8],
+            minimum_shift: usize,
+        ) -> Option<usize> {
+            let scan_limit = prefix_query.len();
+            let original_nm = mismatch_count(prefix_query, prefix_reference);
+            (minimum_shift..=scan_limit).rev().find(|&shift| {
+                mismatch_count(
+                    &prefix_query[..scan_limit - shift],
+                    &prefix_reference[..scan_limit - shift],
+                ) + mismatch_count(
+                    &shift_query[scan_limit - shift..],
+                    &shift_reference[scan_limit - shift..],
+                ) <= original_nm
+            })
+        }
+
+        let alphabet = *b"ACGTN";
+        let mut state = 0x9e37_79b9_u32;
+        for scan_limit in 1..=128 {
+            for minimum_shift in 1..=scan_limit {
+                let mut next_sequence = || {
+                    (0..scan_limit)
+                        .map(|_| {
+                            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            alphabet[(state as usize) % alphabet.len()]
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let prefix_query = next_sequence();
+                let prefix_reference = next_sequence();
+                let shift_query = next_sequence();
+                let shift_reference = next_sequence();
+                assert_eq!(
+                    largest_nm_preserving_shift(
+                        &prefix_query,
+                        &prefix_reference,
+                        &shift_query,
+                        &shift_reference,
+                        minimum_shift,
+                    ),
+                    exhaustive(
+                        &prefix_query,
+                        &prefix_reference,
+                        &shift_query,
+                        &shift_reference,
+                        minimum_shift,
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn same_direction_repeat_gaps_unlock_the_middle_anchor() {
+        // Two repeat-unit deletions on either side of a short exact STR
+        // anchor cost one extra gap open compared with one continuous 4D.
+        let reference = b"AC".repeat(43);
+        let query = b"AC".repeat(41);
+        let anchors = vec![
+            OrientedAnchor {
+                q_start: 0,
+                q_end: 20,
+                ref_start: 0,
+                ref_end: 20,
+            },
+            OrientedAnchor {
+                q_start: 20,
+                q_end: 62,
+                ref_start: 22,
+                ref_end: 64,
+            },
+            OrientedAnchor {
+                q_start: 62,
+                q_end: 82,
+                ref_start: 66,
+                ref_end: 86,
+            },
+        ];
+
+        let unlocked = unlock_register_shifted_str_anchors(anchors, &query, &reference, &config());
+        assert_eq!(unlocked.len(), 2);
+
+        let mut continuous_ops = Vec::new();
+        append_gap(
+            &mut continuous_ops,
+            &query,
+            &reference,
+            unlocked[0].q_end,
+            unlocked[1].q_start,
+            unlocked[0].ref_end,
+            unlocked[1].ref_start,
+            &config(),
+        )
+        .unwrap();
+        assert_eq!(count_gap_opens(&continuous_ops), 1);
+        assert!(continuous_ops.contains(&CigarOp::Del(4)));
+    }
+
+    #[test]
+    fn test_mnv_opposing_indel_collapse() {
+        // Ref: GGGCA (5bp)
+        // Qry: GGCAG (5bp)
+        let reference = b"NNNNNGGGCANNNNN";
+        let query = b"NNNNNGGCAGNNNNN";
+        let mut ops = vec![
+            CigarOp::Match(5),
+            CigarOp::Del(1),
+            CigarOp::Match(4),
+            CigarOp::Ins(1),
+            CigarOp::Match(5),
+        ];
+        collapse_balanced_indels_to_mnvs(&mut ops, reference, query, 0);
+        assert_eq!(ops, vec![CigarOp::Match(15)]);
+    }
+
+    #[test]
+    fn mnv_collapse_handles_reverse_order_and_rejects_unbalanced_indels() {
+        let reference = b"NNNNNAAAAGNNNNN";
+        let query = b"NNNNNCAAAANNNNN";
+        let mut reverse_order = vec![
+            CigarOp::Match(5),
+            CigarOp::Ins(1),
+            CigarOp::Match(4),
+            CigarOp::Del(1),
+            CigarOp::Match(5),
+        ];
+        collapse_balanced_indels_to_mnvs(&mut reverse_order, reference, query, 0);
+        assert_eq!(reverse_order, vec![CigarOp::Match(15)]);
+
+        let mut unbalanced = vec![
+            CigarOp::Match(5),
+            CigarOp::Del(1),
+            CigarOp::Match(4),
+            CigarOp::Ins(2),
+            CigarOp::Match(5),
+        ];
+        let original = unbalanced.clone();
+        collapse_balanced_indels_to_mnvs(&mut unbalanced, reference, query, 0);
+        assert_eq!(unbalanced, original);
     }
 }
