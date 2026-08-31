@@ -366,6 +366,8 @@ fn find_anchors_with_seed_hits_depth(
                 query_seed_hits.seed_span,
                 window_start,
                 window_end,
+                config.candidates.emms_max_mismatch_run,
+                config.candidates.emms_relock_span,
             ) else {
                 continue;
             };
@@ -659,6 +661,7 @@ fn build_paired_staging(
 /// those spans. Accepted mismatch runs are at most three bases and must
 /// re-lock for twelve exact bases before another run. The final exact seed
 /// naturally supplies the terminal re-lock.
+#[allow(clippy::too_many_arguments)]
 fn build_paired_emms_anchor(
     read: &[u8],
     reference: &[u8],
@@ -667,9 +670,9 @@ fn build_paired_emms_anchor(
     seed_span: usize,
     window_start: usize,
     window_end: usize,
+    max_mismatch_run: usize,
+    relock_span: usize,
 ) -> Option<Anchor> {
-    const RELOCK_SPAN: usize = 12;
-    const MAX_MISMATCH_RUN: usize = 3;
     const MAX_MISMATCHES: usize = 32;
     const MAX_MISMATCH_PERCENT: usize = 8;
 
@@ -697,7 +700,7 @@ fn build_paired_emms_anchor(
     let span_len = q_end - pair.q_left;
     let mut mismatches = 0usize;
     let mut mismatch_run = 0usize;
-    let mut exact_since_run = RELOCK_SPAN;
+    let mut exact_since_run = relock_span;
     let mut awaiting_relock = false;
     for offset in 0..span_len {
         let ref_index = match candidate.strand {
@@ -711,18 +714,18 @@ fn build_paired_emms_anchor(
         ) {
             mismatch_run = 0;
             exact_since_run = exact_since_run.saturating_add(1);
-            if exact_since_run >= RELOCK_SPAN {
+            if exact_since_run >= relock_span {
                 awaiting_relock = false;
             }
             continue;
         }
 
-        if mismatch_run == 0 && (awaiting_relock || exact_since_run < RELOCK_SPAN) {
+        if mismatch_run == 0 && (awaiting_relock || exact_since_run < relock_span) {
             return None;
         }
         mismatch_run += 1;
         mismatches += 1;
-        if mismatch_run > MAX_MISMATCH_RUN || mismatches > MAX_MISMATCHES {
+        if mismatch_run > max_mismatch_run || mismatches > MAX_MISMATCHES {
             return None;
         }
         exact_since_run = 0;
@@ -1157,6 +1160,8 @@ mod tests {
             24,
             0,
             reference.len(),
+            1,
+            24,
         )
         .expect("isolated SNP should retain the paired diagonal");
         assert_eq!((anchor.q_start, anchor.q_end), (16, 136));
@@ -1182,6 +1187,8 @@ mod tests {
             24,
             0,
             reference.len(),
+            1,
+            24,
         )
         .is_none());
     }
@@ -1204,6 +1211,8 @@ mod tests {
             24,
             0,
             reference.len(),
+            1,
+            24,
         )
         .expect("reverse paired span should be accepted");
         assert_eq!((anchor.ref_start, anchor.ref_end), (16, 136));

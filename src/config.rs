@@ -34,6 +34,10 @@ pub struct CandidateConfig {
     /// Experimental SNP-tolerant bridge between equal-distance minimizers.
     /// Exact paired staging remains the quality-verified default.
     pub paired_emms: bool,
+    /// Maximum contiguous mismatch run allowed in an EMMS bridge (default: 1).
+    pub emms_max_mismatch_run: usize,
+    /// Minimum exact matching bases required after a mismatch in an EMMS bridge (default: 24).
+    pub emms_relock_span: usize,
     /// Experimental cheap competitor pass for candidates below 70% of the
     /// top score. Full candidate refinement remains the default.
     pub tiered_candidates: bool,
@@ -91,6 +95,8 @@ impl Default for Config {
                 max_anchors_per_region: 512,
                 diagonal_tolerance: 2_000,
                 paired_emms: false,
+                emms_max_mismatch_run: 1,
+                emms_relock_span: 24,
                 tiered_candidates: false,
             },
             alignment: AlignmentConfig {

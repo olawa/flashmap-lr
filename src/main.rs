@@ -19,6 +19,8 @@ struct Options {
     quiet: bool,
     profile: bool,
     paired_emms: bool,
+    emms_max_mismatch_run: usize,
+    emms_relock_span: usize,
     tiered_candidates: bool,
 }
 
@@ -41,6 +43,8 @@ impl Options {
         let mut quiet = false;
         let mut profile = false;
         let mut paired_emms = false;
+        let mut emms_max_mismatch_run = 1;
+        let mut emms_relock_span = 24;
         let mut tiered_candidates = false;
 
         let mut positional = Vec::new();
@@ -75,6 +79,26 @@ impl Options {
                 }
                 "--paired-emms" => {
                     paired_emms = true;
+                }
+                "--emms" => {
+                    paired_emms = true;
+                    let val = next_value(&mut args, &argument)?;
+                    if let Some((m, r)) = val.split_once(',') {
+                        emms_max_mismatch_run = parse_positive(m.to_owned(), "emms mismatches")?;
+                        emms_relock_span = parse_positive(r.to_owned(), "emms relock")?;
+                    } else {
+                        emms_max_mismatch_run = parse_positive(val, "emms mismatches")?;
+                    }
+                }
+                "--emms-mismatch" => {
+                    paired_emms = true;
+                    emms_max_mismatch_run =
+                        parse_positive(next_value(&mut args, &argument)?, "emms-mismatch")?;
+                }
+                "--emms-relock" => {
+                    paired_emms = true;
+                    emms_relock_span =
+                        parse_positive(next_value(&mut args, &argument)?, "emms-relock")?;
                 }
                 "--tiered-candidates" => {
                     tiered_candidates = true;
@@ -149,6 +173,8 @@ impl Options {
             quiet,
             profile,
             paired_emms,
+            emms_max_mismatch_run,
+            emms_relock_span,
             tiered_candidates,
         })
     }
@@ -447,6 +473,8 @@ fn execute_mapping(
     config.worker_pool.workers = options.workers;
     config.worker_pool.chunk_size = options.chunk_size;
     config.candidates.paired_emms = options.paired_emms;
+    config.candidates.emms_max_mismatch_run = options.emms_max_mismatch_run;
+    config.candidates.emms_relock_span = options.emms_relock_span;
     config.candidates.tiered_candidates = options.tiered_candidates;
     let profile = ProfileReporter::default();
     let aligner = Aligner::new(reference, index, config)
@@ -722,6 +750,21 @@ mod tests {
         .unwrap();
         assert_eq!(options.reference, Some(PathBuf::from("reference.fasta")));
         assert_eq!(options.reads, PathBuf::from("reads.fastq"));
+    }
+
+    #[test]
+    fn parser_accepts_emms_flags() {
+        let options = Options::parse(
+            [
+                "rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "--emms", "1,24",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert!(options.paired_emms);
+        assert_eq!(options.emms_max_mismatch_run, 1);
+        assert_eq!(options.emms_relock_span, 24);
     }
 
     #[test]
