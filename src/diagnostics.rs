@@ -40,6 +40,14 @@ pub struct ReadDiagnostics {
     pub phase_repair_nanos: u64,
     pub approximate_gap_fallbacks: u32,
     pub adaptive_gap_escalations: u32,
+    /// Reads where rare seeds in both end windows agree on a diagonal.
+    pub near_exact_two_ended: u32,
+    /// Of those, reads where exactly one locus is consistent.
+    pub near_exact_unique_locus: u32,
+    /// Reads where only one end window contributed a usable seed.
+    pub near_exact_single_ended: u32,
+    /// Distinct consistent loci summed across reads, for an ambiguity mean.
+    pub near_exact_loci: u32,
     pub ambiguous_candidate_stops: u32,
     pub ambiguous_candidates_skipped: u32,
     pub query_seed_nanos: u64,

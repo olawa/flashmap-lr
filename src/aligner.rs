@@ -155,6 +155,15 @@ impl<'a> Aligner<'a> {
         let query_seed_hits = cache_query_seed_hits(&query_seeds, self.index);
         diagnostics.seed_cache_nanos = phase_nanos(phase_started);
 
+        if profiling {
+            probe_near_exact_potential(
+                read.sequence.len(),
+                &query_seeds,
+                &query_seed_hits,
+                &self.policy.probes,
+                &mut diagnostics,
+            );
+        }
         diagnostics.exact_fastpath_attempts = 1;
         if let Some((contig_id, chain)) = try_exact_unique_chain(
             read.sequence,
@@ -750,6 +759,126 @@ fn exact_bases_match(query: u8, reference: u8, strand: crate::Strand) -> bool {
                 (b'A', b'T') | (b'C', b'G') | (b'G', b'C') | (b'T', b'A')
             )
         }
+    }
+}
+
+/// Would a two-ended near-exact fast path fire on this read?
+///
+/// Measurement only: this decides nothing. It asks whether rare seeds drawn
+/// from the two end windows agree on a diagonal within the tolerance a real
+/// fast path would use, which is what bounds the work for a clean read in
+/// unique sequence. `try_exact_unique_chain` cannot answer that -- it demands
+/// a whole-read exact match and so never fires on HiFi.
+fn probe_near_exact_potential(
+    read_len: usize,
+    query_seeds: &[crate::QuerySeed],
+    hits: &CachedQuerySeedHits,
+    policy: &crate::config::ProbePolicy,
+    diagnostics: &mut ReadDiagnostics,
+) {
+    const MAX_SEEDS_PER_END: usize = 8;
+    const MAX_HITS_PER_SEED: usize = 32;
+    const DIAGONAL_TOLERANCE: i64 = 1_000;
+    // A locus is one diagonal band; two pairs that agree to within the
+    // tolerance are the same placement, not competing ones.
+    const LOCUS_BAND: i64 = 2 * DIAGONAL_TOLERANCE;
+
+    let window = policy.endpoint_window.min(read_len / 2);
+    if window == 0 || read_len < 2 * window {
+        return;
+    }
+    let right_window_start = read_len - window;
+
+    // Rarest first, mirroring how a fast path would spend its lookups.
+    let mut left: Vec<(usize, u32)> = Vec::new();
+    let mut right: Vec<(usize, u32)> = Vec::new();
+    for (index, seed) in query_seeds.iter().enumerate() {
+        let Some(lookup) = hits.lookup_at(index) else {
+            continue;
+        };
+        if !matches!(lookup.completeness, crate::HitCompleteness::Complete)
+            || lookup.reported_hits == 0
+            || lookup.reported_hits as usize > policy.endpoint_max_frequency
+        {
+            continue;
+        }
+        let position = seed.query_pos as usize;
+        if position < window {
+            left.push((index, lookup.reported_hits));
+        } else if position >= right_window_start {
+            right.push((index, lookup.reported_hits));
+        }
+    }
+    if left.is_empty() && right.is_empty() {
+        return;
+    }
+    if left.is_empty() || right.is_empty() {
+        diagnostics.near_exact_single_ended = 1;
+        return;
+    }
+    left.sort_unstable_by_key(|(_, frequency)| *frequency);
+    right.sort_unstable_by_key(|(_, frequency)| *frequency);
+    left.truncate(MAX_SEEDS_PER_END);
+    right.truncate(MAX_SEEDS_PER_END);
+
+    let mut loci: Vec<(crate::ContigId, crate::Strand, i64)> = Vec::new();
+    for &(left_index, _) in &left {
+        let left_seed = query_seeds[left_index];
+        for left_hit in hits.hits_at(left_index).iter().take(MAX_HITS_PER_SEED) {
+            let left_strand = effective_strand(left_seed.strand, left_hit.strand);
+            for &(right_index, _) in &right {
+                let right_seed = query_seeds[right_index];
+                let query_span = right_seed.query_pos as i64 - left_seed.query_pos as i64;
+                if query_span <= 0 {
+                    continue;
+                }
+                for right_hit in hits.hits_at(right_index).iter().take(MAX_HITS_PER_SEED) {
+                    if right_hit.contig != left_hit.contig
+                        || effective_strand(right_seed.strand, right_hit.strand) != left_strand
+                    {
+                        continue;
+                    }
+                    // On the reverse strand the read runs backwards along the
+                    // reference, so the expected span changes sign.
+                    let reference_span = match left_strand {
+                        crate::Strand::Forward => {
+                            right_hit.ref_pos as i64 - left_hit.ref_pos as i64
+                        }
+                        crate::Strand::Reverse => {
+                            left_hit.ref_pos as i64 - right_hit.ref_pos as i64
+                        }
+                    };
+                    if (reference_span - query_span).abs() > DIAGONAL_TOLERANCE {
+                        continue;
+                    }
+                    let band = left_hit.ref_pos as i64 / LOCUS_BAND;
+                    if !loci.iter().any(|(contig, strand, existing)| {
+                        *contig == left_hit.contig
+                            && *strand == left_strand
+                            && (*existing - band).abs() <= 1
+                    }) {
+                        loci.push((left_hit.contig, left_strand, band));
+                    }
+                }
+            }
+        }
+    }
+
+    if loci.is_empty() {
+        return;
+    }
+    diagnostics.near_exact_two_ended = 1;
+    diagnostics.near_exact_loci = saturating_u32(loci.len());
+    if loci.len() == 1 {
+        diagnostics.near_exact_unique_locus = 1;
+    }
+}
+
+fn effective_strand(query: crate::Strand, reference: crate::Strand) -> crate::Strand {
+    if query == reference {
+        crate::Strand::Forward
+    } else {
+        crate::Strand::Reverse
     }
 }
 

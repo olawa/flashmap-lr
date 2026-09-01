@@ -705,6 +705,10 @@ struct ProfileReporter {
     phase_repair_nanos: AtomicU64,
     approximate_gap_fallbacks: AtomicU64,
     adaptive_gap_escalations: AtomicU64,
+    near_exact_two_ended: AtomicU64,
+    near_exact_unique_locus: AtomicU64,
+    near_exact_single_ended: AtomicU64,
+    near_exact_loci: AtomicU64,
     ambiguous_candidate_stops: AtomicU64,
     ambiguous_candidates_skipped: AtomicU64,
     query_seed_nanos: AtomicU64,
@@ -804,6 +808,19 @@ impl DiagnosticsSink for ProfileReporter {
                 &self.adaptive_gap_escalations,
                 diagnostics.adaptive_gap_escalations as u64,
             ),
+            (
+                &self.near_exact_two_ended,
+                u64::from(diagnostics.near_exact_two_ended),
+            ),
+            (
+                &self.near_exact_unique_locus,
+                u64::from(diagnostics.near_exact_unique_locus),
+            ),
+            (
+                &self.near_exact_single_ended,
+                u64::from(diagnostics.near_exact_single_ended),
+            ),
+            (&self.near_exact_loci, u64::from(diagnostics.near_exact_loci)),
             (
                 &self.ambiguous_candidate_stops,
                 diagnostics.ambiguous_candidate_stops as u64,
@@ -928,6 +945,19 @@ impl ProfileReporter {
             self.phase_repairs.load(Ordering::Relaxed),
             self.phase_repair_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
             self.approximate_gap_fallbacks.load(Ordering::Relaxed),
+        );
+        let two_ended = self.near_exact_two_ended.load(Ordering::Relaxed);
+        let unique = self.near_exact_unique_locus.load(Ordering::Relaxed);
+        let single = self.near_exact_single_ended.load(Ordering::Relaxed);
+        let loci = self.near_exact_loci.load(Ordering::Relaxed);
+        eprintln!(
+            "  Near-exact potential: {two_ended} two-ended ({:.1}%), of which {unique} unique ({:.1}%)",
+            if reads > 0 { 100.0 * two_ended as f64 / reads as f64 } else { 0.0 },
+            if two_ended > 0 { 100.0 * unique as f64 / two_ended as f64 } else { 0.0 },
+        );
+        eprintln!(
+            "                        {single} single-ended only; {:.2} mean consistent loci",
+            if two_ended > 0 { loci as f64 / two_ended as f64 } else { 0.0 },
         );
         eprintln!(
             "  Fast escalation:      {} suspicious gaps; {} ambiguous reads ({} candidates skipped)",
