@@ -26,6 +26,7 @@ struct Options {
     mode: AlignmentMode,
     sort_memory: Option<String>,
     query_window: usize,
+    limit: Option<usize>,
 }
 
 impl Options {
@@ -53,6 +54,7 @@ impl Options {
         let mut mode = AlignmentMode::default();
         let mut sort_memory: Option<String> = None;
         let mut query_window = 0usize;
+        let mut limit: Option<usize> = None;
         let mut explicit_mode = None;
 
         let mut positional = Vec::new();
@@ -81,6 +83,9 @@ impl Options {
                 }
                 "--quiet" => {
                     quiet = true;
+                }
+                "-n" | "--limit" => {
+                    limit = Some(parse_positive(next_value(&mut args, &argument)?, "limit")?);
                 }
                 "--query-window" => {
                     query_window = parse_positive(next_value(&mut args, &argument)?, "query-window")?;
@@ -212,6 +217,7 @@ impl Options {
             mode,
             sort_memory,
             query_window,
+            limit,
         })
     }
 }
@@ -325,6 +331,7 @@ Options:\n\
   -c, --chunk-size N     Reads per worker batch (default: 10)\n\
       --quiet            Suppress progress indicators and summary\n\
       --profile          Print aggregate mapper phase timings\n\
+  -n, --limit N          Stop after mapping N reads (for benchmarking)\n\
       --query-window N   Minimizer window used to query the index, independent\n\
                          of the window it was built with (clamped up to it)\n\
       --sort-memory SIZE samtools sort memory PER THREAD for .bam output\n\
@@ -586,6 +593,9 @@ fn execute_mapping(
         .map_err(|error| CliError::Pool(error.to_string()))?;
 
     let reads = open_fastx(&options.reads).map_err(CliError::Reads)?;
+    // `usize::MAX` leaves the stream untouched, so the benchmarking path and
+    // the production path run the same iterator adapter.
+    let reads = reads.take(options.limit.unwrap_or(usize::MAX));
     let output = AlignmentSink::open_with_sort_memory(
         &options.output,
         options.workers,
@@ -1148,6 +1158,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(options_fast.mode, AlignmentMode::Fast);
+    }
+
+    #[test]
+    fn parser_accepts_limit_and_query_window() {
+        let options = Options::parse(
+            [
+                "rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "-n", "1000", "--query-window", "12",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(options.limit, Some(1000));
+        assert_eq!(options.query_window, 12);
+
+        let long = Options::parse(
+            ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "--limit", "25"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(long.limit, Some(25));
+
+        let none = Options::parse(
+            ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(none.limit, None);
+        assert_eq!(none.query_window, 0);
     }
 
     #[test]
