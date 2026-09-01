@@ -76,6 +76,35 @@ pub(crate) struct CachedQuerySeedHits {
     callback_counts: Vec<usize>,
 }
 
+impl CachedQuerySeedHits {
+    /// Seed span the cached hits were resolved with.
+    pub(crate) fn seed_span(&self) -> usize {
+        self.seed_span
+    }
+
+    /// Hit-list metadata for the `index`-th query seed of the cached read.
+    pub(crate) fn lookup_at(&self, index: usize) -> Option<SeedLookup> {
+        self.lookups.get(index).copied()
+    }
+
+    /// Reference hits retained for the `index`-th query seed.
+    ///
+    /// The slice is truncated at the per-seed retention cap; pair it with
+    /// [`Self::callback_count_at`] before treating it as a complete list.
+    pub(crate) fn hits_at(&self, index: usize) -> &[SeedHit] {
+        let (Some(&start), Some(&end)) = (self.offsets.get(index), self.offsets.get(index + 1))
+        else {
+            return &[];
+        };
+        &self.hits[start..end]
+    }
+
+    /// Number of hits the backend actually reported, ignoring the cap.
+    pub(crate) fn callback_count_at(&self, index: usize) -> usize {
+        self.callback_counts.get(index).copied().unwrap_or(0)
+    }
+}
+
 pub(crate) fn cache_query_seed_hits(
     query_seeds: &[QuerySeed],
     index: &dyn SeedIndex,
@@ -104,32 +133,96 @@ pub(crate) fn cache_query_seed_hits(
     cached
 }
 
+/// Local reference k-mer positions for one candidate window.
+///
+/// Stored as two parallel arrays sorted by `(code, position)` rather than a
+/// hash of per-code vectors: the window holds one entry per reference offset,
+/// so the map is rebuilt for every candidate and a bucket-per-k-mer layout
+/// costs thousands of small allocations and repeated rehashing per read.  The
+/// flat form is a single allocation and keeps each code's positions
+/// contiguous and in ascending order, which is what the scan below consumes.
 #[derive(Default)]
 struct LocalKmerMap {
-    buckets: HashMap<u64, Vec<u64>>,
+    codes: Vec<u64>,
+    positions: Vec<u64>,
 }
 
 impl LocalKmerMap {
     fn build(sequence: &[u8], window_start: usize, k: usize) -> Self {
-        let mut buckets = HashMap::new();
         if sequence.len() < k {
-            return Self { buckets };
+            return Self::default();
         }
 
-        for offset in 0..=sequence.len() - k {
-            if let Some(code) = encode_kmer(&sequence[offset..offset + k]) {
-                let bucket = buckets.entry(code).or_insert_with(Vec::new);
-                // Keep one extra position as a saturation marker.  The
-                // lookup below rejects buckets larger than 128, while this
-                // cap prevents a homopolymer/repeat window from retaining
-                // every occurrence and consuming unbounded per-candidate
-                // memory.
-                if bucket.len() < 129 {
-                    bucket.push((window_start + offset) as u64);
+        if k > 32 {
+            return Self::default();
+        }
+        // Roll the two-bit code across the window instead of re-encoding each
+        // k-mer from scratch: `encode_kmer` is O(k) per offset, so a rebuilt
+        // window costs one base decode per (offset, k) pair rather than one
+        // per base.  An ambiguous base resets the run, which reproduces
+        // `encode_kmer` returning `None` for any window containing it.
+        let mask = if k == 32 {
+            u64::MAX
+        } else {
+            (1u64 << (2 * k)) - 1
+        };
+        // A code occupies 2k bits, so when the remaining bits can address the
+        // window the (code, offset) pair packs into one u64 and the grouping
+        // sort moves half as many bytes with a plain integer comparison.
+        let offset_bits = 64 - 2 * k;
+        let capacity = sequence.len() - k + 1;
+        let packable = offset_bits >= 1 && (capacity as u128) <= (1u128 << offset_bits);
+        let offset_mask = if packable {
+            (1u64 << offset_bits) - 1
+        } else {
+            0
+        };
+
+        let mut packed: Vec<u64> = Vec::with_capacity(if packable { capacity } else { 0 });
+        let mut pairs: Vec<(u64, u64)> = Vec::with_capacity(if packable { 0 } else { capacity });
+        let mut code = 0u64;
+        let mut run = 0usize;
+        for (offset, &base) in sequence.iter().enumerate() {
+            match base_code(base) {
+                Some(bits) => {
+                    code = ((code << 2) | u64::from(bits)) & mask;
+                    run += 1;
+                }
+                None => {
+                    code = 0;
+                    run = 0;
+                }
+            }
+            if run >= k {
+                let start = offset + 1 - k;
+                if packable {
+                    packed.push((code << offset_bits) | start as u64);
+                } else {
+                    pairs.push((code, (window_start + start) as u64));
                 }
             }
         }
-        Self { buckets }
+
+        let mut codes;
+        let mut positions;
+        if packable {
+            packed.sort_unstable();
+            codes = Vec::with_capacity(packed.len());
+            positions = Vec::with_capacity(packed.len());
+            for entry in packed {
+                codes.push(entry >> offset_bits);
+                positions.push(window_start as u64 + (entry & offset_mask));
+            }
+        } else {
+            pairs.sort_unstable();
+            codes = Vec::with_capacity(pairs.len());
+            positions = Vec::with_capacity(pairs.len());
+            for (code, position) in pairs {
+                codes.push(code);
+                positions.push(position);
+            }
+        }
+        Self { codes, positions }
     }
 
     /// Return only non-repetitive local k-mer buckets.
@@ -138,10 +231,13 @@ impl LocalKmerMap {
     /// more than 128 entries. A sampled subset of a repetitive k-mer is not
     /// safe evidence for a placement, so retain that invariant here.
     fn positions(&self, code: u64) -> Option<&[u64]> {
-        self.buckets
-            .get(&code)
-            .filter(|positions| positions.len() <= 128)
-            .map(Vec::as_slice)
+        let start = self.codes.partition_point(|&entry| entry < code);
+        if start == self.codes.len() || self.codes[start] != code {
+            return None;
+        }
+        let end = start + self.codes[start..].partition_point(|&entry| entry == code);
+        let positions = &self.positions[start..end];
+        (positions.len() <= 128).then_some(positions)
     }
 }
 
@@ -161,14 +257,26 @@ struct PairedMinimizerPair {
     r_right: u64,
 }
 
+/// Accepted anchor extents, indexed by diagonal.
+///
+/// `contains_seed` only ever matches an interval on the seed's own diagonal,
+/// so the scan is keyed by diagonal instead of walking every accepted anchor.
+/// Every anchor inserted during one `find_anchors` call shares the candidate
+/// strand, so the insert-time diagonal uses the same convention the lookup does.
 #[derive(Default)]
 struct AnchorCoverage {
-    intervals: Vec<Interval>,
+    by_diagonal: HashMap<i64, Vec<Interval>>,
 }
 
 impl AnchorCoverage {
     fn insert(&mut self, anchor: Anchor) {
-        self.intervals.push(Interval {
+        let key = diagonal(
+            anchor.q_start,
+            anchor.ref_start,
+            anchor.ref_end,
+            anchor.strand,
+        );
+        self.by_diagonal.entry(key).or_default().push(Interval {
             q_start: anchor.q_start,
             q_end: anchor.q_end,
             ref_start: anchor.ref_start,
@@ -184,18 +292,14 @@ impl AnchorCoverage {
             return false;
         };
         let seed_diagonal = diagonal(q_start as u32, ref_start, ref_end, strand);
-        self.intervals.iter().any(|interval| {
-            let anchor_diagonal = diagonal(
-                interval.q_start,
-                interval.ref_start,
-                interval.ref_end,
-                strand,
-            );
+        let Some(intervals) = self.by_diagonal.get(&seed_diagonal) else {
+            return false;
+        };
+        intervals.iter().any(|interval| {
             q_start as u32 >= interval.q_start
                 && q_end as u32 <= interval.q_end
                 && ref_start >= interval.ref_start
                 && ref_end <= interval.ref_end
-                && seed_diagonal == anchor_diagonal
         })
     }
 }

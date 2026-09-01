@@ -1,5 +1,6 @@
 //! Sparse query-probe extraction.
 
+use crate::anchors::CachedQuerySeedHits;
 use crate::config::{ProbePolicy, ResolvedMapperPolicy};
 use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt};
 use crate::{segment_read, Config, QuerySeed, Read, SeedIndex, SeedLookup, Segment};
@@ -138,16 +139,24 @@ fn select_spaced_probes(
 /// The aligner already needs this list for the gapless fastpath and anchor
 /// cache. Reusing it avoids re-running minimizer extraction for every
 /// overlapping backbone segment and both endpoint windows.
+///
+/// Hit-list metadata is read from the shared per-read cache rather than
+/// re-resolved: `SeedIndex::lookup` and `SeedIndex::visit_hits` perform the
+/// same table probe, so a separate frequency pass would binary-search every
+/// query minimizer of the read a second time.
 pub(crate) fn extract_read_probes_from_seeds(
     read: Read<'_>,
     query_seeds: &[QuerySeed],
+    query_seed_hits: &CachedQuerySeedHits,
     index: &dyn SeedIndex,
     policy: &ProbePolicy,
 ) -> Vec<Probe> {
     let seed_span = index.seed_span();
     let mut ranked = Vec::with_capacity(query_seeds.len());
-    for &seed in query_seeds {
-        let lookup = index.lookup(&seed);
+    for (seed_index, &seed) in query_seeds.iter().enumerate() {
+        let Some(lookup) = query_seed_hits.lookup_at(seed_index) else {
+            continue;
+        };
         if !matches!(lookup.completeness, crate::HitCompleteness::Complete)
             || lookup.reported_hits == 0
             || lookup.reported_hits as usize
