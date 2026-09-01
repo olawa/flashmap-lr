@@ -1369,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_escalates_a_high_nm_bounded_gap_to_exact_islands() {
+    fn a_bounded_split_policy_escalates_a_high_nm_gap_to_exact_islands() {
         fn pseudo_sequence(length: usize, mut state: u32) -> Vec<u8> {
             const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
             (0..length)
@@ -1385,11 +1385,14 @@ mod tests {
         let mut query = reference[..120].to_vec();
         query.extend_from_slice(&insertion);
         query.extend_from_slice(&reference[120..]);
-        let policy = ResolvedMapperPolicy::from_mapper_config(&MapperConfig {
-            mode: crate::AlignmentMode::Fast,
-            ..MapperConfig::default()
-        })
-        .unwrap();
+        // No shipped tier bounds the recursive split any more -- gap
+        // resolution is a quality rule shared by Fast, Standard, and
+        // Sensitive. Build the bounded policy directly so the escalation
+        // path itself stays covered.
+        let mut policy = ResolvedMapperPolicy::from_mapper_config(&MapperConfig::default()).unwrap();
+        policy.gaps.recursive_split_max_depth = 2;
+        policy.gaps.recursive_split_max_gap = 4_096;
+        policy.gaps.recursive_split_trigger_nm_permille = 50;
         let mut diagnostics = crate::ReadDiagnostics::default();
         let mut ops = Vec::new();
 

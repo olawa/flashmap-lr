@@ -512,7 +512,11 @@ impl ResolvedMapperPolicy {
             segment_size: 2_048,
             segment_overlap: 512,
             max_probes_per_segment: 6,
-            max_total_hits_scanned: 8_000,
+            // The dominant Fast lever. In a unique region a read's probes
+            // resolve to a handful of hits and this cap never binds; inside
+            // centromeric satellite the same probes return thousands, and
+            // scanning them is what makes those reads expensive.
+            max_total_hits_scanned: if mode.is_fast() { 4_000 } else { 8_000 },
             max_probe_frequency: 40,
             endpoint_window: 1_000,
             endpoint_probes_per_end: 4,
@@ -522,16 +526,28 @@ impl ResolvedMapperPolicy {
             // Sensitive raises only the ceiling on how many loci may be
             // resolved; the clustering rule itself is shared with Standard so
             // the two tiers rank the same candidates the same way.
-            max_regions: if mode.is_sensitive() { 32 } else { 20 },
+            max_regions: match mode {
+                AlignmentMode::Fast => 8,
+                AlignmentMode::Standard => 20,
+                AlignmentMode::Sensitive => 32,
+            },
             min_supporting_segments: 2,
             diagonal_tolerance: 2_000,
         };
         let anchors = AnchorPolicy {
             anchor_k: 15,
             min_anchor_length: 30,
-            max_anchors_per_region: if mode.is_sensitive() { 1_024 } else { 512 },
+            max_anchors_per_region: match mode {
+                AlignmentMode::Fast => 256,
+                AlignmentMode::Standard => 512,
+                AlignmentMode::Sensitive => 1_024,
+            },
             reference_flank: 1_024,
-            max_local_kmer_hits: if mode.is_sensitive() { 16_000 } else { 8_000 },
+            max_local_kmer_hits: match mode {
+                AlignmentMode::Fast => 4_000,
+                AlignmentMode::Standard => 8_000,
+                AlignmentMode::Sensitive => 16_000,
+            },
             paired_emms: false,
             emms_max_mismatch_run: 1,
             emms_relock_span: 24,
@@ -549,7 +565,9 @@ impl ResolvedMapperPolicy {
             max_dist: (candidates.diagonal_tolerance.max(0) as u32)
                 .saturating_mul(20)
                 .max(10_000),
-            max_iter: 256,
+            // Chain DP look-back is quadratic in colinear anchors, which is
+            // where a satellite locus spends its time.
+            max_iter: if mode.is_fast() { 64 } else { 256 },
         };
         let structural = StructuralPolicy {
             min_bridge_indel: 2_000,
@@ -563,8 +581,13 @@ impl ResolvedMapperPolicy {
             max_supplementary_query_overlap_fraction: 0.20,
             max_supplementary_alignments: 4,
         };
-        let gaps = if mode.resolves_full_depth() {
-            GapPolicy {
+        // Gap resolution, terminal rescue, normalization, and scoring are
+        // quality rules, not search budgets. All three tiers resolve a gap
+        // the same way; they differ only in how much of the read's seed and
+        // chain space they are willing to search to find the gap in the
+        // first place. Fast giving up DP depth cost it aligned bases in
+        // exactly the unique regions it is meant to be correct in.
+        let gaps = GapPolicy {
                 bridge_flank: 256,
                 bridge_max_gap: 5_000,
                 small_gap_dp_max: 1_024,
@@ -580,38 +603,10 @@ impl ResolvedMapperPolicy {
                 recursive_split_trigger_nm_permille: 0,
                 flank_max: 64,
                 flank_min: 16,
-            }
-        } else {
-            GapPolicy {
-                bridge_flank: 256,
-                bridge_max_gap: 5_000,
-                small_gap_dp_max: 512,
-                small_gap_dp_delta_max: 64,
-                medium_gap_dp_max: 1_536,
-                medium_gap_dp_delta_max: 128,
-                recursive_split_k: 13,
-                recursive_split_min_gap: 64,
-                // Fast retries only suspicious DP results and unresolved
-                // bounded gaps. Two levels are enough to re-lock across a
-                // local phase shift without paying Sensitive's full search.
-                recursive_split_max_depth: 2,
-                recursive_split_max_gap: 4_096,
-                recursive_split_trigger_nm_permille: 50,
-                flank_max: 64,
-                flank_min: 16,
-            }
         };
         let terminal = TerminalPolicy {
             max_dp_query: 300,
-            max_recursive_query: if mode.resolves_full_depth() {
-                if mode.is_sensitive() {
-                    4_000
-                } else {
-                    2_500
-                }
-            } else {
-                300
-            },
+            max_recursive_query: if mode.is_sensitive() { 4_000 } else { 2_500 },
             reference_slack: 256,
             max_reference_window: 4_096,
             max_nm_rate: 0.15,
@@ -641,10 +636,10 @@ impl ResolvedMapperPolicy {
         let work_budget = WorkBudget {
             // Fast retains the existing eight-candidate ceiling. Sensitive
             // can inspect the complete resolved candidate list.
-            max_candidates: if mode.resolves_full_depth() {
-                candidates.max_regions
+            max_candidates: if mode.is_fast() {
+                4
             } else {
-                8
+                candidates.max_regions
             },
             competitive_score_fraction: 0.40,
             full_search_score_fraction: 0.0,
@@ -759,26 +754,34 @@ mod tests {
     }
 
     #[test]
-    fn resolved_modes_share_evidence_and_scoring_but_bound_work_differently() {
-        let fast = ResolvedMapperPolicy::from_mapper_config(&MapperConfig {
-            mode: AlignmentMode::Fast,
-            ..MapperConfig::default()
-        })
-        .unwrap();
-        let sensitive = ResolvedMapperPolicy::from_mapper_config(&MapperConfig::default()).unwrap();
+    fn tiers_share_every_quality_rule_and_differ_only_in_search_budget() {
+        let runtime = RuntimeConfig::default();
+        let fast = ResolvedMapperPolicy::for_mode(AlignmentMode::Fast, runtime.clone());
+        let standard = ResolvedMapperPolicy::for_mode(AlignmentMode::Standard, runtime.clone());
+        let sensitive = ResolvedMapperPolicy::for_mode(AlignmentMode::Sensitive, runtime);
 
-        assert_eq!(fast.probes, sensitive.probes);
-        assert_eq!(fast.anchors, sensitive.anchors);
-        assert_eq!(fast.scoring, sensitive.scoring);
-        assert_ne!(fast.gaps, sensitive.gaps);
-        assert_ne!(fast.work_budget, sensitive.work_budget);
-        assert_eq!(fast.gaps.recursive_split_max_depth, 2);
-        assert!(fast.gaps.recursive_split_trigger_nm_permille > 0);
-        assert_eq!(sensitive.gaps.recursive_split_trigger_nm_permille, 0);
-        assert_eq!(fast.normalization, sensitive.normalization);
-        assert_eq!(fast.terminal.max_recursive_query, 300);
-        assert!(sensitive.gaps.recursive_split_max_depth > 0);
-        assert!(sensitive.terminal.max_recursive_query > fast.terminal.max_recursive_query);
+        // How a gap, terminal, or base is resolved does not depend on the
+        // tier. Fast trading DP depth for speed cost it aligned bases in the
+        // unique regions it is meant to be correct in.
+        assert_eq!(fast.gaps, standard.gaps);
+        assert_eq!(fast.terminal, standard.terminal);
+        assert_eq!(fast.normalization, standard.normalization);
+        assert_eq!(fast.scoring, standard.scoring);
+        assert_eq!(fast.gaps.recursive_split_max_depth, 8);
+        assert_eq!(fast.gaps.recursive_split_trigger_nm_permille, 0);
+
+        // Tiers differ in how much of the seed and chain space they search.
+        assert!(fast.probes.max_total_hits_scanned < standard.probes.max_total_hits_scanned);
+        // The probe schedule itself is shared: cutting probes per segment
+        // thinned the backbone in unique loci too, where it is not the cost.
+        assert_eq!(
+            fast.probes.max_probes_per_segment,
+            standard.probes.max_probes_per_segment
+        );
+        assert!(fast.candidates.max_regions < standard.candidates.max_regions);
+        assert!(fast.anchors.max_local_kmer_hits < standard.anchors.max_local_kmer_hits);
+        assert!(fast.chaining.max_iter < standard.chaining.max_iter);
+        assert!(fast.work_budget.max_candidates < standard.work_budget.max_candidates);
     }
 
     #[test]
@@ -800,8 +803,9 @@ mod tests {
         let standard = ResolvedMapperPolicy::for_mode(AlignmentMode::Standard, runtime.clone());
         let sensitive = ResolvedMapperPolicy::for_mode(AlignmentMode::Sensitive, runtime);
 
-        // Standard carries the resolution Fast gives up.
-        assert_ne!(fast.gaps, standard.gaps);
+        // Fast is bounded by search budget, not by resolution.
+        assert_eq!(fast.gaps, standard.gaps);
+        assert!(fast.work_budget.max_candidates < standard.work_budget.max_candidates);
         assert_eq!(standard.gaps.recursive_split_max_depth, 8);
 
         // Sensitive keeps every Standard rule and only raises ceilings.
