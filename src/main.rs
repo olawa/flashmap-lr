@@ -18,7 +18,8 @@ struct Options {
     index: Option<PathBuf>,
     reads: PathBuf,
     output: PathBuf,
-    workers: usize,
+    threads: usize,
+    workers: Option<usize>,
     chunk_size: usize,
     quiet: bool,
     profile: bool,
@@ -36,6 +37,25 @@ struct Options {
 }
 
 impl Options {
+    /// Worker threads to actually start.
+    ///
+    /// `-w` names them outright, which is what a like-for-like comparison
+    /// across machines needs. Otherwise they come out of the `-t` budget with
+    /// a share held back for a decompressor that would otherwise be starved
+    /// by the very workers it feeds.
+    fn resolved_workers(&self, decompressing: bool) -> usize {
+        if let Some(workers) = self.workers {
+            return workers;
+        }
+        if decompressing {
+            self.threads
+                .saturating_sub(decompressor_threads(self.threads))
+                .max(1)
+        } else {
+            self.threads
+        }
+    }
+
     fn parse<I>(args: I) -> Result<Self, CliError>
     where
         I: IntoIterator<Item = String>,
@@ -46,10 +66,13 @@ impl Options {
         let mut index = None;
         let mut reads = None;
         let mut output = PathBuf::from("-");
-        let mut workers = std::thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(1)
-            .max(1);
+        // `-t` is the total budget the mapper may spend, including anything
+        // it spawns. `-w` names the worker count directly, which is what a
+        // like-for-like comparison across machines needs.
+        let mut threads = std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1);
+        let mut workers: Option<usize> = None;
         let mut chunk_size = MapperConfig::default().runtime.chunk_size;
         let mut quiet = false;
         let mut profile = false;
@@ -84,8 +107,11 @@ impl Options {
                 "-o" | "--output" => {
                     output = PathBuf::from(next_value(&mut args, &argument)?);
                 }
-                "-t" | "--threads" | "-w" | "--workers" => {
-                    workers = parse_positive(next_value(&mut args, &argument)?, "workers")?;
+                "-t" | "--threads" => {
+                    threads = parse_positive(next_value(&mut args, &argument)?, "threads")?;
+                }
+                "-w" | "--workers" => {
+                    workers = Some(parse_positive(next_value(&mut args, &argument)?, "workers")?);
                 }
                 "-c" | "--chunk-size" => {
                     chunk_size = parse_positive(next_value(&mut args, &argument)?, "chunk-size")?;
@@ -225,6 +251,7 @@ impl Options {
             index,
             reads: reads.ok_or(CliError::MissingOption("-q/--query/--reads"))?,
             output,
+            threads,
             workers,
             chunk_size,
             quiet,
@@ -348,8 +375,10 @@ Options:\n\
                          FASTA or FASTQ reads [required unless positional]\n\
   -o, --output PATH      SAM/BAM output path, or - for stdout (default: -)\n\
                          (automatically sorted and indexed when ending in .bam)\n\
-  -t, -w, --threads, --workers N\n\
-                         Parallel mapper worker threads (default: available CPUs)\n\
+  -t, --threads N        Total threads the mapper may use, including anything\n\
+                         it spawns (default: available CPUs)\n\
+  -w, --workers N        Mapper worker threads outright, ignoring the budget\n\
+                         (default: derived from -t)\n\
   -c, --chunk-size N     Reads per worker batch (default: 10)\n\
       --quiet            Suppress progress indicators and summary\n\
       --profile          Print aggregate mapper phase timings\n\
@@ -585,13 +614,28 @@ fn execute_mapping(
     metadata: Vec<(rs_lra::ContigId, String, usize)>,
     options: &Options,
 ) -> Result<(), CliError> {
+    // A spawned decompressor runs on the same cores as the workers, so it has
+    // to come out of the thread budget rather than be added on top of it.
+    // Oversubscribing starves it: it then cannot feed the workers it is
+    // competing with, and total throughput drops.
+    let decompressor = resolve_decompressor(&options.reads, options.decompress_with.as_deref());
+    let runtime = RuntimeConfig {
+        workers: options.resolved_workers(decompressor.is_some()),
+        chunk_size: options.chunk_size,
+        reader_batch_size: None,
+    };
+    if !options.quiet && options.workers.is_none() {
+        let reserved = options.threads.saturating_sub(runtime.workers);
+        if reserved > 0 {
+            eprintln!(
+                "[rs-lra] gzip input: {} of {} threads reserved for decompression",
+                reserved, options.threads
+            );
+        }
+    }
     let mapper_config = MapperConfig {
         mode: options.mode,
-        runtime: RuntimeConfig {
-            workers: options.workers,
-            chunk_size: options.chunk_size,
-            reader_batch_size: None,
-        },
+        runtime: runtime.clone(),
     };
     // Experimental phase switches remain an explicit compatibility escape
     // hatch for benchmark/debug runs.  The normal CLI path always constructs
@@ -627,26 +671,6 @@ fn execute_mapping(
     } else {
         AlignerConfig::Mapper(mapper_config)
     };
-    // A spawned decompressor runs on the same cores as the workers, so it has
-    // to come out of the thread budget rather than be added on top of it.
-    // Oversubscribing starves it: it then cannot feed the workers it is
-    // competing with, and total throughput drops.
-    let decompressor = resolve_decompressor(&options.reads, options.decompress_with.as_deref());
-    let mut runtime = RuntimeConfig {
-        workers: options.workers,
-        chunk_size: options.chunk_size,
-        reader_batch_size: None,
-    };
-    if decompressor.is_some() {
-        let reserved = decompressor_threads(options.workers);
-        runtime.workers = options.workers.saturating_sub(reserved).max(1);
-        if !options.quiet && reserved > 0 {
-            eprintln!(
-                "[rs-lra] gzip input: {} of {} threads reserved for decompression",
-                reserved, options.workers
-            );
-        }
-    }
 
     let profile = ProfileReporter::default();
     let aligner = Aligner::new(reference, index, aligner_config)
@@ -666,7 +690,7 @@ fn execute_mapping(
     let reads = reads.take(options.limit.unwrap_or(usize::MAX));
     let output = AlignmentSink::open_with_sort_memory(
         &options.output,
-        options.workers,
+        options.threads,
         options.sort_memory.as_deref(),
     )
     .map_err(CliError::Output)?;
@@ -1153,7 +1177,7 @@ mod tests {
         assert_eq!(options.index, None);
         assert_eq!(options.reads, PathBuf::from("reads.fq"));
         assert_eq!(options.output, PathBuf::from("out.sam"));
-        assert_eq!(options.workers, 3);
+        assert_eq!(options.workers, Some(3));
         assert_eq!(options.chunk_size, 17);
         assert!(!options.quiet);
     }
@@ -1181,7 +1205,7 @@ mod tests {
         .unwrap();
         assert_eq!(options.index, Some(PathBuf::from("ref.fmi")));
         assert_eq!(options.reads, PathBuf::from("reads.fq"));
-        assert_eq!(options.workers, 18);
+        assert_eq!(options.threads, 18);
         assert_eq!(options.output, PathBuf::from("out.bam"));
         assert_eq!(options.chunk_size, 5);
     }
@@ -1196,7 +1220,7 @@ mod tests {
         .unwrap();
         assert_eq!(options.index, Some(PathBuf::from("ref.fmi")));
         assert_eq!(options.reads, PathBuf::from("reads.fq"));
-        assert_eq!(options.workers, 8);
+        assert_eq!(options.workers, Some(8));
     }
 
     #[test]
@@ -1217,7 +1241,7 @@ mod tests {
         .unwrap();
         assert_eq!(options.index, Some(PathBuf::from("GRCh38.fmi")));
         assert_eq!(options.reads, PathBuf::from("reads.fastq"));
-        assert_eq!(options.workers, 16);
+        assert_eq!(options.threads, 16);
         assert_eq!(options.output, PathBuf::from("out.bam"));
     }
 
@@ -1310,6 +1334,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(options_fast.mode, AlignmentMode::Fast);
+    }
+
+    #[test]
+    fn workers_flag_overrides_the_thread_budget() {
+        let budget = Options::parse(
+            ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "-t", "48"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(budget.threads, 48);
+        assert_eq!(budget.workers, None);
+        // Uncompressed input spends the whole budget on mapping.
+        assert_eq!(budget.resolved_workers(false), 48);
+        // Compressed input holds a share back for the decompressor.
+        assert_eq!(budget.resolved_workers(true), 40);
+
+        let explicit = Options::parse(
+            ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "-t", "48", "-w", "18"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(explicit.threads, 48);
+        assert_eq!(explicit.workers, Some(18));
+        // `-w` is taken literally either way, which is what makes a
+        // cross-machine comparison like-for-like.
+        assert_eq!(explicit.resolved_workers(false), 18);
+        assert_eq!(explicit.resolved_workers(true), 18);
     }
 
     #[test]
