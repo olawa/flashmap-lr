@@ -299,6 +299,7 @@ impl MinimizerIndex {
         }
         let file = File::open(path).map_err(MinimizerIndexError::Io)?;
         let mmap = unsafe { Mmap::map(&file).map_err(MinimizerIndexError::Io)? };
+        advise_random_access(&mmap);
         let mmap = Arc::new(mmap);
         if mmap.len() < FMI_HEADER_LEN {
             return Err(MinimizerIndexError::Format(
@@ -736,6 +737,33 @@ impl SeedIndex for MinimizerIndex {
             SeedLookup::absent()
         }
     }
+}
+
+/// Tell the kernel how this mapping is actually used.
+///
+/// Seed resolution touches the hash, range, and hit tables at unrelated
+/// offsets, several times per query minimizer, so the mapping is read almost
+/// purely at random. Two things follow.
+///
+/// `MADV_RANDOM` suppresses readahead. The default fault-around expands every
+/// miss into a surrounding window, which for this pattern is mostly wasted
+/// I/O and page-cache pressure while the index warms.
+///
+/// `MADV_HUGEPAGE` matters more, and only on Linux. A whole-genome index is
+/// tens of gigabytes, so with 4 KiB pages its page-table footprint runs to
+/// millions of entries while a core's L2 TLB covers a few megabytes -- close
+/// to a TLB miss and page walk on every lookup. Backing the mapping with 2 MiB
+/// pages cuts the entry count by 512x. Platforms with a larger base page (macOS
+/// on Apple silicon uses 16 KiB) already avoid the worst of this, which is why
+/// the effect is expected to be Linux-specific.
+///
+/// Both calls are advisory: a kernel without transparent huge pages, or a
+/// filesystem that refuses the hint, simply ignores it, so a failure here is
+/// not an error.
+fn advise_random_access(mmap: &Mmap) {
+    let _ = mmap.advise(memmap2::Advice::Random);
+    #[cfg(target_os = "linux")]
+    let _ = mmap.advise(memmap2::Advice::HugePage);
 }
 
 fn validate_metadata(metadata: &FmiMetadata) -> Result<(), MinimizerIndexError> {
