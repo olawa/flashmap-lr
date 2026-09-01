@@ -34,6 +34,9 @@ const SECTION_PRIMARY_SEED_RANGES: u32 = 14;
 
 const INLINE_BIT: u64 = 1 << 63;
 const CAPPED_BIT: u64 = 1 << 48;
+/// Strand flag of an inline entry's single hit.  Deliberately the same bit as
+/// [`CAPPED_BIT`], which only applies to out-of-line entries.
+const INLINE_RC_BIT: u64 = 1 << 48;
 const FINGERPRINT_SHIFT: u32 = 49;
 const FINGERPRINT_MASK: u64 = (1 << 14) - 1;
 const RC_BIT: u64 = 1 << 15;
@@ -468,29 +471,39 @@ impl MinimizerIndex {
             .collect()
     }
 
+    /// Decode the single hit an inline range word carries.
+    ///
+    /// Bit 48 is this hit's strand flag.  It aliases `CAPPED_BIT`, which is
+    /// only meaningful for out-of-line entries, so every reader of an inline
+    /// word must go through here rather than testing the bit directly.
+    #[inline]
+    fn inline_hit(&self, range: u64) -> Option<SeedHit> {
+        let ref_id = ((range >> 32) & 0xffff) as u32;
+        let ref_pos = range as u32;
+        let is_rc = range & INLINE_RC_BIT != 0;
+        if (ref_id as usize) >= self.ref_lengths.len()
+            || (ref_pos as u64)
+                .checked_add(self.k as u64)
+                .is_none_or(|end| end > self.ref_lengths[ref_id as usize] as u64)
+        {
+            return None;
+        }
+        Some(SeedHit {
+            contig: ContigId(ref_id),
+            ref_pos: ref_pos as u64,
+            strand: if is_rc {
+                Strand::Reverse
+            } else {
+                Strand::Forward
+            },
+        })
+    }
+
     #[inline]
     fn range_hits(&self, range: u64, visit: &mut dyn FnMut(SeedHit)) -> Option<(u32, bool)> {
         if range & INLINE_BIT != 0 {
-            let ref_id = ((range >> 32) & 0xffff) as u32;
-            let ref_pos = range as u32;
-            let is_rc = range & (1 << 48) != 0;
-            if (ref_id as usize) < self.ref_lengths.len()
-                && (ref_pos as u64)
-                    .checked_add(self.k as u64)
-                    .is_some_and(|end| end <= self.ref_lengths[ref_id as usize] as u64)
-            {
-                visit(SeedHit {
-                    contig: ContigId(ref_id),
-                    ref_pos: ref_pos as u64,
-                    strand: if is_rc {
-                        Strand::Reverse
-                    } else {
-                        Strand::Forward
-                    },
-                });
-                return Some((1, false));
-            }
-            return None;
+            visit(self.inline_hit(range)?);
+            return Some((1, false));
         }
         let start = (range & 0xffff_ffff) as usize;
         let len = ((range >> 32) & 0xffff) as usize;
@@ -632,11 +645,20 @@ impl SeedIndex for MinimizerIndex {
             if (range >> FINGERPRINT_SHIFT) & FINGERPRINT_MASK != code & FINGERPRINT_MASK {
                 continue;
             }
-            let stored = if range & INLINE_BIT != 0 {
-                1
-            } else {
-                ((range >> 32) & 0xffff) as u32
-            };
+            if range & INLINE_BIT != 0 {
+                // An inline entry stores its single hit in the range word
+                // itself, and bit 48 is that hit's strand flag -- the same bit
+                // `CAPPED_BIT` occupies for out-of-line entries.  Testing the
+                // capped marker here would report every unique reverse-strand
+                // seed as `Sampled`, which is exactly the evidence probe
+                // selection refuses to build a candidate from.  A single
+                // inlined hit is never a capped bucket.
+                return self.inline_hit(range).map_or_else(
+                    SeedLookup::absent,
+                    |_| SeedLookup::complete(1),
+                );
+            }
+            let stored = ((range >> 32) & 0xffff) as u32;
             if stored == 0 {
                 return SeedLookup::absent();
             }
@@ -1351,6 +1373,43 @@ mod tests {
         assert_eq!(reverse_lookup, SeedLookup::complete(1));
         assert_eq!(reverse_hits.len(), 1);
         assert_ne!(reverse_seed.strand, reverse_hits[0].strand);
+        fs::remove_file(path).expect("remove fixture index");
+    }
+
+    #[test]
+    fn lookup_agrees_with_visit_hits_including_inline_reverse_strand_seeds() {
+        // `CAPPED_BIT` and an inline entry's strand flag are the same bit, so
+        // a `lookup` that tests the capped marker on an inline word reports
+        // every unique reverse-strand seed as `Sampled`.  Probe selection
+        // refuses to build a candidate from sampled evidence, so that silently
+        // discarded the rarest seeds in the read.  The two entry points must
+        // agree for every seed.
+        let path = fixture_path("lookup-agreement");
+        let reference = write_minimizer_fixture(&path);
+        let index = MinimizerIndex::open(&path).expect("open generated v13 fixture");
+
+        let seeds = index.query_seeds(&reference);
+        assert!(seeds.len() >= 2);
+        let mut reverse_inline_seeds = 0usize;
+        for seed in &seeds {
+            let mut hits = Vec::new();
+            let visited = index.visit_hits(seed, &mut |hit| hits.push(hit));
+            assert_eq!(
+                index.lookup(seed),
+                visited,
+                "lookup and visit_hits disagree for seed at {}",
+                seed.query_pos
+            );
+            if hits.len() == 1 && hits[0].strand == Strand::Reverse {
+                reverse_inline_seeds += 1;
+                assert_eq!(index.lookup(seed), SeedLookup::complete(1));
+            }
+        }
+        assert!(
+            reverse_inline_seeds > 0,
+            "fixture must exercise at least one unique reverse-strand seed"
+        );
+
         fs::remove_file(path).expect("remove fixture index");
     }
 
