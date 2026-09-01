@@ -24,6 +24,7 @@ struct Options {
     emms_relock_span: usize,
     tiered_candidates: bool,
     mode: AlignmentMode,
+    sort_memory: Option<String>,
 }
 
 impl Options {
@@ -49,6 +50,7 @@ impl Options {
         let mut emms_relock_span = 24;
         let mut tiered_candidates = false;
         let mut mode = AlignmentMode::default();
+        let mut sort_memory: Option<String> = None;
         let mut explicit_mode = None;
 
         let mut positional = Vec::new();
@@ -77,6 +79,9 @@ impl Options {
                 }
                 "--quiet" => {
                     quiet = true;
+                }
+                "--sort-memory" => {
+                    sort_memory = Some(next_value(&mut args, &argument)?);
                 }
                 "--profile" => {
                     profile = true;
@@ -200,6 +205,7 @@ impl Options {
             emms_relock_span,
             tiered_candidates,
             mode,
+            sort_memory,
         })
     }
 }
@@ -313,6 +319,8 @@ Options:\n\
   -c, --chunk-size N     Reads per worker batch (default: 10)\n\
       --quiet            Suppress progress indicators and summary\n\
       --profile          Print aggregate mapper phase timings\n\
+      --sort-memory SIZE samtools sort memory PER THREAD for .bam output\n\
+                         (e.g. 768M, 2G); default is samtools' own 768M\n\
       --fast             Bounded work budget for high throughput\n\
       --standard         Deep DP gap bounds and full STR left-alignment (default)\n\
       --sensitive        Standard plus a wider candidate and DP ceiling\n\
@@ -564,7 +572,12 @@ fn execute_mapping(
         .map_err(|error| CliError::Pool(error.to_string()))?;
 
     let reads = open_fastx(&options.reads).map_err(CliError::Reads)?;
-    let output = AlignmentSink::open(&options.output, options.workers).map_err(CliError::Output)?;
+    let output = AlignmentSink::open_with_sort_memory(
+        &options.output,
+        options.workers,
+        options.sort_memory.as_deref(),
+    )
+    .map_err(CliError::Output)?;
     let mut writer = SamWriter::from_contigs(output, metadata)
         .map_err(|error| CliError::Pool(error.to_string()))?;
     let mut progress = ProgressReporter::new(options.quiet);

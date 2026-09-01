@@ -22,8 +22,7 @@ use super::prepare::{count_gap_opens, unlock_register_shifted_str_anchors, Orien
 use crate::config::{
     GapPolicy, NormalizationPolicy, ResolvedMapperPolicy, ScoringPolicy, TerminalPolicy,
 };
-use crate::dna::encode_kmer;
-use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt};
+use crate::dna::{base_code, encode_kmer};
 use crate::{
     align_full, Alignment, AlignmentError, Chain, Cigar, CigarError, CigarOp, Config, Contig, Read,
 };
@@ -873,27 +872,71 @@ fn find_exact_island_chain(
         return search;
     }
 
-    let mut r_kmers = HashMap::<u64, Vec<u32>>::new();
-    for i in 0..=r_gap_len - k {
-        if let Some(val) = encode_kmer(&r_gap_seq[i..i + k]) {
-            let bucket = r_kmers.entry(val).or_default();
-            if bucket.len() < 17 {
-                bucket.push(i as u32);
+    // Flat, sorted (code, position) pairs rather than a hash of per-code
+    // vectors: this table is rebuilt for every gap, so a bucket-per-k-mer
+    // layout costs one small allocation per distinct k-mer plus rehashing.
+    // The code is rolled across the slice instead of re-encoding each k-mer,
+    // which is O(k) per offset.
+    let mask = if k == 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * k)) - 1
+    };
+    let mut r_kmers: Vec<(u64, u32)> = Vec::with_capacity(r_gap_len - k + 1);
+    let mut code = 0u64;
+    let mut run = 0usize;
+    for (offset, &base) in r_gap_seq.iter().enumerate() {
+        match base_code(base) {
+            Some(bits) => {
+                code = ((code << 2) | u64::from(bits)) & mask;
+                run += 1;
+            }
+            None => {
+                code = 0;
+                run = 0;
             }
         }
+        if run >= k {
+            r_kmers.push((code, (offset + 1 - k) as u32));
+        }
     }
-    search.max_bucket = r_kmers.values().map(Vec::len).max().unwrap_or(0);
-    search.rejected_buckets = r_kmers.values().filter(|bucket| bucket.len() == 17).count();
+    r_kmers.sort_unstable();
+
+    let bucket_range = |value: u64| -> &[(u64, u32)] {
+        let start = r_kmers.partition_point(|&(entry, _)| entry < value);
+        if start == r_kmers.len() || r_kmers[start].0 != value {
+            return &[];
+        }
+        let end = start + r_kmers[start..].partition_point(|&(entry, _)| entry == value);
+        &r_kmers[start..end]
+    };
+
+    let mut longest_bucket = 0usize;
+    let mut rejected = 0usize;
+    let mut index = 0usize;
+    while index < r_kmers.len() {
+        let value = r_kmers[index].0;
+        let end = index + r_kmers[index..].partition_point(|&(entry, _)| entry == value);
+        let len = end - index;
+        // The previous map stored at most 17 positions per code and treated a
+        // full bucket as the rejection marker; preserve both counts exactly.
+        longest_bucket = longest_bucket.max(len.min(17));
+        if len >= 17 {
+            rejected += 1;
+        }
+        index = end;
+    }
+    search.max_bucket = longest_bucket;
+    search.rejected_buckets = rejected;
 
     let mut matches = Vec::new();
     let query_step = (max_gap / 512).max(1);
     for i in (0..=q_gap_len - k).step_by(query_step) {
         if let Some(val) = encode_kmer(&q_gap_seq[i..i + k]) {
-            if let Some(r_poses) = r_kmers.get(&val) {
-                if r_poses.len() <= 16 {
-                    for &r_pos in r_poses {
-                        matches.push((i as u32, r_pos));
-                    }
+            let bucket = bucket_range(val);
+            if !bucket.is_empty() && bucket.len() <= 16 {
+                for &(_, r_pos) in bucket {
+                    matches.push((i as u32, r_pos));
                 }
             }
         }

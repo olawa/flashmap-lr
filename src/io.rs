@@ -684,6 +684,19 @@ pub enum AlignmentSink {
 
 impl AlignmentSink {
     pub fn open(path: &Path, threads: usize) -> io::Result<Self> {
+        Self::open_with_sort_memory(path, threads, None)
+    }
+
+    /// Open an output sink, optionally bounding `samtools sort` memory.
+    ///
+    /// `sort_memory` is passed through as `-m`, which samtools applies **per
+    /// sort thread**. Left unset, samtools uses its own 768 MiB default, so a
+    /// 48-thread run reserves roughly 36 GiB before it spills.
+    pub fn open_with_sort_memory(
+        path: &Path,
+        threads: usize,
+        sort_memory: Option<&str>,
+    ) -> io::Result<Self> {
         if path == Path::new("-") {
             Ok(Self::Stdout(io::BufWriter::new(io::stdout())))
         } else if path
@@ -692,7 +705,11 @@ impl AlignmentSink {
             .map(|ext| ext.eq_ignore_ascii_case("bam"))
             .unwrap_or(false)
         {
-            Ok(Self::SamtoolsSort(SamtoolsSortSink::new(path, threads)?))
+            Ok(Self::SamtoolsSort(SamtoolsSortSink::new(
+                path,
+                threads,
+                sort_memory,
+            )?))
         } else {
             let file = File::create(path)?;
             Ok(Self::File(io::BufWriter::new(file)))
@@ -737,13 +754,22 @@ pub struct SamtoolsSortSink {
 }
 
 impl SamtoolsSortSink {
-    pub fn new(output_path: &Path, threads: usize) -> io::Result<Self> {
+    pub fn new(
+        output_path: &Path,
+        threads: usize,
+        sort_memory: Option<&str>,
+    ) -> io::Result<Self> {
         let threads = threads.max(1);
         let mut command = Command::new("samtools");
         command
             .arg("sort")
             .arg("-@")
-            .arg(threads.to_string())
+            .arg(threads.to_string());
+        if let Some(memory) = sort_memory {
+            // samtools applies -m per sort thread.
+            command.arg("-m").arg(memory);
+        }
+        command
             .arg("-O")
             .arg("BAM")
             .arg("-o")
