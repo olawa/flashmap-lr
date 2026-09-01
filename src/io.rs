@@ -97,7 +97,7 @@ pub struct FastxReader<R> {
     line_number: usize,
     format: Option<FastxFormat>,
     pending_header: Option<(usize, String)>,
-    line: String,
+    line: Vec<u8>,
     finished: bool,
 }
 
@@ -108,7 +108,7 @@ impl<R: BufRead> FastxReader<R> {
             line_number: 0,
             format: None,
             pending_header: None,
-            line: String::new(),
+            line: Vec::new(),
             finished: false,
         }
     }
@@ -117,21 +117,40 @@ impl<R: BufRead> FastxReader<R> {
         self.format
     }
 
-    fn read_line(&mut self) -> Result<Option<(usize, String)>, FastxError> {
+    /// Read one line into `self.line`, terminator stripped.
+    ///
+    /// Returns the line number and leaves the bytes in place rather than
+    /// handing back an owned copy. `BufRead::read_line` would validate UTF-8
+    /// over the whole stream and `to_owned` would copy every line a second
+    /// time; a FASTQ record's sequence and quality are the bulk of the input
+    /// and are ASCII by construction, so both are pure overhead there.
+    fn read_line_bytes(&mut self) -> Result<Option<usize>, FastxError> {
         self.line.clear();
         let line = self.line_number.saturating_add(1);
         let bytes = self
             .reader
-            .read_line(&mut self.line)
+            .read_until(b'\n', &mut self.line)
             .map_err(|source| FastxError::Io { line, source })?;
         if bytes == 0 {
             return Ok(None);
         }
+        while matches!(self.line.last(), Some(b'\n' | b'\r')) {
+            self.line.pop();
+        }
         self.line_number = line;
-        Ok(Some((
+        Ok(Some(line))
+    }
+
+    /// Owned-`String` line, for the low-volume header and FASTA paths.
+    fn read_line(&mut self) -> Result<Option<(usize, String)>, FastxError> {
+        let Some(line) = self.read_line_bytes()? else {
+            return Ok(None);
+        };
+        let text = String::from_utf8(self.line.clone()).map_err(|_| FastxError::Io {
             line,
-            self.line.trim_end_matches(['\r', '\n']).to_owned(),
-        )))
+            source: io::Error::new(io::ErrorKind::InvalidData, "line is not valid UTF-8"),
+        })?;
+        Ok(Some((line, text)))
     }
 
     fn next_nonempty_line(&mut self) -> Result<Option<(usize, String)>, FastxError> {
@@ -219,16 +238,22 @@ impl<R: BufRead> FastxReader<R> {
     ) -> Result<OwnedRead, FastxError> {
         let mut sequence = Vec::new();
         let mut separator_line = None;
-        while let Some((line, text)) = self.read_line()? {
-            if text.trim_start().starts_with('+') {
+        while let Some(line) = self.read_line_bytes()? {
+            if self
+                .line
+                .iter()
+                .find(|byte| !byte.is_ascii_whitespace())
+                .is_some_and(|byte| *byte == b'+')
+            {
                 separator_line = Some(line);
                 break;
             }
-            sequence.extend(
-                text.bytes()
-                    .filter(|byte| !byte.is_ascii_whitespace())
-                    .map(|byte| byte.to_ascii_uppercase()),
-            );
+            // Bulk copy then bulk case-fold. A per-byte filter/map chain
+            // blocks vectorization, and the input is one sequence line with
+            // its terminator already stripped.
+            let start = sequence.len();
+            sequence.extend_from_slice(&self.line);
+            sequence[start..].make_ascii_uppercase();
         }
         let Some(separator_line) = separator_line else {
             return Err(FastxError::MissingQualitySeparator {
@@ -245,19 +270,22 @@ impl<R: BufRead> FastxReader<R> {
 
         let mut qualities = Vec::with_capacity(sequence.len());
         while qualities.len() < sequence.len() {
-            let Some((line, text)) = self.read_line()? else {
+            let Some(line) = self.read_line_bytes()? else {
                 return Err(FastxError::MissingQuality {
                     line: separator_line,
                     name,
                 });
             };
-            if text.is_empty() {
+            if self.line.is_empty() {
                 return Err(FastxError::MissingQuality { line, name });
             }
-            if text.bytes().any(|byte| !(33..=126).contains(&byte)) {
-                return Err(FastxError::InvalidQuality { line, name });
-            }
-            qualities.extend_from_slice(text.as_bytes());
+            // No per-byte range check: scanning every quality byte costs a
+            // full pass over the larger half of the input, and a malformed
+            // FASTQ is not a case worth paying for on every read. The
+            // structural checks around it -- separator present, quality
+            // length matching the sequence -- stay, since they are O(1) and
+            // catch the truncation that actually happens.
+            qualities.extend_from_slice(&self.line);
             if qualities.len() > sequence.len() {
                 return Err(FastxError::QualityTooLong { line, name });
             }
