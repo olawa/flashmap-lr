@@ -7,18 +7,39 @@
 //! worker to observe a partially-mutated configuration.
 
 /// Mapping depth profile exposed by the public API and CLI.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+///
+/// The variants are ordered by resolved work budget, so a policy that applies
+/// from a given depth upwards can be written as a comparison rather than a
+/// list of variants.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, PartialOrd, Ord)]
 pub enum AlignmentMode {
     /// Bounded work budget for high throughput.
     Fast,
-    /// Larger gap/candidate work budget for maximum sensitivity.
+    /// Quality-first default: deep DP gap bounds and full STR left-alignment.
     #[default]
+    Standard,
+    /// Standard's resolution plus a wider candidate and DP ceiling.
     Sensitive,
 }
 
 impl AlignmentMode {
+    /// True for the top depth tier only.
     pub const fn is_sensitive(self) -> bool {
         matches!(self, Self::Sensitive)
+    }
+
+    /// True for the bounded throughput tier only.
+    pub const fn is_fast(self) -> bool {
+        matches!(self, Self::Fast)
+    }
+
+    /// True once the mode resolves gaps and terminals at full depth.
+    ///
+    /// `Standard` and `Sensitive` share this resolution; they differ in how
+    /// many candidates and how large a DP window they are willing to spend on
+    /// it.
+    pub const fn resolves_full_depth(self) -> bool {
+        !self.is_fast()
     }
 }
 
@@ -59,7 +80,7 @@ pub struct MapperConfig {
 impl Default for MapperConfig {
     fn default() -> Self {
         Self {
-            mode: AlignmentMode::Sensitive,
+            mode: AlignmentMode::Standard,
             runtime: RuntimeConfig::default(),
         }
     }
@@ -154,7 +175,7 @@ impl Default for Config {
                 bridge_max_gap: 5_000,
                 // Sensitive is the production default. The explicit Fast
                 // profile remains available for throughput experiments.
-                mode: AlignmentMode::Sensitive,
+                mode: AlignmentMode::Standard,
             },
             worker_pool: WorkerPoolConfig::default(),
         }
@@ -498,16 +519,19 @@ impl ResolvedMapperPolicy {
             endpoint_max_frequency: 250,
         };
         let candidates = CandidatePolicy {
-            max_regions: 20,
+            // Sensitive raises only the ceiling on how many loci may be
+            // resolved; the clustering rule itself is shared with Standard so
+            // the two tiers rank the same candidates the same way.
+            max_regions: if mode.is_sensitive() { 32 } else { 20 },
             min_supporting_segments: 2,
             diagonal_tolerance: 2_000,
         };
         let anchors = AnchorPolicy {
             anchor_k: 15,
             min_anchor_length: 30,
-            max_anchors_per_region: 512,
+            max_anchors_per_region: if mode.is_sensitive() { 1_024 } else { 512 },
             reference_flank: 1_024,
-            max_local_kmer_hits: 8_000,
+            max_local_kmer_hits: if mode.is_sensitive() { 16_000 } else { 8_000 },
             paired_emms: false,
             emms_max_mismatch_run: 1,
             emms_relock_span: 24,
@@ -539,14 +563,16 @@ impl ResolvedMapperPolicy {
             max_supplementary_query_overlap_fraction: 0.20,
             max_supplementary_alignments: 4,
         };
-        let gaps = if mode.is_sensitive() {
+        let gaps = if mode.resolves_full_depth() {
             GapPolicy {
                 bridge_flank: 256,
                 bridge_max_gap: 5_000,
                 small_gap_dp_max: 1_024,
                 small_gap_dp_delta_max: 256,
-                medium_gap_dp_max: 2_048,
-                medium_gap_dp_delta_max: 512,
+                // Sensitive spends a wider banded window on the same gaps
+                // Standard already resolves; the DP rule is unchanged.
+                medium_gap_dp_max: if mode.is_sensitive() { 4_096 } else { 2_048 },
+                medium_gap_dp_delta_max: if mode.is_sensitive() { 1_024 } else { 512 },
                 recursive_split_k: 13,
                 recursive_split_min_gap: 13,
                 recursive_split_max_depth: 8,
@@ -577,7 +603,15 @@ impl ResolvedMapperPolicy {
         };
         let terminal = TerminalPolicy {
             max_dp_query: 300,
-            max_recursive_query: if mode.is_sensitive() { 2_500 } else { 300 },
+            max_recursive_query: if mode.resolves_full_depth() {
+                if mode.is_sensitive() {
+                    4_000
+                } else {
+                    2_500
+                }
+            } else {
+                300
+            },
             reference_slack: 256,
             max_reference_window: 4_096,
             max_nm_rate: 0.15,
@@ -607,7 +641,7 @@ impl ResolvedMapperPolicy {
         let work_budget = WorkBudget {
             // Fast retains the existing eight-candidate ceiling. Sensitive
             // can inspect the complete resolved candidate list.
-            max_candidates: if mode.is_sensitive() {
+            max_candidates: if mode.resolves_full_depth() {
                 candidates.max_regions
             } else {
                 8
@@ -618,9 +652,9 @@ impl ResolvedMapperPolicy {
             max_candidates_without_placement: 3,
             high_coverage_fraction: 0.90,
             low_coverage_fraction: 0.40,
-            limited_mapq_cap: if mode.is_sensitive() { 60 } else { 50 },
+            limited_mapq_cap: if mode.resolves_full_depth() { 60 } else { 50 },
             ambiguity_score_fraction: 0.90,
-            ambiguity_candidate_count: if mode.is_sensitive() { usize::MAX } else { 4 },
+            ambiguity_candidate_count: if mode.resolves_full_depth() { usize::MAX } else { 4 },
             ambiguity_candidate_budget: 3,
             ambiguity_mapq_cap: 5,
         };
@@ -714,9 +748,9 @@ mod tests {
     }
 
     #[test]
-    fn public_mapper_config_defaults_to_sensitive_and_validates_runtime() {
+    fn public_mapper_config_defaults_to_standard_and_validates_runtime() {
         let config = MapperConfig::default();
-        assert_eq!(config.mode, AlignmentMode::Sensitive);
+        assert_eq!(config.mode, AlignmentMode::Standard);
         assert!(config.validate().is_ok());
 
         let mut invalid = config;
@@ -748,14 +782,39 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_config_uses_the_sensitive_default() {
+    fn compatibility_config_uses_the_standard_default() {
         let policy = ResolvedMapperPolicy::from_legacy_config(&Config::default()).unwrap();
-        assert_eq!(policy.mode, AlignmentMode::Sensitive);
+        assert_eq!(policy.mode, AlignmentMode::Standard);
         assert_eq!(
             policy.gaps,
-            ResolvedMapperPolicy::for_mode(AlignmentMode::Sensitive, RuntimeConfig::default(),)
-                .gaps
+            ResolvedMapperPolicy::for_mode(AlignmentMode::Standard, RuntimeConfig::default(),).gaps
         );
+    }
+
+    #[test]
+    fn tiers_are_ordered_and_sensitive_only_widens_standard() {
+        assert!(AlignmentMode::Fast < AlignmentMode::Standard);
+        assert!(AlignmentMode::Standard < AlignmentMode::Sensitive);
+        let runtime = RuntimeConfig::default();
+        let fast = ResolvedMapperPolicy::for_mode(AlignmentMode::Fast, runtime.clone());
+        let standard = ResolvedMapperPolicy::for_mode(AlignmentMode::Standard, runtime.clone());
+        let sensitive = ResolvedMapperPolicy::for_mode(AlignmentMode::Sensitive, runtime);
+
+        // Standard carries the resolution Fast gives up.
+        assert_ne!(fast.gaps, standard.gaps);
+        assert_eq!(standard.gaps.recursive_split_max_depth, 8);
+
+        // Sensitive keeps every Standard rule and only raises ceilings.
+        assert_eq!(
+            standard.gaps.recursive_split_max_depth,
+            sensitive.gaps.recursive_split_max_depth
+        );
+        assert_eq!(standard.normalization, sensitive.normalization);
+        assert_eq!(standard.scoring, sensitive.scoring);
+        assert!(sensitive.candidates.max_regions > standard.candidates.max_regions);
+        assert!(sensitive.gaps.medium_gap_dp_max > standard.gaps.medium_gap_dp_max);
+        assert!(sensitive.anchors.max_local_kmer_hits > standard.anchors.max_local_kmer_hits);
+        assert!(sensitive.terminal.max_recursive_query > standard.terminal.max_recursive_query);
     }
 
     #[test]

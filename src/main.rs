@@ -110,13 +110,16 @@ impl Options {
                 "--sensitive" => {
                     set_mode(&mut mode, &mut explicit_mode, AlignmentMode::Sensitive)?;
                 }
-                "--fast" | "--no-sensitive" => {
+                "--standard" | "--no-sensitive" => {
+                    set_mode(&mut mode, &mut explicit_mode, AlignmentMode::Standard)?;
+                }
+                "--fast" => {
                     set_mode(&mut mode, &mut explicit_mode, AlignmentMode::Fast)?;
                 }
                 "-x" | "--preset" => {
                     let val = next_value(&mut args, &argument)?;
                     let preset = match val.as_str() {
-                        "standard" => AlignmentMode::Sensitive,
+                        "standard" => AlignmentMode::Standard,
                         "fast" => AlignmentMode::Fast,
                         "sensitive" => AlignmentMode::Sensitive,
                         _ => return Err(CliError::UnknownPreset(val)),
@@ -261,7 +264,7 @@ impl std::fmt::Display for CliError {
                 "unknown preset {preset:?}; expected \"standard\", \"fast\", or \"sensitive\""
             ),
             Self::ConflictingMode => {
-                f.write_str("conflicting alignment modes; choose --fast or --sensitive")
+                f.write_str("conflicting alignment modes; choose --fast, --standard, or --sensitive")
             }
             Self::UnknownOption(option) => write!(f, "unknown option {option}\n\n{}", usage()),
             Self::UnexpectedArgument(value) => {
@@ -310,8 +313,9 @@ Options:\n\
   -c, --chunk-size N     Reads per worker batch (default: 10)\n\
       --quiet            Suppress progress indicators and summary\n\
       --profile          Print aggregate mapper phase timings\n\
-      --fast             Fast bounded-gap mode\n\
-      --sensitive        Sensitive mode with deeper DP and full STR left-alignment (default)\n\
+      --fast             Bounded work budget for high throughput\n\
+      --standard         Deep DP gap bounds and full STR left-alignment (default)\n\
+      --sensitive        Standard plus a wider candidate and DP ceiling\n\
   -x, --preset STR       Preset profile: standard, fast, or sensitive\n\
       --paired-emms      Experimental mismatch-tolerant paired anchors\n\
       --tiered-candidates Experimental cheap pass for weak candidates\n\
@@ -1120,14 +1124,14 @@ mod tests {
     }
 
     #[test]
-    fn parser_defaults_to_sensitive_mode_and_accepts_standard_preset() {
+    fn parser_defaults_to_standard_mode_and_accepts_standard_preset() {
         let options = Options::parse(
             ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq"]
                 .into_iter()
                 .map(str::to_owned),
         )
         .unwrap();
-        assert_eq!(options.mode, AlignmentMode::Sensitive);
+        assert_eq!(options.mode, AlignmentMode::Standard);
 
         let options_preset = Options::parse(
             [
@@ -1137,7 +1141,15 @@ mod tests {
             .map(str::to_owned),
         )
         .unwrap();
-        assert_eq!(options_preset.mode, AlignmentMode::Sensitive);
+        assert_eq!(options_preset.mode, AlignmentMode::Standard);
+
+        let options_flag = Options::parse(
+            ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "--standard"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(options_flag.mode, AlignmentMode::Standard);
 
         let options_fast_preset = Options::parse(
             ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "-x", "fast"]
