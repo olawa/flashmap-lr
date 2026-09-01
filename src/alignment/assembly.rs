@@ -734,9 +734,13 @@ fn append_gap_recursive(
     if common > 0 {
         ops.push(CigarOp::Match(to_u32(common)?));
     }
+    // Equal lengths reach this fallback whenever the spans differ in sequence
+    // but every DP attempt declined -- a balanced indel or a phase shift.
+    // An unconditional `else` emits `Del(0)` there, which fails CIGAR
+    // validation and aborts the whole run on one read.
     if query_len > reference_len {
         ops.push(CigarOp::Ins(to_u32(query_len - reference_len)?));
-    } else {
+    } else if reference_len > query_len {
         ops.push(CigarOp::Del(to_u32(reference_len - query_len)?));
     }
     Ok(())
@@ -1366,6 +1370,53 @@ mod tests {
         assert!(cigar.ops().contains(&CigarOp::Ins(40)));
         assert_eq!(cigar.query_len(), read.len() as u32);
         assert_eq!(cigar.reference_len(), reference.len() as u32);
+    }
+
+    #[test]
+    fn an_equal_length_gap_that_declines_dp_emits_no_zero_length_operation() {
+        // A balanced indel or phase shift produces a gap whose query and
+        // reference spans are the same length but whose sequence differs, so
+        // it misses the all-bases-agree `M` shortcut. If every DP stage then
+        // declines, the approximate fallback used to emit `Del(0)` and fail
+        // CIGAR validation -- aborting an entire run on a single read.
+        let query = b"ACGTACGTACGTACGTACGTACGTACGTACGT".to_vec();
+        let mut reference = query.clone();
+        reference.reverse();
+        assert_eq!(query.len(), reference.len());
+
+        let mut policy = ResolvedMapperPolicy::from_mapper_config(&MapperConfig::default()).unwrap();
+        // Decline every DP and rescue stage so the fallback is the only path.
+        policy.gaps.bridge_max_gap = 0;
+        policy.gaps.small_gap_dp_max = 0;
+        policy.gaps.medium_gap_dp_max = 0;
+        policy.gaps.recursive_split_max_depth = 0;
+        policy.gaps.flank_min = usize::MAX;
+
+        let mut ops = Vec::new();
+        append_gap_with_policy(
+            &mut ops,
+            &query,
+            &reference,
+            0,
+            query.len(),
+            0,
+            reference.len(),
+            &policy.gaps,
+            None,
+        )
+        .unwrap();
+
+        assert!(!ops.is_empty());
+        assert!(
+            ops.iter().all(|op| match op {
+                CigarOp::Match(n) | CigarOp::Ins(n) | CigarOp::Del(n) | CigarOp::SoftClip(n) => {
+                    *n > 0
+                }
+                _ => true,
+            }),
+            "fallback emitted a zero-length operation: {ops:?}"
+        );
+        Cigar::new(ops).expect("fallback CIGAR must validate");
     }
 
     #[test]
