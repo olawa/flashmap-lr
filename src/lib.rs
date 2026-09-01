@@ -49,6 +49,7 @@ pub use index::{
 };
 pub use io::{
     load_reference, load_reference_path, open_fastx, FastxError, FastxFormat, FastxReader,
+    FastxSource,
     ReferenceIoError, SamError, SamWriter,
 };
 pub use probes::{extract_backbone_probes, extract_read_probes, Probe};

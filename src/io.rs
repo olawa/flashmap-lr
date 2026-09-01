@@ -302,9 +302,36 @@ impl<R: BufRead> Iterator for FastxReader<R> {
     }
 }
 
-pub fn open_fastx(path: impl AsRef<Path>) -> Result<FastxReader<BufReader<File>>, FastxError> {
+/// Buffered read source produced by [`open_fastx`].
+///
+/// The concrete type depends on whether the input is compressed, so the
+/// reader is boxed rather than exposing the decoder in the signature.
+pub type FastxSource = Box<dyn BufRead + Send>;
+
+/// Open a FASTA/FASTQ file, transparently decompressing gzip input.
+///
+/// Detection is by magic bytes rather than file extension: a `.fastq` that is
+/// actually gzip, or a `.gz` that is not, both open correctly. `MultiGzDecoder`
+/// is used because concatenated members are common in FASTQ produced by
+/// appending or by parallel compressors.
+pub fn open_fastx(path: impl AsRef<Path>) -> Result<FastxReader<FastxSource>, FastxError> {
     let file = File::open(path).map_err(|source| FastxError::Io { line: 0, source })?;
-    Ok(FastxReader::new(BufReader::new(file)))
+    let mut buffered = BufReader::with_capacity(1 << 20, file);
+    let gzipped = {
+        let head = buffered
+            .fill_buf()
+            .map_err(|source| FastxError::Io { line: 0, source })?;
+        head.starts_with(&[0x1f, 0x8b])
+    };
+    let source: FastxSource = if gzipped {
+        Box::new(BufReader::with_capacity(
+            1 << 20,
+            flate2::read::MultiGzDecoder::new(buffered),
+        ))
+    } else {
+        Box::new(buffered)
+    };
+    Ok(FastxReader::new(source))
 }
 
 /// Parse a reference FASTA into the core's owned reference adapter.
