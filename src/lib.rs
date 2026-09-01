@@ -48,7 +48,8 @@ pub use index::{
     SeedIndexBuildError, DEFAULT_MAX_STORED_HITS, LR_MINIMIZER_WINDOW, LR_SEED_K,
 };
 pub use io::{
-    load_reference, load_reference_path, open_fastx, FastxError, FastxFormat, FastxReader,
+    load_reference, load_reference_path, open_fastx, open_fastx_with_decompressor, FastxError,
+    FastxFormat, FastxReader,
     FastxSource,
     ReferenceIoError, SamError, SamWriter,
 };

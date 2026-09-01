@@ -1,4 +1,4 @@
-use rs_lra::io::{load_reference_path, open_fastx, AlignmentSink, SamWriter};
+use rs_lra::io::{load_reference_path, open_fastx_with_decompressor, AlignmentSink, SamWriter};
 use rs_lra::{
     Aligner, AlignerConfig, AlignmentMode, CigarOp, Config, DiagnosticsSink, InMemorySeedIndex,
     MappedRead, MapperConfig, MinimizerIndex, MinimizerIndexError, ReadDiagnostics, Reference,
@@ -27,6 +27,7 @@ struct Options {
     sort_memory: Option<String>,
     query_window: usize,
     limit: Option<usize>,
+    decompress_with: Option<String>,
 }
 
 impl Options {
@@ -55,6 +56,7 @@ impl Options {
         let mut sort_memory: Option<String> = None;
         let mut query_window = 0usize;
         let mut limit: Option<usize> = None;
+        let mut decompress_with: Option<String> = None;
         let mut explicit_mode = None;
 
         let mut positional = Vec::new();
@@ -83,6 +85,9 @@ impl Options {
                 }
                 "--quiet" => {
                     quiet = true;
+                }
+                "--decompress-with" => {
+                    decompress_with = Some(next_value(&mut args, &argument)?);
                 }
                 "-n" | "--limit" => {
                     limit = Some(parse_positive(next_value(&mut args, &argument)?, "limit")?);
@@ -218,6 +223,7 @@ impl Options {
             sort_memory,
             query_window,
             limit,
+            decompress_with,
         })
     }
 }
@@ -332,6 +338,8 @@ Options:\n\
       --quiet            Suppress progress indicators and summary\n\
       --profile          Print aggregate mapper phase timings\n\
   -n, --limit N          Stop after mapping N reads (for benchmarking)\n\
+      --decompress-with CMD  Command to decompress gzip reads; the file path is\n\
+                         appended (default: pigz -dc when on PATH)\n\
       --query-window N   Minimizer window used to query the index, independent\n\
                          of the window it was built with (clamped up to it)\n\
       --sort-memory SIZE samtools sort memory PER THREAD for .bam output\n\
@@ -592,7 +600,8 @@ fn execute_mapping(
     let pool = WorkerPool::new(aligner.runtime_config().clone())
         .map_err(|error| CliError::Pool(error.to_string()))?;
 
-    let reads = open_fastx(&options.reads).map_err(CliError::Reads)?;
+    let reads = open_fastx_with_decompressor(&options.reads, options.decompress_with.as_deref())
+        .map_err(CliError::Reads)?;
     // `usize::MAX` leaves the stream untouched, so the benchmarking path and
     // the production path run the same iterator adapter.
     let reads = reads.take(options.limit.unwrap_or(usize::MAX));

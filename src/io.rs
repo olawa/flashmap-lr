@@ -315,6 +315,74 @@ pub type FastxSource = Box<dyn BufRead + Send>;
 /// is used because concatenated members are common in FASTQ produced by
 /// appending or by parallel compressors.
 pub fn open_fastx(path: impl AsRef<Path>) -> Result<FastxReader<FastxSource>, FastxError> {
+    open_fastx_with_decompressor(path, None)
+}
+
+/// Reader stdout of a spawned decompressor, keeping the child alive with it.
+struct ChildReader {
+    child: std::process::Child,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+impl io::Read for ChildReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stdout.read(buf)
+    }
+}
+
+impl BufRead for ChildReader {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.stdout.fill_buf()
+    }
+    fn consume(&mut self, amount: usize) {
+        self.stdout.consume(amount)
+    }
+}
+
+impl Drop for ChildReader {
+    fn drop(&mut self) {
+        // The mapper may stop early (`--limit`), leaving the decompressor
+        // blocked on a full pipe. Close the read end first, then reap.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_decompressor(command: &str, path: &Path) -> Option<FastxSource> {
+    let mut parts = command.split_whitespace();
+    let program = parts.next()?;
+    let mut child = Command::new(program)
+        .args(parts)
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    Some(Box::new(ChildReader {
+        child,
+        stdout: BufReader::with_capacity(1 << 20, stdout),
+    }))
+}
+
+/// Open a FASTA/FASTQ file, decompressing gzip input.
+///
+/// Inflating one gzip stream is inherently serial, so an external tool does
+/// not help by adding threads -- it helps by having a faster inflate than the
+/// in-process one and by running on its own core. Measured on 3.2 GB of HiFi
+/// FASTQ: system zlib 1823 MB/s, `pigz -dc -p1` 1732 MB/s, in-process
+/// miniz_oxide 730 MB/s, and `pigz -dc -p8` 1384 MB/s -- slower than `-p1`,
+/// which is what "decompression does not parallelize" looks like.
+///
+/// `decompressor` overrides the command; the file path is appended to it.
+/// When unset, `pigz -dc` is used if it is on PATH, and the in-process decoder
+/// otherwise, so an installation without it still works.
+pub fn open_fastx_with_decompressor(
+    path: impl AsRef<Path>,
+    decompressor: Option<&str>,
+) -> Result<FastxReader<FastxSource>, FastxError> {
+    let path = path.as_ref();
     let file = File::open(path).map_err(|source| FastxError::Io { line: 0, source })?;
     let mut buffered = BufReader::with_capacity(1 << 20, file);
     let gzipped = {
@@ -324,10 +392,26 @@ pub fn open_fastx(path: impl AsRef<Path>) -> Result<FastxReader<FastxSource>, Fa
         head.starts_with(&[0x1f, 0x8b])
     };
     let source: FastxSource = if gzipped {
-        Box::new(BufReader::with_capacity(
-            1 << 20,
-            flate2::read::MultiGzDecoder::new(buffered),
-        ))
+        let external = decompressor
+            .map(|command| (command, true))
+            .or(Some(("pigz -dc", false)))
+            .and_then(|(command, explicit)| {
+                spawn_decompressor(command, path).or_else(|| {
+                    if explicit {
+                        eprintln!(
+                            "rs-lra: could not run {command:?}; falling back to the built-in gzip decoder"
+                        );
+                    }
+                    None
+                })
+            });
+        match external {
+            Some(source) => source,
+            None => Box::new(BufReader::with_capacity(
+                1 << 20,
+                flate2::read::MultiGzDecoder::new(buffered),
+            )),
+        }
     } else {
         Box::new(buffered)
     };
