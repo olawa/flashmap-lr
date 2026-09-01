@@ -1,11 +1,84 @@
-//! Stable RS-LRA configuration.
+//! Public mapper configuration and the startup-resolved LR policy.
 //!
-//! There is deliberately one algorithm profile in this repository: the
-//! current FlashMap LR default (HiFi-balanced settings), with the worker-pool
-//! scheduler as the only execution model. CLI presets, alternate DP
-//! backends, alternate chainers, and experimental seed schedules stay out of
-//! the core until a parity baseline exists.
+//! The public configuration is intentionally small.  Callers choose an
+//! accuracy/throughput mode and the runtime scheduler; all algorithmic
+//! thresholds are resolved once when an [`crate::Aligner`] is constructed.
+//! This keeps mode branches out of the hot path and makes it impossible for a
+//! worker to observe a partially-mutated configuration.
 
+/// Mapping depth profile exposed by the public API and CLI.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AlignmentMode {
+    /// Bounded work budget for high throughput.
+    Fast,
+    /// Larger gap/candidate work budget for maximum sensitivity.
+    #[default]
+    Sensitive,
+}
+
+impl AlignmentMode {
+    pub const fn is_sensitive(self) -> bool {
+        matches!(self, Self::Sensitive)
+    }
+}
+
+/// Runtime settings for the one supported worker-pool scheduler.
+///
+/// Runtime settings are deliberately separate from algorithm policy.  The
+/// mapper never reads these values while mapping a read; they are consumed by
+/// [`crate::WorkerPool`] at the process boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeConfig {
+    pub workers: usize,
+    pub chunk_size: usize,
+    pub reader_batch_size: Option<usize>,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            workers: 1,
+            // Small batches avoid long-tail imbalance when a few repetitive
+            // LR reads monopolize one worker.
+            chunk_size: 10,
+            reader_batch_size: None,
+        }
+    }
+}
+
+/// Public RS-LRA configuration.
+///
+/// Algorithmic thresholds do not belong here.  [`crate::Aligner::new`]
+/// validates this value and lowers it to an immutable private policy graph.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MapperConfig {
+    pub mode: AlignmentMode,
+    pub runtime: RuntimeConfig,
+}
+
+impl Default for MapperConfig {
+    fn default() -> Self {
+        Self {
+            mode: AlignmentMode::Sensitive,
+            runtime: RuntimeConfig::default(),
+        }
+    }
+}
+
+impl MapperConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_runtime(&self.runtime)
+    }
+}
+
+/// Compatibility name retained for the worker-pool API during the extraction.
+/// New callers should use [`RuntimeConfig`].
+pub type WorkerPoolConfig = RuntimeConfig;
+
+/// Transitional full configuration used by the low-level compatibility
+/// wrappers. Production construction goes through [`MapperConfig`] and an
+/// internal resolved policy; keeping this type for one release lets existing
+/// phase-level tests and adapters migrate without duplicating defaults.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub seeding: SeedingConfig,
@@ -47,32 +120,9 @@ pub struct CandidateConfig {
 pub struct AlignmentConfig {
     pub bridge_flank: usize,
     pub bridge_max_gap: usize,
-    pub sensitive: bool,
-}
-
-/// Runtime settings for the one supported scheduler.
-///
-/// A single worker is still a worker-pool run; the value is one mainly for
-/// library callers and tests. The CLI adapter should set it to the requested
-/// mapper-worker count.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkerPoolConfig {
-    pub workers: usize,
-    pub chunk_size: usize,
-    pub reader_batch_size: Option<usize>,
-}
-
-impl Default for WorkerPoolConfig {
-    fn default() -> Self {
-        Self {
-            workers: 1,
-            // Small batches avoid long-tail imbalance when a few repetitive
-            // LR reads monopolize one worker. Ten was the fastest stable
-            // value in the chr20 and centromere benchmarks.
-            chunk_size: 10,
-            reader_batch_size: None,
-        }
-    }
+    /// Compatibility-only mode field.  New mapper construction uses the
+    /// top-level [`MapperConfig::mode`] and copies it into `GapPolicy`.
+    pub mode: AlignmentMode,
 }
 
 impl Default for Config {
@@ -81,9 +131,8 @@ impl Default for Config {
             seeding: SeedingConfig {
                 segment_size: 2048,
                 segment_overlap: 512,
-                // Current FlashMap HiFi-balanced default (the default lowers
-                // through SvSensitive, not the experimental ultra-sparse
-                // profile).
+                // Fixed LR/HiFi-balanced probe schedule. This is resolved
+                // internally and is not a user-selectable seed profile.
                 max_probes_per_segment: 6,
                 max_total_hits_scanned: 8_000,
                 max_probe_frequency: 40,
@@ -103,7 +152,9 @@ impl Default for Config {
             alignment: AlignmentConfig {
                 bridge_flank: 256,
                 bridge_max_gap: 5_000,
-                sensitive: true,
+                // Sensitive is the production default. The explicit Fast
+                // profile remains available for throughput experiments.
+                mode: AlignmentMode::Sensitive,
             },
             worker_pool: WorkerPoolConfig::default(),
         }
@@ -191,6 +242,435 @@ impl Config {
     }
 }
 
+fn validate_runtime(runtime: &RuntimeConfig) -> Result<(), ConfigError> {
+    if runtime.workers == 0 {
+        return Err(ConfigError::new(
+            "runtime.workers must be greater than zero",
+        ));
+    }
+    if runtime.chunk_size == 0 {
+        return Err(ConfigError::new(
+            "runtime.chunk_size must be greater than zero",
+        ));
+    }
+    if runtime.reader_batch_size == Some(0) {
+        return Err(ConfigError::new(
+            "runtime.reader_batch_size must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+/// Startup-resolved query-probe policy.  It contains no mode branch; the
+/// resolver selects one complete value before a worker is started.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProbePolicy {
+    pub(crate) segment_size: usize,
+    pub(crate) segment_overlap: usize,
+    pub(crate) max_probes_per_segment: usize,
+    pub(crate) max_total_hits_scanned: usize,
+    pub(crate) max_probe_frequency: usize,
+    pub(crate) endpoint_window: usize,
+    pub(crate) endpoint_probes_per_end: usize,
+    pub(crate) endpoint_max_frequency: usize,
+}
+
+/// Startup-resolved candidate-clustering policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CandidatePolicy {
+    pub(crate) max_regions: usize,
+    pub(crate) min_supporting_segments: usize,
+    pub(crate) diagonal_tolerance: i32,
+}
+
+/// Startup-resolved local-anchor policy.  The paired-stage controls are fixed
+/// parts of the extracted HiFi path rather than public experiment switches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AnchorPolicy {
+    pub(crate) anchor_k: usize,
+    pub(crate) min_anchor_length: usize,
+    pub(crate) max_anchors_per_region: usize,
+    pub(crate) reference_flank: usize,
+    pub(crate) max_local_kmer_hits: usize,
+    pub(crate) paired_emms: bool,
+    pub(crate) emms_max_mismatch_run: usize,
+    pub(crate) emms_relock_span: usize,
+    pub(crate) paired_min_distance: usize,
+    pub(crate) paired_max_distance: usize,
+    pub(crate) paired_distance_tolerance: usize,
+    pub(crate) paired_max_pairs: usize,
+    pub(crate) max_right_pair_candidates: usize,
+    pub(crate) sufficient_anchor_count: usize,
+    pub(crate) sufficient_span_permille: usize,
+    pub(crate) sufficient_coverage_permille: usize,
+}
+
+/// Startup-resolved Minimap-DP chaining policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ChainPolicy {
+    pub(crate) diagonal_tolerance: i32,
+    pub(crate) max_dist: u32,
+    pub(crate) max_iter: usize,
+}
+
+/// Policy for reconciling strong split chains around a structural indel and
+/// for emitting genuinely disjoint read segments as supplementary records.
+/// This path is cheap and therefore shared by Fast and Sensitive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StructuralPolicy {
+    /// Smallest diagonal jump handled by the post-chain SV bridge. Smaller
+    /// gaps belong to the ordinary chainer and gap assembler.
+    pub(crate) min_bridge_indel: u32,
+    /// Largest insertion/deletion represented as one primary CIGAR when both
+    /// flanks have strong, colinear support.
+    pub(crate) max_bridge_indel: u32,
+    /// At most this much sequence may be present on both sides of the gap.
+    /// This keeps the bridge focused on a structural indel rather than asking
+    /// the long-gap fallback to invent a complex alignment.
+    pub(crate) max_bridge_context: u32,
+    pub(crate) max_bridge_overlap: u32,
+    pub(crate) min_flank_covered_bases: u32,
+    pub(crate) min_flank_anchors: usize,
+    pub(crate) bridge_score_penalty: i32,
+    pub(crate) min_supplementary_bases: u32,
+    pub(crate) max_supplementary_query_overlap_fraction: f64,
+    pub(crate) max_supplementary_alignments: usize,
+}
+
+/// Startup-resolved gap work budget.  Fast and Sensitive share the same
+/// scoring and seed evidence; only these bounded work limits differ.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GapPolicy {
+    pub(crate) bridge_flank: usize,
+    pub(crate) bridge_max_gap: usize,
+    pub(crate) small_gap_dp_max: usize,
+    pub(crate) small_gap_dp_delta_max: usize,
+    pub(crate) medium_gap_dp_max: usize,
+    pub(crate) medium_gap_dp_delta_max: usize,
+    pub(crate) recursive_split_k: usize,
+    pub(crate) recursive_split_min_gap: usize,
+    pub(crate) recursive_split_max_depth: usize,
+    pub(crate) recursive_split_max_gap: usize,
+    /// Minimum edit rate (per mille) of an otherwise bounded DP result before
+    /// Fast retries the gap through exact islands. Zero preserves Sensitive's
+    /// unconditional exact-island search for gaps outside the small-DP path.
+    pub(crate) recursive_split_trigger_nm_permille: u16,
+    pub(crate) flank_max: usize,
+    pub(crate) flank_min: usize,
+}
+
+/// Startup-resolved terminal-rescue policy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TerminalPolicy {
+    pub(crate) max_dp_query: usize,
+    pub(crate) max_recursive_query: usize,
+    pub(crate) reference_slack: usize,
+    pub(crate) max_reference_window: usize,
+    pub(crate) max_nm_rate: f64,
+    pub(crate) kmer: usize,
+    pub(crate) endpoint_search: usize,
+    pub(crate) protect_indel_support: usize,
+    /// Endpoint clipping intentionally uses the historical conservative
+    /// reward, separate from the 2/4/6/1 gap-DP scoring tuple.
+    pub(crate) match_score: i8,
+    pub(crate) clip_penalty: i32,
+    pub(crate) min_clip_score_gain: i32,
+}
+
+/// Startup-resolved CIGAR-normalization policy.  It describes work limits,
+/// not a second algorithm; all profiles use the same normalization stages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NormalizationPolicy {
+    pub(crate) max_micro_match: usize,
+    pub(crate) str_left_alignment_window: usize,
+    pub(crate) phase_shift_window: usize,
+    pub(crate) divergent_terminal_window: usize,
+}
+
+/// Startup-resolved scoring constants shared by DP, normalization, and MAPQ
+/// evidence calculations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ScoringPolicy {
+    pub(crate) match_score: i8,
+    pub(crate) mismatch_penalty: i8,
+    pub(crate) gap_open: i8,
+    pub(crate) gap_extend: i8,
+}
+
+/// Read-level work budget and search-completeness policy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct WorkBudget {
+    pub(crate) max_candidates: usize,
+    pub(crate) competitive_score_fraction: f32,
+    pub(crate) full_search_score_fraction: f32,
+    pub(crate) weak_candidate_fraction: f32,
+    pub(crate) max_candidates_without_placement: usize,
+    pub(crate) high_coverage_fraction: f64,
+    pub(crate) low_coverage_fraction: f64,
+    pub(crate) limited_mapq_cap: u8,
+    /// Fast-only coarse-candidate entropy guard. When at least this many
+    /// candidates remain within `ambiguity_score_fraction` of the top probe
+    /// score, only `ambiguity_candidate_budget` candidates are resolved and
+    /// MAPQ is capped at `ambiguity_mapq_cap`.
+    pub(crate) ambiguity_score_fraction: f32,
+    pub(crate) ambiguity_candidate_count: usize,
+    pub(crate) ambiguity_candidate_budget: usize,
+    pub(crate) ambiguity_mapq_cap: u8,
+}
+
+/// Complete immutable algorithm policy used by [`crate::Aligner`].
+///
+/// This type is crate-private on purpose: callers select a public mode and
+/// runtime, while algorithm modules receive only the narrow policy they need.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ResolvedMapperPolicy {
+    pub(crate) probes: ProbePolicy,
+    pub(crate) candidates: CandidatePolicy,
+    pub(crate) anchors: AnchorPolicy,
+    pub(crate) chaining: ChainPolicy,
+    pub(crate) structural: StructuralPolicy,
+    pub(crate) gaps: GapPolicy,
+    pub(crate) terminal: TerminalPolicy,
+    pub(crate) normalization: NormalizationPolicy,
+    pub(crate) scoring: ScoringPolicy,
+    pub(crate) work_budget: WorkBudget,
+    pub(crate) mode: AlignmentMode,
+    pub(crate) runtime: RuntimeConfig,
+}
+
+impl ResolvedMapperPolicy {
+    pub(crate) fn from_mapper_config(config: &MapperConfig) -> Result<Self, ConfigError> {
+        config.validate()?;
+        Ok(Self::for_mode(config.mode, config.runtime.clone()))
+    }
+
+    pub(crate) fn from_legacy_config(config: &Config) -> Result<Self, ConfigError> {
+        config.validate()?;
+        let mut policy = Self::for_mode(config.alignment.mode, config.worker_pool.clone());
+        policy.gaps.bridge_flank = config.alignment.bridge_flank;
+        policy.gaps.bridge_max_gap = config.alignment.bridge_max_gap;
+        policy.probes = ProbePolicy {
+            segment_size: config.seeding.segment_size,
+            segment_overlap: config.seeding.segment_overlap,
+            max_probes_per_segment: config.seeding.max_probes_per_segment,
+            max_total_hits_scanned: config.seeding.max_total_hits_scanned,
+            max_probe_frequency: config.seeding.max_probe_frequency,
+            endpoint_window: 1_000,
+            endpoint_probes_per_end: 4,
+            endpoint_max_frequency: 250,
+        };
+        policy.candidates = CandidatePolicy {
+            max_regions: config.candidates.max_regions,
+            min_supporting_segments: config.candidates.min_supporting_segments,
+            diagonal_tolerance: config.candidates.diagonal_tolerance,
+        };
+        policy.anchors = AnchorPolicy {
+            anchor_k: config.candidates.anchor_k,
+            min_anchor_length: config.candidates.min_anchor_length,
+            max_anchors_per_region: config.candidates.max_anchors_per_region,
+            paired_emms: config.candidates.paired_emms,
+            emms_max_mismatch_run: config.candidates.emms_max_mismatch_run,
+            emms_relock_span: config.candidates.emms_relock_span,
+            ..policy.anchors
+        };
+        policy.work_budget.max_candidates = config.candidates.max_regions.min(8);
+        // Tiered and EMMS switches are compatibility-only.  They are carried
+        // into the resolved policy only when explicitly requested through the
+        // legacy Config; MapperConfig itself cannot create these combinations.
+        if config.candidates.tiered_candidates {
+            policy.work_budget.full_search_score_fraction = 0.70;
+            policy.work_budget.weak_candidate_fraction = 0.50;
+        } else {
+            policy.work_budget.full_search_score_fraction = 0.0;
+        }
+        Ok(policy)
+    }
+
+    fn for_mode(mode: AlignmentMode, runtime: RuntimeConfig) -> Self {
+        let probes = ProbePolicy {
+            segment_size: 2_048,
+            segment_overlap: 512,
+            max_probes_per_segment: 6,
+            max_total_hits_scanned: 8_000,
+            max_probe_frequency: 40,
+            endpoint_window: 1_000,
+            endpoint_probes_per_end: 4,
+            endpoint_max_frequency: 250,
+        };
+        let candidates = CandidatePolicy {
+            max_regions: 20,
+            min_supporting_segments: 2,
+            diagonal_tolerance: 2_000,
+        };
+        let anchors = AnchorPolicy {
+            anchor_k: 15,
+            min_anchor_length: 30,
+            max_anchors_per_region: 512,
+            reference_flank: 1_024,
+            max_local_kmer_hits: 8_000,
+            paired_emms: false,
+            emms_max_mismatch_run: 1,
+            emms_relock_span: 24,
+            paired_min_distance: 64,
+            paired_max_distance: 512,
+            paired_distance_tolerance: 12,
+            paired_max_pairs: 256,
+            max_right_pair_candidates: 12,
+            sufficient_anchor_count: 6,
+            sufficient_span_permille: 750,
+            sufficient_coverage_permille: 350,
+        };
+        let chaining = ChainPolicy {
+            diagonal_tolerance: candidates.diagonal_tolerance,
+            max_dist: (candidates.diagonal_tolerance.max(0) as u32)
+                .saturating_mul(20)
+                .max(10_000),
+            max_iter: 256,
+        };
+        let structural = StructuralPolicy {
+            min_bridge_indel: 2_000,
+            max_bridge_indel: 100_000,
+            max_bridge_context: 512,
+            max_bridge_overlap: 256,
+            min_flank_covered_bases: 500,
+            min_flank_anchors: 2,
+            bridge_score_penalty: 40,
+            min_supplementary_bases: 500,
+            max_supplementary_query_overlap_fraction: 0.20,
+            max_supplementary_alignments: 4,
+        };
+        let gaps = if mode.is_sensitive() {
+            GapPolicy {
+                bridge_flank: 256,
+                bridge_max_gap: 5_000,
+                small_gap_dp_max: 1_024,
+                small_gap_dp_delta_max: 256,
+                medium_gap_dp_max: 2_048,
+                medium_gap_dp_delta_max: 512,
+                recursive_split_k: 13,
+                recursive_split_min_gap: 13,
+                recursive_split_max_depth: 8,
+                recursive_split_max_gap: 1_000_000,
+                recursive_split_trigger_nm_permille: 0,
+                flank_max: 64,
+                flank_min: 16,
+            }
+        } else {
+            GapPolicy {
+                bridge_flank: 256,
+                bridge_max_gap: 5_000,
+                small_gap_dp_max: 512,
+                small_gap_dp_delta_max: 64,
+                medium_gap_dp_max: 1_536,
+                medium_gap_dp_delta_max: 128,
+                recursive_split_k: 13,
+                recursive_split_min_gap: 64,
+                // Fast retries only suspicious DP results and unresolved
+                // bounded gaps. Two levels are enough to re-lock across a
+                // local phase shift without paying Sensitive's full search.
+                recursive_split_max_depth: 2,
+                recursive_split_max_gap: 4_096,
+                recursive_split_trigger_nm_permille: 50,
+                flank_max: 64,
+                flank_min: 16,
+            }
+        };
+        let terminal = TerminalPolicy {
+            max_dp_query: 300,
+            max_recursive_query: if mode.is_sensitive() { 2_500 } else { 300 },
+            reference_slack: 256,
+            max_reference_window: 4_096,
+            max_nm_rate: 0.15,
+            kmer: 13,
+            endpoint_search: 25,
+            protect_indel_support: 8,
+            match_score: 1,
+            clip_penalty: 5,
+            min_clip_score_gain: 3,
+        };
+        let normalization = NormalizationPolicy {
+            // These passes are linear after the STR-prefix rewrite and are
+            // quality rules rather than search budgets. Keep them identical
+            // between modes so Fast does not manufacture SNP clusters merely
+            // to save a negligible amount of CIGAR work.
+            max_micro_match: 12,
+            str_left_alignment_window: usize::MAX,
+            phase_shift_window: 32,
+            divergent_terminal_window: 32,
+        };
+        let scoring = ScoringPolicy {
+            match_score: 2,
+            mismatch_penalty: 4,
+            gap_open: 6,
+            gap_extend: 1,
+        };
+        let work_budget = WorkBudget {
+            // Fast retains the existing eight-candidate ceiling. Sensitive
+            // can inspect the complete resolved candidate list.
+            max_candidates: if mode.is_sensitive() {
+                candidates.max_regions
+            } else {
+                8
+            },
+            competitive_score_fraction: 0.40,
+            full_search_score_fraction: 0.0,
+            weak_candidate_fraction: 0.50,
+            max_candidates_without_placement: 3,
+            high_coverage_fraction: 0.90,
+            low_coverage_fraction: 0.40,
+            limited_mapq_cap: if mode.is_sensitive() { 60 } else { 50 },
+            ambiguity_score_fraction: 0.90,
+            ambiguity_candidate_count: if mode.is_sensitive() { usize::MAX } else { 4 },
+            ambiguity_candidate_budget: 3,
+            ambiguity_mapq_cap: 5,
+        };
+        Self {
+            probes,
+            candidates,
+            anchors,
+            chaining,
+            structural,
+            gaps,
+            terminal,
+            normalization,
+            scoring,
+            work_budget,
+            mode,
+            runtime,
+        }
+    }
+
+    pub(crate) fn as_legacy_config(&self) -> Config {
+        Config {
+            seeding: SeedingConfig {
+                segment_size: self.probes.segment_size,
+                segment_overlap: self.probes.segment_overlap,
+                max_probes_per_segment: self.probes.max_probes_per_segment,
+                max_total_hits_scanned: self.probes.max_total_hits_scanned,
+                max_probe_frequency: self.probes.max_probe_frequency,
+            },
+            candidates: CandidateConfig {
+                max_regions: self.candidates.max_regions,
+                min_supporting_segments: self.candidates.min_supporting_segments,
+                anchor_k: self.anchors.anchor_k,
+                min_anchor_length: self.anchors.min_anchor_length,
+                max_anchors_per_region: self.anchors.max_anchors_per_region,
+                diagonal_tolerance: self.candidates.diagonal_tolerance,
+                paired_emms: self.anchors.paired_emms,
+                emms_max_mismatch_run: self.anchors.emms_max_mismatch_run,
+                emms_relock_span: self.anchors.emms_relock_span,
+                tiered_candidates: self.work_budget.full_search_score_fraction > 0.0,
+            },
+            alignment: AlignmentConfig {
+                bridge_flank: self.gaps.bridge_flank,
+                bridge_max_gap: self.gaps.bridge_max_gap,
+                mode: self.mode,
+            },
+            worker_pool: self.runtime.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigError {
     message: &'static str,
@@ -231,5 +711,63 @@ mod tests {
         let mut config = Config::default();
         config.worker_pool.workers = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn public_mapper_config_defaults_to_sensitive_and_validates_runtime() {
+        let config = MapperConfig::default();
+        assert_eq!(config.mode, AlignmentMode::Sensitive);
+        assert!(config.validate().is_ok());
+
+        let mut invalid = config;
+        invalid.runtime.workers = 0;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn resolved_modes_share_evidence_and_scoring_but_bound_work_differently() {
+        let fast = ResolvedMapperPolicy::from_mapper_config(&MapperConfig {
+            mode: AlignmentMode::Fast,
+            ..MapperConfig::default()
+        })
+        .unwrap();
+        let sensitive = ResolvedMapperPolicy::from_mapper_config(&MapperConfig::default()).unwrap();
+
+        assert_eq!(fast.probes, sensitive.probes);
+        assert_eq!(fast.anchors, sensitive.anchors);
+        assert_eq!(fast.scoring, sensitive.scoring);
+        assert_ne!(fast.gaps, sensitive.gaps);
+        assert_ne!(fast.work_budget, sensitive.work_budget);
+        assert_eq!(fast.gaps.recursive_split_max_depth, 2);
+        assert!(fast.gaps.recursive_split_trigger_nm_permille > 0);
+        assert_eq!(sensitive.gaps.recursive_split_trigger_nm_permille, 0);
+        assert_eq!(fast.normalization, sensitive.normalization);
+        assert_eq!(fast.terminal.max_recursive_query, 300);
+        assert!(sensitive.gaps.recursive_split_max_depth > 0);
+        assert!(sensitive.terminal.max_recursive_query > fast.terminal.max_recursive_query);
+    }
+
+    #[test]
+    fn compatibility_config_uses_the_sensitive_default() {
+        let policy = ResolvedMapperPolicy::from_legacy_config(&Config::default()).unwrap();
+        assert_eq!(policy.mode, AlignmentMode::Sensitive);
+        assert_eq!(
+            policy.gaps,
+            ResolvedMapperPolicy::for_mode(AlignmentMode::Sensitive, RuntimeConfig::default(),)
+                .gaps
+        );
+    }
+
+    #[test]
+    fn legacy_threshold_overrides_are_lowered_into_the_policy() {
+        let mut config = Config::default();
+        config.alignment.bridge_flank = 128;
+        config.alignment.bridge_max_gap = 4_000;
+        config.candidates.max_regions = 7;
+        let policy = ResolvedMapperPolicy::from_legacy_config(&config).unwrap();
+        assert_eq!(policy.gaps.bridge_flank, 128);
+        assert_eq!(policy.gaps.bridge_max_gap, 4_000);
+        assert_eq!(policy.candidates.max_regions, 7);
+        assert_eq!(policy.work_budget.max_candidates, 7);
     }
 }

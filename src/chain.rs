@@ -7,6 +7,7 @@
 //! evaluated over nearby colinear predecessors, then non-overlapping chains
 //! are recovered by score-ranked traceback.
 
+use crate::config::{ChainPolicy, ResolvedMapperPolicy, StructuralPolicy};
 use crate::{Anchor, Strand};
 use std::cell::RefCell;
 
@@ -70,10 +71,17 @@ pub struct ChainSet {
 /// same step score, reverse-strand coordinate rule, distance cap, and
 /// traceback policy.
 pub fn chain_anchors(anchors: Vec<Anchor>, read_len: usize, colinear_threshold: i32) -> ChainSet {
+    let policy = chain_policy_for_threshold(colinear_threshold);
+    chain_anchors_with_policy(anchors, read_len, &policy)
+}
+
+pub(crate) fn chain_anchors_with_policy(
+    anchors: Vec<Anchor>,
+    read_len: usize,
+    policy: &ChainPolicy,
+) -> ChainSet {
     let anchors_input = anchors.len();
-    let max_dist = (colinear_threshold.max(0) as u32)
-        .saturating_mul(20)
-        .max(MIN_MAX_DIST);
+    let max_dist = policy.max_dist;
 
     if anchors.is_empty() {
         return ChainSet {
@@ -81,7 +89,7 @@ pub fn chain_anchors(anchors: Vec<Anchor>, read_len: usize, colinear_threshold: 
             alternatives: Vec::new(),
             anchors_input,
             max_dist,
-            max_iter: MAX_ITER,
+            max_iter: policy.max_iter,
         };
     }
 
@@ -138,14 +146,14 @@ pub fn chain_anchors(anchors: Vec<Anchor>, read_len: usize, colinear_threshold: 
                 }
 
                 iterations += 1;
-                if iterations > MAX_ITER {
+                if iterations > policy.max_iter {
                     break;
                 }
 
                 let Some(step) = minimap_chain_step_score(
                     previous_anchor,
                     current_anchor,
-                    colinear_threshold,
+                    policy.diagonal_tolerance,
                     max_dist,
                 ) else {
                     continue;
@@ -221,9 +229,22 @@ pub fn chain_anchors(anchors: Vec<Anchor>, read_len: usize, colinear_threshold: 
             alternatives: chains,
             anchors_input,
             max_dist,
-            max_iter: MAX_ITER,
+            max_iter: policy.max_iter,
         }
     })
+}
+
+fn chain_policy_for_threshold(colinear_threshold: i32) -> ChainPolicy {
+    let defaults = ResolvedMapperPolicy::from_mapper_config(&crate::MapperConfig::default())
+        .expect("default mapper policy is valid")
+        .chaining;
+    ChainPolicy {
+        diagonal_tolerance: colinear_threshold,
+        max_dist: (colinear_threshold.max(0) as u32)
+            .saturating_mul(20)
+            .max(MIN_MAX_DIST),
+        max_iter: defaults.max_iter,
+    }
 }
 
 fn strand_key(strand: Strand) -> u8 {
@@ -302,6 +323,82 @@ fn minimap_chain_step_score(
         score -= (linear_penalty + logarithmic_penalty) as i32;
     }
     Some(score)
+}
+
+/// Join two strong, query-disjoint chains when their geometry describes one
+/// long insertion or deletion. The ordinary chainer deliberately rejects
+/// these diagonal jumps; this second stage requires substantially stronger
+/// evidence on both flanks and does not perform a large DP.
+pub(crate) fn bridge_structural_indel_chains(
+    first: &Chain,
+    second: &Chain,
+    read_len: usize,
+    policy: &StructuralPolicy,
+) -> Option<Chain> {
+    let (left, right) = if first.q_start <= second.q_start {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let left_anchor = left.anchors.first()?;
+    let right_anchor = right.anchors.first()?;
+    if left_anchor.ref_id != right_anchor.ref_id || left_anchor.strand != right_anchor.strand {
+        return None;
+    }
+    if !has_structural_flank_support(left, policy) || !has_structural_flank_support(right, policy) {
+        return None;
+    }
+
+    let query_gap = ordered_gap(
+        left.q_end as u64,
+        right.q_start as u64,
+        policy.max_bridge_overlap as u64,
+    )? as u32;
+    let reference_gap_u64 = match left_anchor.strand {
+        Strand::Forward => ordered_gap(
+            left.ref_end,
+            right.ref_start,
+            policy.max_bridge_overlap as u64,
+        )?,
+        Strand::Reverse => ordered_gap(
+            right.ref_end,
+            left.ref_start,
+            policy.max_bridge_overlap as u64,
+        )?,
+    };
+    let reference_gap = u32::try_from(reference_gap_u64).ok()?;
+    let indel_len = query_gap.abs_diff(reference_gap);
+    if indel_len < policy.min_bridge_indel
+        || indel_len > policy.max_bridge_indel
+        || query_gap.min(reference_gap) > policy.max_bridge_context
+    {
+        return None;
+    }
+
+    let mut anchors = Vec::with_capacity(left.anchors.len() + right.anchors.len());
+    anchors.extend_from_slice(&left.anchors);
+    anchors.extend_from_slice(&right.anchors);
+    let mut merged = build_chain(anchors, read_len, true);
+    merged.score = left
+        .score
+        .saturating_add(right.score)
+        .saturating_sub(policy.bridge_score_penalty);
+    merged.split_candidate = true;
+    Some(merged)
+}
+
+fn ordered_gap(left_end: u64, right_start: u64, max_overlap: u64) -> Option<u64> {
+    if right_start >= left_end {
+        Some(right_start - left_end)
+    } else {
+        (left_end - right_start <= max_overlap).then_some(0)
+    }
+}
+
+fn has_structural_flank_support(chain: &Chain, policy: &StructuralPolicy) -> bool {
+    chain.query_covered_bases >= policy.min_flank_covered_bases
+        && (chain.anchors.len() >= policy.min_flank_anchors
+            || chain.longest_anchor >= policy.min_flank_covered_bases)
 }
 
 fn build_chain(mut anchors: Vec<Anchor>, read_len: usize, is_primary: bool) -> Chain {
@@ -397,7 +494,7 @@ fn build_chain(mut anchors: Vec<Anchor>, read_len: usize, is_primary: bool) -> C
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ContigId;
+    use crate::{ContigId, MapperConfig};
 
     fn anchor(
         q_start: u32,
@@ -416,6 +513,77 @@ mod tests {
             strand,
             score,
         }
+    }
+
+    fn structural_policy() -> StructuralPolicy {
+        ResolvedMapperPolicy::from_mapper_config(&MapperConfig::default())
+            .unwrap()
+            .structural
+    }
+
+    #[test]
+    fn strong_split_chains_bridge_a_three_kilobase_insertion() {
+        let anchors = vec![
+            anchor(0, 300, 1_000, 1_300, Strand::Forward, 300),
+            anchor(300, 600, 1_300, 1_600, Strand::Forward, 300),
+            anchor(3_565, 3_865, 1_600, 1_900, Strand::Forward, 300),
+            anchor(3_865, 4_165, 1_900, 2_200, Strand::Forward, 300),
+        ];
+        let chains = chain_anchors(anchors, 4_165, 2_000);
+        let primary = chains.primary.as_ref().expect("primary split chain");
+        let alternative = chains.alternatives.first().expect("other SV flank");
+
+        let merged =
+            bridge_structural_indel_chains(primary, alternative, 4_165, &structural_policy())
+                .expect("strong colinear flanks should bridge");
+
+        assert_eq!(merged.anchors.len(), 4);
+        assert_eq!(merged.q_start, 0);
+        assert_eq!(merged.q_end, 4_165);
+        assert_eq!(merged.ref_start, 1_000);
+        assert_eq!(merged.ref_end, 2_200);
+        assert_eq!(merged.max_query_gap, 2_965);
+        assert!(merged.split_candidate);
+    }
+
+    #[test]
+    fn structural_bridge_obeys_reverse_strand_geometry() {
+        let anchors = vec![
+            anchor(0, 300, 1_900, 2_200, Strand::Reverse, 300),
+            anchor(300, 600, 1_600, 1_900, Strand::Reverse, 300),
+            anchor(3_565, 3_865, 1_300, 1_600, Strand::Reverse, 300),
+            anchor(3_865, 4_165, 1_000, 1_300, Strand::Reverse, 300),
+        ];
+        let chains = chain_anchors(anchors, 4_165, 2_000);
+        let merged = bridge_structural_indel_chains(
+            chains.primary.as_ref().unwrap(),
+            chains.alternatives.first().unwrap(),
+            4_165,
+            &structural_policy(),
+        )
+        .expect("reverse-strand insertion should bridge");
+
+        assert_eq!(merged.anchors.len(), 4);
+        assert_eq!(merged.max_query_gap, 2_965);
+        assert_eq!(merged.ref_start, 1_000);
+        assert_eq!(merged.ref_end, 2_200);
+    }
+
+    #[test]
+    fn structural_bridge_rejects_weak_flanks() {
+        let left = build_chain(
+            vec![anchor(0, 100, 1_000, 1_100, Strand::Forward, 100)],
+            3_200,
+            true,
+        );
+        let right = build_chain(
+            vec![anchor(3_100, 3_200, 1_100, 1_200, Strand::Forward, 100)],
+            3_200,
+            false,
+        );
+        assert!(
+            bridge_structural_indel_chains(&left, &right, 3_200, &structural_policy(),).is_none()
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Sparse query-probe extraction.
 
+use crate::config::{ProbePolicy, ResolvedMapperPolicy};
 use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt};
 use crate::{segment_read, Config, QuerySeed, Read, SeedIndex, SeedLookup, Segment};
 
@@ -43,8 +44,22 @@ pub fn extract_backbone_probes(
     index: &dyn SeedIndex,
     config: &Config,
 ) -> Vec<Probe> {
-    let max_probes = config.seeding.max_probes_per_segment;
-    if max_probes == 0 || segment.is_empty() {
+    let policy = legacy_probe_policy(config);
+    extract_backbone_probes_with_policy(read, segment, index, &policy)
+}
+
+pub(crate) fn extract_backbone_probes_with_policy(
+    read: Read<'_>,
+    segment: &Segment,
+    index: &dyn SeedIndex,
+    policy: &ProbePolicy,
+) -> Vec<Probe> {
+    let max_probes = policy.max_probes_per_segment;
+    if max_probes == 0
+        || segment.is_empty()
+        || segment.read_start > segment.read_end
+        || segment.read_end > read.sequence.len()
+    {
         return Vec::new();
     }
 
@@ -57,7 +72,7 @@ pub fn extract_backbone_probes(
             return true;
         }
         if matches!(lookup.completeness, crate::HitCompleteness::Sampled { .. })
-            || frequency as usize > config.seeding.max_probe_frequency
+            || frequency as usize > policy.max_probe_frequency
         {
             return true;
         }
@@ -127,12 +142,8 @@ pub(crate) fn extract_read_probes_from_seeds(
     read: Read<'_>,
     query_seeds: &[QuerySeed],
     index: &dyn SeedIndex,
-    config: &Config,
+    policy: &ProbePolicy,
 ) -> Vec<Probe> {
-    const END_WINDOW: usize = 1_000;
-    const END_PROBES_PER_END: usize = 4;
-    const END_MAX_FREQUENCY: usize = 250;
-
     let seed_span = index.seed_span();
     let mut ranked = Vec::with_capacity(query_seeds.len());
     for &seed in query_seeds {
@@ -140,24 +151,22 @@ pub(crate) fn extract_read_probes_from_seeds(
         if !matches!(lookup.completeness, crate::HitCompleteness::Complete)
             || lookup.reported_hits == 0
             || lookup.reported_hits as usize
-                > config.seeding.max_probe_frequency.max(END_MAX_FREQUENCY)
+                > policy
+                    .max_probe_frequency
+                    .max(policy.endpoint_max_frequency)
         {
             continue;
         }
         ranked.push((seed, lookup.reported_hits));
     }
 
-    let segments = segment_read(
-        read.sequence,
-        config.seeding.segment_size,
-        config.seeding.segment_overlap,
-    );
+    let segments = segment_read(read.sequence, policy.segment_size, policy.segment_overlap);
     let mut probes = Vec::new();
     for segment in &segments {
         let candidates = ranked
             .iter()
             .filter(|(seed, frequency)| {
-                *frequency as usize <= config.seeding.max_probe_frequency
+                *frequency as usize <= policy.max_probe_frequency
                     && seed.query_pos as usize >= segment.read_start
                     && (seed.query_pos as usize).saturating_add(seed_span) <= segment.read_end
             })
@@ -166,11 +175,11 @@ pub(crate) fn extract_read_probes_from_seeds(
         probes.extend(select_spaced_probes(
             candidates,
             segment.len(),
-            config.seeding.max_probes_per_segment,
+            policy.max_probes_per_segment,
         ));
     }
 
-    let window_len = END_WINDOW.min(read.sequence.len());
+    let window_len = policy.endpoint_window.min(read.sequence.len());
     if window_len > 0 {
         for (window_start, window_end, segment_index) in [
             (0, window_len, LEFT_ENDPOINT_SEGMENT),
@@ -183,7 +192,7 @@ pub(crate) fn extract_read_probes_from_seeds(
             let mut candidates: Vec<Probe> = ranked
                 .iter()
                 .filter(|(seed, frequency)| {
-                    *frequency as usize <= END_MAX_FREQUENCY
+                    *frequency as usize <= policy.endpoint_max_frequency
                         && seed.query_pos as usize >= window_start
                         && (seed.query_pos as usize).saturating_add(seed_span) <= window_end
                 })
@@ -192,7 +201,7 @@ pub(crate) fn extract_read_probes_from_seeds(
                 })
                 .collect();
             candidates.sort_by_key(|probe| (probe.frequency, probe.read_pos, probe.seed.key()));
-            candidates.truncate(END_PROBES_PER_END);
+            candidates.truncate(policy.endpoint_probes_per_end);
             for (rank, probe) in candidates.iter_mut().enumerate() {
                 probe.rank = rank + 1;
             }
@@ -205,25 +214,27 @@ pub(crate) fn extract_read_probes_from_seeds(
 
 /// Segment a read and select backbone probes from every segment.
 pub fn extract_read_probes(read: Read<'_>, index: &dyn SeedIndex, config: &Config) -> Vec<Probe> {
-    let mut probes: Vec<Probe> = segment_read(
-        read.sequence,
-        config.seeding.segment_size,
-        config.seeding.segment_overlap,
-    )
-    .iter()
-    .flat_map(|segment| extract_backbone_probes(read, segment, index, config))
-    .collect();
+    let policy = legacy_probe_policy(config);
+    extract_read_probes_with_policy(read, index, &policy)
+}
 
-    // The resolved FlashMap LR default adds a small, fixed endpoint probe
+pub(crate) fn extract_read_probes_with_policy(
+    read: Read<'_>,
+    index: &dyn SeedIndex,
+    policy: &ProbePolicy,
+) -> Vec<Probe> {
+    let mut probes: Vec<Probe> =
+        segment_read(read.sequence, policy.segment_size, policy.segment_overlap)
+            .iter()
+            .flat_map(|segment| extract_backbone_probes_with_policy(read, segment, index, policy))
+            .collect();
+
+    // The resolved LR policy adds a small, fixed endpoint probe
     // set after the backbone pass.  Keep this staging internal to the one
     // profile: endpoint probes are not a second seed schedule or a public
     // configuration choice, but they prevent an otherwise well-supported
     // locus from losing both read ends during candidate clustering.
-    const END_WINDOW: usize = 1_000;
-    const END_PROBES_PER_END: usize = 4;
-    // Resolved HiFiBalanced/SvSensitive FlashMap default.
-    const END_MAX_FREQUENCY: usize = 250;
-    let window_len = END_WINDOW.min(read.sequence.len());
+    let window_len = policy.endpoint_window.min(read.sequence.len());
     if window_len > 0 {
         append_endpoint_probes(
             &mut probes,
@@ -232,8 +243,8 @@ pub fn extract_read_probes(read: Read<'_>, index: &dyn SeedIndex, config: &Confi
             0,
             window_len,
             LEFT_ENDPOINT_SEGMENT,
-            END_PROBES_PER_END,
-            END_MAX_FREQUENCY,
+            policy.endpoint_probes_per_end,
+            policy.endpoint_max_frequency,
         );
         let right_start = read.sequence.len().saturating_sub(window_len);
         append_endpoint_probes(
@@ -243,12 +254,22 @@ pub fn extract_read_probes(read: Read<'_>, index: &dyn SeedIndex, config: &Confi
             right_start,
             read.sequence.len(),
             RIGHT_ENDPOINT_SEGMENT,
-            END_PROBES_PER_END,
-            END_MAX_FREQUENCY,
+            policy.endpoint_probes_per_end,
+            policy.endpoint_max_frequency,
         );
     }
 
     deduplicate_probes(probes)
+}
+
+fn legacy_probe_policy(config: &Config) -> ProbePolicy {
+    ResolvedMapperPolicy::from_legacy_config(config)
+        .map(|policy| policy.probes)
+        .unwrap_or_else(|_| {
+            ResolvedMapperPolicy::from_mapper_config(&crate::MapperConfig::default())
+                .expect("default mapper policy is valid")
+                .probes
+        })
 }
 
 fn deduplicate_probes(mut probes: Vec<Probe>) -> Vec<Probe> {
@@ -498,5 +519,16 @@ mod tests {
             .filter(|probe| probe.read_pos == 600 && probe.seed.key() == SeedKey::new(7, 7))
             .count();
         assert_eq!(at_overlap, 1);
+    }
+
+    #[test]
+    fn invalid_public_segment_is_ignored_without_panicking() {
+        let read = Read::new("r", b"ACGT");
+        let segment = Segment {
+            index: 0,
+            read_start: 3,
+            read_end: 9,
+        };
+        assert!(extract_backbone_probes(read, &segment, &TestIndex, &Config::default()).is_empty());
     }
 }

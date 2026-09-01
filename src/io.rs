@@ -7,7 +7,10 @@
 //! [`crate::InMemorySeedIndex`], so the parser/output boundary does not choose
 //! a production on-disk index format.
 
-use crate::{Alignment, CigarOp, ContigId, InMemoryReference, MappedRead, OwnedRead, Strand};
+use crate::{
+    Alignment, AlignmentError, CigarOp, ContigId, InMemoryReference, MappedRead, OwnedRead, Read,
+    ReadError, Strand,
+};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -87,7 +90,8 @@ impl std::error::Error for FastxError {
 /// Sequence lines may be wrapped. FASTQ quality lines may also be wrapped and
 /// are consumed until exactly the sequence length is reached. Names are
 /// represented by the first whitespace-delimited token, matching SAM QNAME
-/// conventions and avoiding header descriptions in downstream records.
+/// conventions. Header comments are reduced to valid SAM optional fields;
+/// ordinary free-form descriptions are intentionally not emitted as tags.
 pub struct FastxReader<R> {
     reader: R,
     line_number: usize,
@@ -170,9 +174,8 @@ impl<R: BufRead> FastxReader<R> {
         let name = parts.next().unwrap_or_default().trim().to_owned();
         let tags = parts
             .next()
-            .map(|t| t.trim())
-            .filter(|t| !t.is_empty())
-            .map(|t| t.to_owned());
+            .map(crate::tags::normalize_optional_fields)
+            .filter(|t| !t.is_empty());
         if name.is_empty() {
             return Err(FastxError::EmptyName { line });
         }
@@ -386,6 +389,8 @@ struct SamContig {
 pub enum SamError {
     Io(io::Error),
     InvalidField(&'static str),
+    InvalidRead(ReadError),
+    InvalidAlignment(AlignmentError),
     MissingContig(ContigId),
     CoordinateOverflow,
     QualityLength { sequence: usize, qualities: usize },
@@ -396,6 +401,10 @@ impl std::fmt::Display for SamError {
         match self {
             Self::Io(error) => write!(f, "SAM output failed: {error}"),
             Self::InvalidField(field) => write!(f, "invalid tab/newline in SAM {field}"),
+            Self::InvalidRead(error) => write!(f, "invalid read for SAM output: {error}"),
+            Self::InvalidAlignment(error) => {
+                write!(f, "invalid alignment for SAM output: {error}")
+            }
             Self::MissingContig(id) => write!(f, "alignment refers to missing contig {}", id.0),
             Self::CoordinateOverflow => f.write_str("SAM coordinate overflow"),
             Self::QualityLength {
@@ -413,6 +422,8 @@ impl std::error::Error for SamError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::InvalidRead(error) => Some(error),
+            Self::InvalidAlignment(error) => Some(error),
             _ => None,
         }
     }
@@ -421,6 +432,18 @@ impl std::error::Error for SamError {
 impl From<io::Error> for SamError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<ReadError> for SamError {
+    fn from(error: ReadError) -> Self {
+        Self::InvalidRead(error)
+    }
+}
+
+impl From<AlignmentError> for SamError {
+    fn from(error: AlignmentError) -> Self {
+        Self::InvalidAlignment(error)
     }
 }
 
@@ -438,7 +461,7 @@ impl<W: Write> SamWriter<W> {
     /// Construct a writer from any reference metadata provider.  The metadata
     /// is copied once (names are tiny compared with a WGS index), so this
     /// output adapter works equally with the in-memory FASTA fixture and an
-    /// mmap-backed [`crate::FmiIndex`].
+    /// mmap-backed [`crate::MinimizerIndex`].
     pub fn from_contigs<I, N>(mut writer: W, contigs: I) -> Result<Self, SamError>
     where
         I: IntoIterator<Item = (ContigId, N, usize)>,
@@ -462,27 +485,29 @@ impl<W: Write> SamWriter<W> {
 
     pub fn write_mapped_read(&mut self, mapped: &MappedRead) -> Result<(), SamError> {
         ensure_sam_field(&mapped.name, "QNAME")?;
-        if let Some(qualities) = &mapped.qualities {
-            if qualities.len() != mapped.sequence.len() {
-                return Err(SamError::QualityLength {
-                    sequence: mapped.sequence.len(),
-                    qualities: qualities.len(),
-                });
-            }
-        }
+        Read::with_qualities_and_tags(
+            &mapped.name,
+            &mapped.sequence,
+            mapped.qualities.as_deref(),
+            mapped.tags.as_deref(),
+        )
+        .validate()?;
         if let Some(primary) = mapped.mapping.primary.as_ref() {
+            // Validate the whole chimeric set before emitting the primary so
+            // an invalid supplementary cannot leave a partially written read.
+            primary.validate()?;
+            self.alignment_contig_name(primary)?;
+            for supplementary in &mapped.mapping.supplementary {
+                supplementary.validate()?;
+                self.alignment_contig_name(supplementary)?;
+            }
             self.write_alignment(mapped, primary, false)?;
         } else {
             write!(self.writer, "{}\t4\t*\t0\t0\t*\t*\t0\t0\t", mapped.name)?;
             write_sam_sequence(&mut self.writer, &mapped.sequence, false)?;
             self.writer.write_all(b"\t")?;
             write_sam_quality(&mut self.writer, mapped.qualities.as_deref(), false)?;
-            if let Some(tags) = &mapped.tags {
-                let normalized = tags.split_whitespace().collect::<Vec<_>>().join("\t");
-                if !normalized.is_empty() {
-                    write!(self.writer, "\t{}", normalized)?;
-                }
-            }
+            write_optional_fields(&mut self.writer, mapped.tags.as_deref(), &[])?;
             self.writer.write_all(b"\n")?;
         }
         for supplementary in &mapped.mapping.supplementary {
@@ -509,12 +534,8 @@ impl<W: Write> SamWriter<W> {
         alignment: &Alignment,
         supplementary: bool,
     ) -> Result<(), SamError> {
-        let name = self
-            .reference
-            .iter()
-            .find(|contig| contig.id == alignment.contig)
-            .map(|contig| contig.name.as_str())
-            .ok_or(SamError::MissingContig(alignment.contig))?;
+        alignment.validate()?;
+        let name = self.alignment_contig_name(alignment)?.to_owned();
         let pos = alignment
             .ref_start
             .checked_add(1)
@@ -527,7 +548,7 @@ impl<W: Write> SamWriter<W> {
         if supplementary {
             flag |= 0x800;
         }
-        ensure_sam_field(name, "reference name")?;
+        ensure_sam_field(&name, "reference name")?;
         let reverse = alignment.strand == Strand::Reverse;
 
         write!(
@@ -545,23 +566,83 @@ impl<W: Write> SamWriter<W> {
             "\tNM:i:{}\tAS:i:{}",
             alignment.edit_distance, alignment.score
         )?;
-        if let Some(tags) = &mapped.tags {
-            if reverse {
-                let transformed =
-                    crate::tags::transform_tags_for_reverse_strand(tags, &mapped.sequence);
-                if !transformed.is_empty() {
-                    write!(self.writer, "\t{}", transformed)?;
-                }
-            } else {
-                let normalized = tags.split_whitespace().collect::<Vec<_>>().join("\t");
-                if !normalized.is_empty() {
-                    write!(self.writer, "\t{}", normalized)?;
-                }
-            }
-        }
+        write_optional_fields(
+            &mut self.writer,
+            mapped.tags.as_deref(),
+            &["NM", "AS", "SA"],
+        )?;
+        self.write_sa_tag(mapped, alignment)?;
         writeln!(self.writer)?;
         Ok(())
     }
+
+    fn alignment_contig_name(&self, alignment: &Alignment) -> Result<&str, SamError> {
+        self.reference
+            .iter()
+            .find(|contig| contig.id == alignment.contig)
+            .map(|contig| contig.name.as_str())
+            .ok_or(SamError::MissingContig(alignment.contig))
+    }
+
+    fn write_sa_tag(&mut self, mapped: &MappedRead, current: &Alignment) -> Result<(), SamError> {
+        let record_count = usize::from(mapped.mapping.primary.is_some())
+            .saturating_add(mapped.mapping.supplementary.len());
+        if record_count <= 1 {
+            return Ok(());
+        }
+
+        self.writer.write_all(b"\tSA:Z:")?;
+        if let Some(primary) = mapped.mapping.primary.as_ref() {
+            if !std::ptr::eq(primary, current) {
+                self.write_sa_entry(primary)?;
+            }
+        }
+        for supplementary in &mapped.mapping.supplementary {
+            if !std::ptr::eq(supplementary, current) {
+                self.write_sa_entry(supplementary)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_sa_entry(&mut self, alignment: &Alignment) -> Result<(), SamError> {
+        let name = self.alignment_contig_name(alignment)?.to_owned();
+        let pos = alignment
+            .ref_start
+            .checked_add(1)
+            .ok_or(SamError::CoordinateOverflow)?;
+        write!(
+            self.writer,
+            "{name},{pos},{},",
+            if alignment.strand == Strand::Reverse {
+                '-'
+            } else {
+                '+'
+            }
+        )?;
+        write_sam_cigar(&mut self.writer, alignment)?;
+        write!(
+            self.writer,
+            ",{},{};",
+            alignment.mapq, alignment.edit_distance
+        )?;
+        Ok(())
+    }
+}
+
+fn write_optional_fields<W: Write>(
+    writer: &mut W,
+    tags: Option<&str>,
+    excluded: &[&str],
+) -> io::Result<()> {
+    let Some(tags) = tags else {
+        return Ok(());
+    };
+    let normalized = crate::tags::normalize_optional_fields_excluding(tags, excluded);
+    if !normalized.is_empty() {
+        write!(writer, "\t{normalized}")?;
+    }
+    Ok(())
 }
 
 /// An output sink for SAM/BAM records.
@@ -880,6 +961,7 @@ mod tests {
         let second = reader.next().unwrap().unwrap();
         assert_eq!(first.name, "r0");
         assert_eq!(first.sequence, b"ACGT");
+        assert_eq!(first.tags, None);
         assert_eq!(second.sequence, b"NN");
         assert_eq!(reader.format(), Some(FastxFormat::Fasta));
         assert!(reader.next().is_none());
@@ -893,6 +975,14 @@ mod tests {
         assert_eq!(read.name, "r0");
         assert_eq!(read.sequence, b"ACGT");
         assert_eq!(read.qualities.as_deref(), Some(&b"!\"#$"[..]));
+    }
+
+    #[test]
+    fn fastq_reader_keeps_only_valid_optional_fields_from_comment() {
+        let input = b"@r0 free description RG:Z:sample MM:Z:C+m?,0; bad-token\nACGT\n+\n!!!!\n";
+        let mut reader = FastxReader::new(Cursor::new(input));
+        let read = reader.next().unwrap().unwrap();
+        assert_eq!(read.tags.as_deref(), Some("RG:Z:sample\tMM:Z:C+m?,0;"));
     }
 
     #[test]
@@ -932,6 +1022,7 @@ mod tests {
                 primary: Some(alignment),
                 supplementary: Vec::new(),
                 diagnostics: None,
+                placement_search: Default::default(),
             },
         };
         let mut output = Vec::new();
@@ -968,6 +1059,7 @@ mod tests {
                 primary: Some(alignment),
                 supplementary: Vec::new(),
                 diagnostics: None,
+                placement_search: Default::default(),
             },
         };
         let mut output = Vec::new();
@@ -987,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn sam_writer_transfers_and_reverses_methylation_tags() {
+    fn sam_writer_preserves_methylation_tags_on_both_strands() {
         let reference = InMemoryReference::from_sequences([("chr0", b"ACACCCCCAA".to_vec())]);
         let cigar = crate::Cigar::new([CigarOp::Match(10)]).unwrap();
         let alignment_fwd =
@@ -1004,6 +1096,7 @@ mod tests {
                 primary: Some(alignment_fwd),
                 supplementary: Vec::new(),
                 diagnostics: None,
+                placement_search: Default::default(),
             },
         };
 
@@ -1016,6 +1109,7 @@ mod tests {
                 primary: Some(alignment_rev),
                 supplementary: Vec::new(),
                 diagnostics: None,
+                placement_search: Default::default(),
             },
         };
 
@@ -1032,7 +1126,111 @@ mod tests {
         // Forward preserves verbatim
         assert!(line_fwd.contains("MM:Z:C+m?,1,2;\tML:B:C,100,200\tRG:Z:sample1"));
 
-        // Reverse inverts strand (+ -> -), recalculates deltas, and reverses ML probabilities
-        assert!(line_rev.contains("MM:Z:C-m?,1,2;\tML:B:C,200,100\tRG:Z:sample1"));
+        // MM/ML retain their as-sequenced orientation even when FLAG 0x10 is set.
+        assert!(line_rev.contains("MM:Z:C+m?,1,2;\tML:B:C,100,200\tRG:Z:sample1"));
+    }
+
+    #[test]
+    fn sam_writer_preserves_tags_on_reverse_supplementary_alignment() {
+        let reference = InMemoryReference::from_sequences([("chr0", b"ACGTACGT".to_vec())]);
+        let cigar = crate::Cigar::new([CigarOp::Match(4)]).unwrap();
+        let primary =
+            Alignment::new(ContigId(0), 0, Strand::Reverse, 0, cigar.clone(), 4, 42, 0).unwrap();
+        let supplementary =
+            Alignment::new(ContigId(0), 4, Strand::Reverse, 0, cigar, 4, 30, 0).unwrap();
+        let mapped = MappedRead {
+            name: "supp-reverse".to_owned(),
+            sequence: b"ACGT".to_vec(),
+            qualities: Some(b"IIII".to_vec()),
+            tags: Some("MM:Z:C+m?,0; ML:B:C,200 RG:Z:sample".to_owned()),
+            mapping: crate::MappingResult {
+                primary: Some(primary),
+                supplementary: vec![supplementary],
+                diagnostics: None,
+                placement_search: Default::default(),
+            },
+        };
+        let mut output = Vec::new();
+        let mut writer = SamWriter::new(&mut output, &reference).unwrap();
+        writer.write_mapped_read(&mapped).unwrap();
+
+        let text = String::from_utf8(output).unwrap();
+        let records: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("supp-reverse\t"))
+            .collect();
+        assert_eq!(records.len(), 2);
+        for record in &records {
+            let fields: Vec<_> = record.split('\t').collect();
+            assert!(fields[1] == "16" || fields[1] == "2064");
+            assert_eq!(fields[9], "ACGT");
+            assert!(record.contains("MM:Z:C+m?,0;\tML:B:C,200\tRG:Z:sample"));
+        }
+        assert!(records[0].contains("\tSA:Z:chr0,5,-,4M,30,0;"));
+        assert!(records[1].contains("\tSA:Z:chr0,1,-,4M,42,0;"));
+    }
+
+    #[test]
+    fn sam_writer_rejects_invalid_alignment_before_writing_record() {
+        let reference = InMemoryReference::from_sequences([("chr0", b"ACGT".to_vec())]);
+        let cigar = crate::Cigar::new([CigarOp::Match(4)]).unwrap();
+        let mut alignment =
+            Alignment::new(ContigId(0), 0, Strand::Forward, 0, cigar, 4, 42, 0).unwrap();
+        alignment.ref_end += 1;
+        let mapped = MappedRead {
+            name: "invalid".to_owned(),
+            sequence: b"ACGT".to_vec(),
+            qualities: None,
+            tags: None,
+            mapping: crate::MappingResult {
+                primary: Some(alignment),
+                supplementary: Vec::new(),
+                diagnostics: None,
+                placement_search: Default::default(),
+            },
+        };
+        let mut output = Vec::new();
+        let mut writer = SamWriter::new(&mut output, &reference).unwrap();
+        assert!(matches!(
+            writer.write_mapped_read(&mapped),
+            Err(SamError::InvalidAlignment(_))
+        ));
+        assert!(!String::from_utf8(output).unwrap().contains("invalid\t"));
+    }
+
+    #[test]
+    fn sam_writer_drops_free_form_and_generated_duplicate_tags() {
+        let reference = InMemoryReference::from_sequences([("chr0", b"ACGT".to_vec())]);
+        let cigar = crate::Cigar::new([CigarOp::Match(4)]).unwrap();
+        let alignment =
+            Alignment::new(ContigId(0), 0, Strand::Forward, 0, cigar, 4, 42, 0).unwrap();
+        let mapped = MappedRead {
+            name: "tags".to_owned(),
+            sequence: b"ACGT".to_vec(),
+            qualities: None,
+            tags: Some(
+                "free comment NM:i:99 AS:i:-1 SA:Z:stale,1,+,4M,1,0; RG:Z:sample".to_owned(),
+            ),
+            mapping: crate::MappingResult {
+                primary: Some(alignment),
+                supplementary: Vec::new(),
+                diagnostics: None,
+                placement_search: Default::default(),
+            },
+        };
+        let mut output = Vec::new();
+        let mut writer = SamWriter::new(&mut output, &reference).unwrap();
+        writer.write_mapped_read(&mapped).unwrap();
+        let record = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .find(|line| line.starts_with("tags\t"))
+            .unwrap()
+            .to_owned();
+        assert!(record.contains("\tNM:i:0\tAS:i:4\tRG:Z:sample"));
+        assert!(!record.contains("free comment"));
+        assert!(!record.contains("NM:i:99"));
+        assert!(!record.contains("AS:i:-1"));
+        assert!(!record.contains("SA:Z:stale"));
     }
 }

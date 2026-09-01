@@ -9,11 +9,11 @@ pub struct Segment {
 
 impl Segment {
     pub fn len(&self) -> usize {
-        self.read_end - self.read_start
+        self.read_end.saturating_sub(self.read_start)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.read_start == self.read_end
+        self.read_start >= self.read_end
     }
 }
 

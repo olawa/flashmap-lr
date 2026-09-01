@@ -11,6 +11,8 @@
 
 use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt, FxHashSet as HashSet, FxHashSetExt};
 
+use crate::config::{AnchorPolicy, ResolvedMapperPolicy};
+use crate::dna::{base_code, encode_kmer};
 use crate::{
     CandidateRegion, Config, ContigId, QuerySeed, Read, Reference, SeedHit, SeedIndex, SeedLookup,
     Strand,
@@ -51,46 +53,6 @@ impl std::fmt::Display for AnchorError {
 }
 
 impl std::error::Error for AnchorError {}
-
-/// Fixed values inherited from FlashMap's resolved `HiFiBalanced` profile.
-///
-/// These are not a second profile. They are the parts of the resolved policy
-/// that were not yet represented by `Config` when RS-LRA's public boundary was
-/// created. Keeping them private prevents the extracted core from growing a
-/// matrix of experimental anchor flags.
-#[derive(Clone, Copy, Debug)]
-struct DefaultAnchorPolicy {
-    reference_flank: usize,
-    max_local_kmer_hits: usize,
-    paired_min_distance: usize,
-    paired_max_distance: usize,
-    paired_distance_tolerance: usize,
-    paired_max_pairs: usize,
-    max_right_pair_candidates: usize,
-    sufficient_anchor_count: usize,
-    sufficient_span_permille: usize,
-    sufficient_coverage_permille: usize,
-}
-
-impl Default for DefaultAnchorPolicy {
-    fn default() -> Self {
-        Self {
-            // `lr_anchor_ref_flank` in HiFiBalanced -> SvSensitive.
-            reference_flank: 1024,
-            // `lr_max_local_kmer_hits` in HiFiBalanced -> SvSensitive.
-            max_local_kmer_hits: 8000,
-            // Fixed paired-minimizer staging values from the same profile.
-            paired_min_distance: 64,
-            paired_max_distance: 512,
-            paired_distance_tolerance: 12,
-            paired_max_pairs: 256,
-            max_right_pair_candidates: 12,
-            sufficient_anchor_count: 6,
-            sufficient_span_permille: 750,
-            sufficient_coverage_permille: 350,
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 struct MatchingSeedHits {
@@ -253,12 +215,20 @@ pub fn find_anchors(
 ) -> Result<Vec<Anchor>, AnchorError> {
     let query_seeds = index.query_seeds(read.sequence);
     let query_seed_hits = cache_query_seed_hits(&query_seeds, index);
-    find_anchors_with_seed_hits(read, candidate, reference, config, &query_seed_hits)
+    let anchor_policy = legacy_anchor_policy(config);
+    find_anchors_with_seed_hits_with_policy(
+        read,
+        candidate,
+        reference,
+        &anchor_policy,
+        &query_seed_hits,
+    )
 }
 
 /// Discover anchors using query seed hits that were already collected for this
 /// read. [`crate::Aligner::map`] uses this entry point so the same minimizer
 /// extraction and index lookups are shared across all candidate regions.
+#[allow(dead_code)]
 pub(crate) fn find_anchors_with_seed_hits(
     read: Read<'_>,
     candidate: &CandidateRegion,
@@ -266,12 +236,57 @@ pub(crate) fn find_anchors_with_seed_hits(
     config: &Config,
     query_seed_hits: &CachedQuerySeedHits,
 ) -> Result<Vec<Anchor>, AnchorError> {
-    find_anchors_with_seed_hits_depth(read, candidate, reference, config, query_seed_hits, true)
+    let anchor_policy = legacy_anchor_policy(config);
+    find_anchors_with_seed_hits_with_policy(
+        read,
+        candidate,
+        reference,
+        &anchor_policy,
+        query_seed_hits,
+    )
+}
+
+pub(crate) fn find_anchors_with_seed_hits_with_policy(
+    read: Read<'_>,
+    candidate: &CandidateRegion,
+    reference: &dyn Reference,
+    anchor_policy: &AnchorPolicy,
+    query_seed_hits: &CachedQuerySeedHits,
+) -> Result<Vec<Anchor>, AnchorError> {
+    find_anchors_with_seed_hits_depth(
+        read,
+        candidate,
+        reference,
+        anchor_policy,
+        query_seed_hits,
+        true,
+        None,
+    )
+}
+
+pub(crate) fn find_anchors_with_seed_hits_with_policy_and_diagnostics(
+    read: Read<'_>,
+    candidate: &CandidateRegion,
+    reference: &dyn Reference,
+    anchor_policy: &AnchorPolicy,
+    query_seed_hits: &CachedQuerySeedHits,
+    diagnostics: &mut crate::ReadDiagnostics,
+) -> Result<Vec<Anchor>, AnchorError> {
+    find_anchors_with_seed_hits_depth(
+        read,
+        candidate,
+        reference,
+        anchor_policy,
+        query_seed_hits,
+        true,
+        Some(diagnostics),
+    )
 }
 
 /// Cheap competitor evidence: paired EMMS plus paired exact Stage A only.
 /// The caller may use this to estimate MAPQ without constructing a local
 /// k-mer table for every weak candidate.
+#[allow(dead_code)]
 pub(crate) fn find_sparse_anchors_with_seed_hits(
     read: Read<'_>,
     candidate: &CandidateRegion,
@@ -279,24 +294,71 @@ pub(crate) fn find_sparse_anchors_with_seed_hits(
     config: &Config,
     query_seed_hits: &CachedQuerySeedHits,
 ) -> Result<Vec<Anchor>, AnchorError> {
-    find_anchors_with_seed_hits_depth(read, candidate, reference, config, query_seed_hits, false)
+    let anchor_policy = legacy_anchor_policy(config);
+    find_anchors_with_seed_hits_depth(
+        read,
+        candidate,
+        reference,
+        &anchor_policy,
+        query_seed_hits,
+        false,
+        None,
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn find_sparse_anchors_with_seed_hits_with_policy(
+    read: Read<'_>,
+    candidate: &CandidateRegion,
+    reference: &dyn Reference,
+    anchor_policy: &AnchorPolicy,
+    query_seed_hits: &CachedQuerySeedHits,
+) -> Result<Vec<Anchor>, AnchorError> {
+    find_anchors_with_seed_hits_depth(
+        read,
+        candidate,
+        reference,
+        anchor_policy,
+        query_seed_hits,
+        false,
+        None,
+    )
+}
+
+pub(crate) fn find_sparse_anchors_with_seed_hits_with_policy_and_diagnostics(
+    read: Read<'_>,
+    candidate: &CandidateRegion,
+    reference: &dyn Reference,
+    anchor_policy: &AnchorPolicy,
+    query_seed_hits: &CachedQuerySeedHits,
+    diagnostics: &mut crate::ReadDiagnostics,
+) -> Result<Vec<Anchor>, AnchorError> {
+    find_anchors_with_seed_hits_depth(
+        read,
+        candidate,
+        reference,
+        anchor_policy,
+        query_seed_hits,
+        false,
+        Some(diagnostics),
+    )
 }
 
 fn find_anchors_with_seed_hits_depth(
     read: Read<'_>,
     candidate: &CandidateRegion,
     reference: &dyn Reference,
-    config: &Config,
+    anchor_policy: &AnchorPolicy,
     query_seed_hits: &CachedQuerySeedHits,
     allow_local_fallback: bool,
+    mut diagnostics: Option<&mut crate::ReadDiagnostics>,
 ) -> Result<Vec<Anchor>, AnchorError> {
     read.validate().map_err(AnchorError::InvalidRead)?;
-    let policy = DefaultAnchorPolicy::default();
-    let k = config.candidates.anchor_k;
+    let k = anchor_policy.anchor_k;
     if k == 0
         || k > 32
-        || config.candidates.min_anchor_length < k
-        || config.candidates.max_anchors_per_region == 0
+        || anchor_policy.min_anchor_length < k
+        || anchor_policy.max_anchors_per_region == 0
     {
         return Err(AnchorError::InvalidConfiguration);
     }
@@ -318,10 +380,10 @@ fn find_anchors_with_seed_hits_depth(
 
     let window_start = candidate
         .ref_start
-        .saturating_sub(policy.reference_flank as u64) as usize;
+        .saturating_sub(anchor_policy.reference_flank as u64) as usize;
     let window_end = candidate
         .ref_end
-        .saturating_add(policy.reference_flank as u64)
+        .saturating_add(anchor_policy.reference_flank as u64)
         .min(reference_len) as usize;
     if window_start >= window_end || window_end > contig.sequence.len() {
         return Err(AnchorError::InvalidCandidateBounds);
@@ -340,7 +402,7 @@ fn find_anchors_with_seed_hits_depth(
     matching_seed_hits.sort_unstable_by_key(|seed| seed.query_pos);
 
     let (prioritized_positions, paired_hits, paired_emms_pairs) =
-        build_paired_staging(candidate.strand, &matching_seed_hits, policy);
+        build_paired_staging(candidate.strand, &matching_seed_hits, *anchor_policy);
 
     let scan_end = read.sequence.len() - k;
     let mut local_kmer_map = None;
@@ -348,7 +410,7 @@ fn find_anchors_with_seed_hits_depth(
     let mut coverage = AnchorCoverage::default();
     let mut seen_seed_hits = HashSet::new();
     let mut kmer_hits = 0usize;
-    let max_kmer_hits = policy
+    let max_kmer_hits = anchor_policy
         .max_local_kmer_hits
         .max(read.sequence.len().div_ceil(1000) * 1000);
     let mut full_span_found = false;
@@ -356,9 +418,12 @@ fn find_anchors_with_seed_hits_depth(
     // A compatible equal-distance pair already supplies exact support at
     // both ends. Validate its diagonal span with the bounded EMMS rule before
     // constructing LocalKmerMap or entering the dense fallback.
-    if config.candidates.paired_emms {
+    if anchor_policy.paired_emms {
         for pair in paired_emms_pairs {
-            let Some(anchor) = build_paired_emms_anchor(
+            if let Some(stats) = diagnostics.as_deref_mut() {
+                stats.emms_pairs_considered = stats.emms_pairs_considered.saturating_add(1);
+            }
+            let Some((anchor, mismatches)) = build_paired_emms_anchor(
                 read.sequence,
                 contig.sequence,
                 candidate,
@@ -366,11 +431,26 @@ fn find_anchors_with_seed_hits_depth(
                 query_seed_hits.seed_span,
                 window_start,
                 window_end,
-                config.candidates.emms_max_mismatch_run,
-                config.candidates.emms_relock_span,
+                anchor_policy.emms_max_mismatch_run,
+                anchor_policy.emms_relock_span,
             ) else {
                 continue;
             };
+            if let Some(stats) = diagnostics.as_deref_mut() {
+                stats.emms_anchors_accepted = stats.emms_anchors_accepted.saturating_add(1);
+                stats.emms_anchor_bases = stats
+                    .emms_anchor_bases
+                    .saturating_add(u64::from(anchor.q_end.saturating_sub(anchor.q_start)));
+                if mismatches > 0 {
+                    stats.emms_variant_anchors = stats.emms_variant_anchors.saturating_add(1);
+                    stats.emms_variant_anchor_bases = stats
+                        .emms_variant_anchor_bases
+                        .saturating_add(u64::from(anchor.q_end.saturating_sub(anchor.q_start)));
+                }
+                stats.emms_anchor_mismatches = stats
+                    .emms_anchor_mismatches
+                    .saturating_add(mismatches as u64);
+            }
             coverage.insert(anchor);
             raw_anchors.push(anchor);
         }
@@ -437,7 +517,7 @@ fn find_anchors_with_seed_hits_depth(
                     k,
                     window_start,
                     window_end,
-                    min_length: config.candidates.min_anchor_length,
+                    min_length: anchor_policy.min_anchor_length,
                 }) else {
                     continue;
                 };
@@ -469,7 +549,7 @@ fn find_anchors_with_seed_hits_depth(
         &mut full_span_found,
     );
 
-    let sufficient = is_sufficient_anchors(&raw_anchors, read.sequence.len(), policy);
+    let sufficient = is_sufficient_anchors(&raw_anchors, read.sequence.len(), *anchor_policy);
 
     if allow_local_fallback && !full_span_found && !sufficient {
         // Stage B: remaining minimizer positions. The map is built lazily and
@@ -492,7 +572,7 @@ fn find_anchors_with_seed_hits_depth(
 
     if allow_local_fallback
         && !full_span_found
-        && !is_sufficient_anchors(&raw_anchors, read.sequence.len(), policy)
+        && !is_sufficient_anchors(&raw_anchors, read.sequence.len(), *anchor_policy)
     {
         // Stage C: dense positions not already visited as minimizers.
         let dense: Vec<usize> = (0..=scan_end)
@@ -512,7 +592,7 @@ fn find_anchors_with_seed_hits_depth(
     Ok(deduplicate_anchors(
         raw_anchors,
         candidate,
-        config.candidates.max_anchors_per_region,
+        anchor_policy.max_anchors_per_region,
     ))
 }
 
@@ -575,7 +655,7 @@ fn collect_matching_seed_hits(
 fn build_paired_staging(
     strand: Strand,
     matching_seed_hits: &[MatchingSeedHits],
-    policy: DefaultAnchorPolicy,
+    policy: AnchorPolicy,
 ) -> (
     Vec<usize>,
     HashMap<usize, Vec<u64>>,
@@ -672,7 +752,7 @@ fn build_paired_emms_anchor(
     window_end: usize,
     max_mismatch_run: usize,
     relock_span: usize,
-) -> Option<Anchor> {
+) -> Option<(Anchor, usize)> {
     const MAX_MISMATCHES: usize = 32;
     const MAX_MISMATCH_PERCENT: usize = 8;
 
@@ -735,15 +815,18 @@ fn build_paired_emms_anchor(
     if awaiting_relock || mismatches * 100 > span_len * MAX_MISMATCH_PERCENT {
         return None;
     }
-    Some(Anchor {
-        ref_id: candidate.contig,
-        ref_start,
-        ref_end,
-        q_start: pair.q_left as u32,
-        q_end: q_end as u32,
-        strand: candidate.strand,
-        score: span_len.saturating_sub(mismatches).min(i32::MAX as usize) as i32,
-    })
+    Some((
+        Anchor {
+            ref_id: candidate.contig,
+            ref_start,
+            ref_end,
+            q_start: pair.q_left as u32,
+            q_end: q_end as u32,
+            strand: candidate.strand,
+            score: span_len.saturating_sub(mismatches).min(i32::MAX as usize) as i32,
+        },
+        mismatches,
+    ))
 }
 
 struct ExactAnchorRequest<'a> {
@@ -898,7 +981,7 @@ fn deduplicate_anchors(
     kept
 }
 
-fn is_sufficient_anchors(anchors: &[Anchor], read_len: usize, policy: DefaultAnchorPolicy) -> bool {
+fn is_sufficient_anchors(anchors: &[Anchor], read_len: usize, policy: AnchorPolicy) -> bool {
     if anchors.len() < policy.sufficient_anchor_count {
         return false;
     }
@@ -936,6 +1019,16 @@ fn merged_query_coverage(anchors: &[Anchor]) -> usize {
         }
     }
     total + (current_end - current_start) as usize
+}
+
+fn legacy_anchor_policy(config: &Config) -> AnchorPolicy {
+    ResolvedMapperPolicy::from_legacy_config(config)
+        .map(|policy| policy.anchors)
+        .unwrap_or_else(|_| {
+            ResolvedMapperPolicy::from_mapper_config(&crate::MapperConfig::default())
+                .expect("default mapper policy is valid")
+                .anchors
+        })
 }
 
 fn is_full_span_anchor(q_start: u32, q_end: u32, read_len: usize, length: i32) -> bool {
@@ -985,27 +1078,6 @@ fn bases_match(query: u8, reference: u8, strand: Strand) -> bool {
         reference_code ^= 0b11;
     }
     query_code == reference_code
-}
-
-fn base_code(base: u8) -> Option<u8> {
-    match base.to_ascii_uppercase() {
-        b'A' => Some(0),
-        b'C' => Some(1),
-        b'G' => Some(2),
-        b'T' => Some(3),
-        _ => None,
-    }
-}
-
-fn encode_kmer(sequence: &[u8]) -> Option<u64> {
-    if sequence.len() > 32 {
-        return None;
-    }
-    let mut code = 0u64;
-    for &base in sequence {
-        code = (code << 2) | base_code(base)? as u64;
-    }
-    Some(code)
 }
 
 fn reverse_complement_code(mut code: u64, k: usize) -> u64 {
@@ -1147,7 +1219,7 @@ mod tests {
         let reference = vec![b'A'; 256];
         let mut query = reference.clone();
         query[80] = b'C';
-        let anchor = build_paired_emms_anchor(
+        let (anchor, mismatches) = build_paired_emms_anchor(
             &query,
             &reference,
             &candidate(reference.len(), Strand::Forward),
@@ -1167,6 +1239,7 @@ mod tests {
         assert_eq!((anchor.q_start, anchor.q_end), (16, 136));
         assert_eq!((anchor.ref_start, anchor.ref_end), (16, 136));
         assert_eq!(anchor.score, 119);
+        assert_eq!(mismatches, 1);
     }
 
     #[test]
@@ -1198,7 +1271,7 @@ mod tests {
         let reference = vec![b'A'; 256];
         let mut query = vec![b'T'; 256];
         query[80] = b'G';
-        let anchor = build_paired_emms_anchor(
+        let (anchor, mismatches) = build_paired_emms_anchor(
             &query,
             &reference,
             &candidate(reference.len(), Strand::Reverse),
@@ -1217,6 +1290,7 @@ mod tests {
         .expect("reverse paired span should be accepted");
         assert_eq!((anchor.ref_start, anchor.ref_end), (16, 136));
         assert_eq!(anchor.strand, Strand::Reverse);
+        assert_eq!(mismatches, 1);
     }
 
     fn test_complement(base: u8) -> u8 {

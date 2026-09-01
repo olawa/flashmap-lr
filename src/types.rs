@@ -293,13 +293,13 @@ pub enum CigarOp {
 }
 
 impl CigarOp {
-    fn len(self) -> u32 {
+    pub(crate) const fn len(self) -> u32 {
         match self {
             Self::Match(n) | Self::Ins(n) | Self::Del(n) | Self::SoftClip(n) => n,
         }
     }
 
-    fn same_kind(self, other: Self) -> bool {
+    pub(crate) const fn same_kind(self, other: Self) -> bool {
         matches!(
             (self, other),
             (Self::Match(_), Self::Match(_))
@@ -309,7 +309,7 @@ impl CigarOp {
         )
     }
 
-    fn with_len(self, len: u32) -> Self {
+    pub(crate) const fn with_len(self, len: u32) -> Self {
         match self {
             Self::Match(_) => Self::Match(len),
             Self::Ins(_) => Self::Ins(len),
@@ -325,6 +325,34 @@ impl CigarOp {
     pub const fn consumes_reference(self) -> bool {
         matches!(self, Self::Match(_) | Self::Del(_))
     }
+}
+
+/// Normalize a mutable operation buffer without allocating. Zero-length
+/// operations are removed and adjacent operations of the same kind are
+/// merged with saturating length semantics used by the repair pipeline.
+pub(crate) fn normalize_cigar_ops(ops: &mut Vec<CigarOp>) {
+    let mut write = 0usize;
+    for read in 0..ops.len() {
+        let op = ops[read];
+        if op.len() == 0 {
+            continue;
+        }
+        if write > 0 && ops[write - 1].same_kind(op) {
+            let merged = ops[write - 1].len().saturating_add(op.len());
+            ops[write - 1] = ops[write - 1].with_len(merged);
+        } else {
+            ops[write] = op;
+            write += 1;
+        }
+    }
+    ops.truncate(write);
+}
+
+pub(crate) fn query_consumed(ops: &[CigarOp]) -> usize {
+    ops.iter()
+        .filter(|op| op.consumes_query())
+        .map(|op| op.len() as usize)
+        .sum()
 }
 
 /// A validated, normalized CIGAR.
@@ -544,12 +572,38 @@ impl std::fmt::Display for AlignmentError {
 
 impl std::error::Error for AlignmentError {}
 
+/// Whether candidate evaluation considered the complete configured search
+/// space. A limited search must be reflected in MAPQ because an absent
+/// runner-up is not evidence of uniqueness.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SearchCompleteness {
+    #[default]
+    Complete,
+    Limited,
+}
+
+/// Metadata describing the placement search performed for one read.
+///
+/// `primary_score` and `runner_up_score` are placement-ranking scores (chain
+/// score plus fixed endpoint evidence), before CIGAR assembly.
+/// `alternatives_seen` counts distinct retained competitors;
+/// it is intentionally separate from the number of candidate regions because
+/// several regions may collapse to one placement.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PlacementSearchResult {
+    pub primary_score: Option<i32>,
+    pub runner_up_score: Option<i32>,
+    pub alternatives_seen: usize,
+    pub completeness: SearchCompleteness,
+}
+
 /// Core mapping output.  SAM/BAM encoding is deliberately left to an adapter.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MappingResult {
     pub primary: Option<Alignment>,
     pub supplementary: Vec<Alignment>,
     pub diagnostics: Option<crate::ReadDiagnostics>,
+    pub placement_search: PlacementSearchResult,
 }
 
 /// A mapping result paired with the source read.
@@ -572,6 +626,19 @@ pub struct MappedRead {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutable_cigar_normalization_removes_zero_ops_and_merges_neighbors() {
+        let mut ops = vec![
+            CigarOp::Match(3),
+            CigarOp::Match(0),
+            CigarOp::Match(2),
+            CigarOp::Ins(1),
+            CigarOp::Ins(2),
+        ];
+        normalize_cigar_ops(&mut ops);
+        assert_eq!(ops, vec![CigarOp::Match(5), CigarOp::Ins(3)]);
+    }
 
     #[test]
     fn cigar_is_normalized_and_lengths_are_computed() {

@@ -1,5 +1,6 @@
 //! Candidate-region clustering from sparse probe hits.
 
+use crate::config::{CandidatePolicy, ProbePolicy, ResolvedMapperPolicy};
 use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt, FxHashSet as HashSet};
 use crate::probes::{LEFT_ENDPOINT_SEGMENT, RIGHT_ENDPOINT_SEGMENT};
 use crate::{Config, ContigId, Probe, SeedHit, SeedIndex, Strand};
@@ -43,6 +44,24 @@ impl EndpointSupport {
             _ => 0,
         }
     }
+
+    pub(crate) fn merged(self, other: Self) -> Self {
+        let left = matches!(self, Self::LeftOnly | Self::BothEnds)
+            || matches!(other, Self::LeftOnly | Self::BothEnds);
+        let right = matches!(self, Self::RightOnly | Self::BothEnds)
+            || matches!(other, Self::RightOnly | Self::BothEnds);
+        match (left, right) {
+            (true, true) => Self::BothEnds,
+            (true, false) => Self::LeftOnly,
+            (false, true) => Self::RightOnly,
+            (false, false)
+                if matches!(self, Self::InternalOnly) || matches!(other, Self::InternalOnly) =>
+            {
+                Self::InternalOnly
+            }
+            (false, false) => Self::None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -64,23 +83,54 @@ pub fn cluster_probe_hits(
     index: &dyn SeedIndex,
     config: &Config,
 ) -> Vec<CandidateRegion> {
-    let inferred_read_len = probes
-        .iter()
-        .map(|probe| probe.read_pos as usize + index.seed_span())
-        .max()
-        .unwrap_or(0);
-    cluster_probe_hits_for_read(probes, inferred_read_len, index, config)
+    let policy = legacy_policies(config);
+    cluster_probe_hits_for_read_with_policy(
+        probes,
+        probes
+            .iter()
+            .map(|probe| probe.read_pos as usize + index.seed_span())
+            .max()
+            .unwrap_or(0),
+        index,
+        &policy.0,
+        &policy.1,
+    )
 }
 
-/// Cluster probes when the adapter can provide the exact read length. The
-/// fixed endpoint score adjustment is defined only for reads at least 2 kb;
-/// keeping this as an internal companion preserves the small public clustering
-/// API for callers that already have a probe list.
+pub(crate) fn cluster_probe_hits_with_policy(
+    probes: &[Probe],
+    read_len: usize,
+    index: &dyn SeedIndex,
+    probe_policy: &ProbePolicy,
+    candidate_policy: &CandidatePolicy,
+) -> Vec<CandidateRegion> {
+    cluster_probe_hits_for_read_with_policy(probes, read_len, index, probe_policy, candidate_policy)
+}
+
+/// Compatibility wrapper for callers that already have an exact read length.
+#[allow(dead_code)]
 pub(crate) fn cluster_probe_hits_for_read(
     probes: &[Probe],
     read_len: usize,
     index: &dyn SeedIndex,
     config: &Config,
+) -> Vec<CandidateRegion> {
+    let (probe_policy, candidate_policy) = legacy_policies(config);
+    cluster_probe_hits_for_read_with_policy(
+        probes,
+        read_len,
+        index,
+        &probe_policy,
+        &candidate_policy,
+    )
+}
+
+fn cluster_probe_hits_for_read_with_policy(
+    probes: &[Probe],
+    read_len: usize,
+    index: &dyn SeedIndex,
+    probe_policy: &ProbePolicy,
+    candidate_policy: &CandidatePolicy,
 ) -> Vec<CandidateRegion> {
     if probes.is_empty() {
         return Vec::new();
@@ -89,13 +139,13 @@ pub(crate) fn cluster_probe_hits_for_read(
     let mut groups: HashMap<(ContigId, Strand), Vec<ProbeHit>> = HashMap::new();
     let mut total_hits_scanned = 0usize;
     for probe in probes {
-        if total_hits_scanned >= config.seeding.max_total_hits_scanned {
+        if total_hits_scanned >= probe_policy.max_total_hits_scanned {
             break;
         }
         let mut visited = 0usize;
         let lookup = index.visit_hits(&probe.seed, &mut |hit| {
             visited = visited.saturating_add(1);
-            if total_hits_scanned + visited > config.seeding.max_total_hits_scanned {
+            if total_hits_scanned + visited > probe_policy.max_total_hits_scanned {
                 return;
             }
             let strand = effective_strand(probe.seed.strand, hit.strand);
@@ -131,7 +181,7 @@ pub(crate) fn cluster_probe_hits_for_read(
         for hit in hits {
             let joins = cluster.last().is_some_and(|last: &ProbeHit| {
                 (hit.diagonal - last.diagonal).unsigned_abs()
-                    <= config.candidates.diagonal_tolerance as u64
+                    <= candidate_policy.diagonal_tolerance.max(0) as u64
             });
             if !joins && !cluster.is_empty() {
                 add_cluster(
@@ -139,7 +189,7 @@ pub(crate) fn cluster_probe_hits_for_read(
                     &cluster,
                     read_len,
                     index.seed_span(),
-                    config,
+                    candidate_policy,
                 );
                 cluster.clear();
             }
@@ -151,7 +201,7 @@ pub(crate) fn cluster_probe_hits_for_read(
                 &cluster,
                 read_len,
                 index.seed_span(),
-                config,
+                candidate_policy,
             );
         }
     }
@@ -164,7 +214,7 @@ pub(crate) fn cluster_probe_hits_for_read(
             .then_with(|| a.ref_end.cmp(&b.ref_end))
             .then_with(|| strand_key(a.strand).cmp(&strand_key(b.strand)))
     });
-    candidates.truncate(config.candidates.max_regions);
+    candidates.truncate(candidate_policy.max_regions);
     candidates
 }
 
@@ -173,10 +223,10 @@ fn add_cluster(
     cluster: &[ProbeHit],
     read_len: usize,
     seed_span: usize,
-    config: &Config,
+    policy: &CandidatePolicy,
 ) {
     let segments: HashSet<usize> = cluster.iter().map(|hit| hit.probe.segment_index).collect();
-    if segments.len() < config.candidates.min_supporting_segments {
+    if segments.len() < policy.min_supporting_segments {
         return;
     }
 
@@ -188,7 +238,11 @@ fn add_cluster(
         .map(|hit| hit.hit.ref_pos)
         .max()
         .unwrap_or(ref_start);
-    let ref_end = ref_last.saturating_add(seed_span as u64);
+    let Some(ref_end) = ref_last.checked_add(seed_span as u64) else {
+        // A malformed index hit must not wrap or silently clamp a candidate
+        // into a plausible-looking interval.
+        return;
+    };
     let unique_probes: HashSet<QueryProbeKey> = cluster
         .iter()
         .map(|hit| QueryProbeKey {
@@ -209,7 +263,7 @@ fn add_cluster(
         }
         let delta_mean = (hit.diagonal - diagonal_mean as i64).unsigned_abs();
         let delta_median = (hit.diagonal - diagonal_median as i64).unsigned_abs();
-        delta_mean.min(delta_median) <= config.candidates.diagonal_tolerance.max(0) as u64
+        delta_mean.min(delta_median) <= policy.diagonal_tolerance.max(0) as u64
     };
     let left_endpoint_support: HashSet<QueryProbeKey> = cluster
         .iter()
@@ -293,6 +347,16 @@ fn strand_key(strand: Strand) -> u8 {
         Strand::Forward => 0,
         Strand::Reverse => 1,
     }
+}
+
+fn legacy_policies(config: &Config) -> (ProbePolicy, CandidatePolicy) {
+    ResolvedMapperPolicy::from_legacy_config(config)
+        .map(|policy| (policy.probes, policy.candidates))
+        .unwrap_or_else(|_| {
+            let policy = ResolvedMapperPolicy::from_mapper_config(&crate::MapperConfig::default())
+                .expect("default mapper policy is valid");
+            (policy.probes, policy.candidates)
+        })
 }
 
 #[cfg(test)]

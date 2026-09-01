@@ -4,37 +4,87 @@
 //! [`crate::WorkerPool`] and call this kernel from its workers.
 
 use crate::anchors::{
-    cache_query_seed_hits, find_anchors_with_seed_hits, find_sparse_anchors_with_seed_hits,
-    CachedQuerySeedHits,
+    cache_query_seed_hits, find_anchors_with_seed_hits_with_policy_and_diagnostics,
+    find_sparse_anchors_with_seed_hits_with_policy_and_diagnostics, CachedQuerySeedHits,
 };
-use crate::candidates::{cluster_probe_hits_for_read, EndpointSupport};
+use crate::candidates::{cluster_probe_hits_with_policy, EndpointSupport};
+use crate::config::{
+    AlignmentMode, Config, ConfigError, MapperConfig, ResolvedMapperPolicy, RuntimeConfig,
+    StructuralPolicy,
+};
 use crate::probes::extract_read_probes_from_seeds;
 use crate::{
-    build_chain_alignment, chain_anchors, Anchor, Chain, Config, ConfigError, DiagnosticsSink,
-    MapError, MappedRead, MappingResult, OwnedRead, Read, ReadDiagnostics, Reference, SeedIndex,
+    Anchor, Chain, DiagnosticsSink, MapError, MappedRead, MappingResult, OwnedRead,
+    PlacementSearchResult, Read, ReadDiagnostics, Reference, SearchCompleteness, SeedIndex,
     WorkerPool, WorkerPoolError, WorkerPoolStats,
 };
 use std::convert::Infallible;
 use std::time::Instant;
 
+/// Configuration accepted by [`Aligner::new`].
+///
+/// `Mapper` is the stable RS-LRA interface. `Legacy` keeps the phase-level
+/// `Config` API source-compatible while callers migrate; both variants are
+/// resolved to the same immutable policy before the first read is mapped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AlignerConfig {
+    Mapper(MapperConfig),
+    Legacy(Config),
+}
+
+impl From<MapperConfig> for AlignerConfig {
+    fn from(config: MapperConfig) -> Self {
+        Self::Mapper(config)
+    }
+}
+
+impl From<Config> for AlignerConfig {
+    fn from(config: Config) -> Self {
+        Self::Legacy(config)
+    }
+}
+
 pub struct Aligner<'a> {
     reference: &'a dyn Reference,
     index: &'a dyn SeedIndex,
-    config: Config,
+    policy: ResolvedMapperPolicy,
+    mapper_config: MapperConfig,
+    compatibility_config: Config,
     diagnostics: Option<&'a dyn DiagnosticsSink>,
 }
 
+type ChainPlacement = (crate::ContigId, Chain, EndpointSupport);
+
 impl<'a> Aligner<'a> {
-    pub fn new(
+    pub fn new<C>(
         reference: &'a dyn Reference,
         index: &'a dyn SeedIndex,
-        config: Config,
-    ) -> Result<Self, ConfigError> {
-        config.validate()?;
+        config: C,
+    ) -> Result<Self, ConfigError>
+    where
+        C: Into<AlignerConfig>,
+    {
+        let (policy, mapper_config, compatibility_config) = match config.into() {
+            AlignerConfig::Mapper(config) => {
+                let policy = ResolvedMapperPolicy::from_mapper_config(&config)?;
+                let compatibility_config = policy.as_legacy_config();
+                (policy, config, compatibility_config)
+            }
+            AlignerConfig::Legacy(config) => {
+                let policy = ResolvedMapperPolicy::from_legacy_config(&config)?;
+                let mapper_config = MapperConfig {
+                    mode: policy.mode,
+                    runtime: policy.runtime.clone(),
+                };
+                (policy, mapper_config, config)
+            }
+        };
         Ok(Self {
             reference,
             index,
-            config,
+            policy,
+            mapper_config,
+            compatibility_config,
             diagnostics: None,
         })
     }
@@ -45,7 +95,25 @@ impl<'a> Aligner<'a> {
     }
 
     pub fn config(&self) -> &Config {
-        &self.config
+        &self.compatibility_config
+    }
+
+    /// Public mode/runtime configuration used to resolve this aligner.
+    ///
+    /// The older [`Self::config`] accessor remains available for callers that
+    /// still consume phase-level thresholds; new code should use this method.
+    pub fn mapper_config(&self) -> &MapperConfig {
+        &self.mapper_config
+    }
+
+    /// Return the resolved public mode selected at construction time.
+    pub fn mode(&self) -> AlignmentMode {
+        self.policy.mode
+    }
+
+    /// Runtime settings for the fixed worker-pool entry point.
+    pub fn runtime_config(&self) -> &RuntimeConfig {
+        &self.policy.runtime
     }
 
     pub fn reference(&self) -> &'a dyn Reference {
@@ -82,8 +150,18 @@ impl<'a> Aligner<'a> {
                 crate::AnchorError::MissingReference(contig_id),
             ))?;
             let cigar_started = Instant::now();
-            let primary = build_chain_alignment(read, contig, &chain, 60, &self.config)
-                .map_err(MapError::Cigar)?;
+            let primary = crate::alignment::build_chain_alignment_with_policy(
+                read,
+                contig,
+                &chain,
+                60,
+                &self.policy.gaps,
+                &self.policy.terminal,
+                &self.policy.normalization,
+                &self.policy.scoring,
+                Some(&mut diagnostics),
+            )
+            .map_err(MapError::Cigar)?;
             diagnostics.cigar_nanos = elapsed_nanos(cigar_started);
             diagnostics.exact_fastpath_accepted = 1;
             diagnostics.anchors = 1;
@@ -95,16 +173,28 @@ impl<'a> Aligner<'a> {
                 primary: Some(primary),
                 supplementary: Vec::new(),
                 diagnostics: self.diagnostics.map(|_| diagnostics),
+                placement_search: PlacementSearchResult {
+                    primary_score: Some(chain.score),
+                    runner_up_score: None,
+                    alternatives_seen: 0,
+                    completeness: SearchCompleteness::Complete,
+                },
             });
         }
         let phase_started = Instant::now();
-        let probes = extract_read_probes_from_seeds(read, &query_seeds, self.index, &self.config);
+        let probes =
+            extract_read_probes_from_seeds(read, &query_seeds, self.index, &self.policy.probes);
         diagnostics.probe_nanos = elapsed_nanos(phase_started);
         diagnostics.seeds_seen = saturating_u32(probes.len());
         diagnostics.seeds_used = diagnostics.seeds_seen;
         let phase_started = Instant::now();
-        let candidates =
-            cluster_probe_hits_for_read(&probes, read.sequence.len(), self.index, &self.config);
+        let candidates = cluster_probe_hits_with_policy(
+            &probes,
+            read.sequence.len(),
+            self.index,
+            &self.policy.probes,
+            &self.policy.candidates,
+        );
         diagnostics.candidate_nanos = elapsed_nanos(phase_started);
         diagnostics.candidates = saturating_u32(candidates.len());
 
@@ -123,33 +213,85 @@ impl<'a> Aligner<'a> {
 
         let mut placements = Vec::new();
         let top_candidate_score = candidates.first().map(|c| c.score).unwrap_or(0);
-        let min_competitive_score = (top_candidate_score as f32 * 0.40) as i32;
-        let min_full_score = (top_candidate_score as f32 * 0.70) as i32;
-        let max_candidates = self.config.candidates.max_regions.min(8);
+        let min_competitive_score = (top_candidate_score as f32
+            * self.policy.work_budget.competitive_score_fraction)
+            as i32;
+        let min_full_score = (top_candidate_score as f32
+            * self.policy.work_budget.full_search_score_fraction)
+            as i32;
+        let max_candidates = self
+            .policy
+            .work_budget
+            .max_candidates
+            .min(self.policy.candidates.max_regions);
+        let ambiguity_score_floor =
+            (top_candidate_score as f32 * self.policy.work_budget.ambiguity_score_fraction) as i32;
+        let near_tied_candidates = candidates
+            .iter()
+            .take(max_candidates)
+            .take_while(|candidate| candidate.score >= ambiguity_score_floor)
+            .count();
+        let ambiguity_limited =
+            near_tied_candidates >= self.policy.work_budget.ambiguity_candidate_count;
+        let candidate_budget = if ambiguity_limited {
+            diagnostics.ambiguous_candidate_stops = 1;
+            let budget = self
+                .policy
+                .work_budget
+                .ambiguity_candidate_budget
+                .min(max_candidates);
+            diagnostics.ambiguous_candidates_skipped =
+                saturating_u32(max_candidates.saturating_sub(budget));
+            budget
+        } else {
+            max_candidates
+        };
+        // Candidate clustering itself caps the returned list. Reaching that
+        // cap, or applying the mode's smaller candidate budget, means the
+        // absence of a runner-up cannot be interpreted as proof of uniqueness.
+        let mut search_completeness = if candidates.len() >= self.policy.candidates.max_regions
+            || candidates.len() >= candidate_budget
+        {
+            SearchCompleteness::Limited
+        } else {
+            SearchCompleteness::Complete
+        };
 
-        for (idx, candidate) in candidates.iter().take(max_candidates).enumerate() {
+        for (idx, candidate) in candidates.iter().take(candidate_budget).enumerate() {
             if idx > 0 && !placements.is_empty() {
                 if candidate.score < min_competitive_score {
+                    search_completeness = SearchCompleteness::Limited;
                     break;
                 }
                 // When an existing placement already has near-perfect anchor coverage (>=90%),
                 // weaker candidate regions (<50% of top seed score) cannot compete.
                 let best_covered_fraction = placements
                     .iter()
-                    .map(|p: &(crate::ContigId, Chain, EndpointSupport)| p.1.query_covered_fraction)
+                    .map(|p: &ChainPlacement| p.1.query_covered_fraction)
                     .fold(0.0f64, f64::max);
-                if best_covered_fraction >= 0.90
-                    && candidate.score < (top_candidate_score as f32 * 0.50) as i32
+                if best_covered_fraction >= self.policy.work_budget.high_coverage_fraction
+                    && candidate.score
+                        < (top_candidate_score as f32
+                            * self.policy.work_budget.weak_candidate_fraction)
+                            as i32
                 {
+                    search_completeness = SearchCompleteness::Limited;
                     break;
                 }
             }
-            if idx >= 3 && placements.is_empty() {
+            if idx >= self.policy.work_budget.max_candidates_without_placement
+                && placements.is_empty()
+            {
+                search_completeness = SearchCompleteness::Limited;
                 break;
             }
-            let full_search = !self.config.candidates.tiered_candidates
+            let full_search = self.policy.work_budget.full_search_score_fraction <= 0.0
                 || candidate.score >= min_full_score
-                || (placements.is_empty() && idx < 3);
+                || (placements.is_empty()
+                    && idx < self.policy.work_budget.max_candidates_without_placement);
+            if !full_search {
+                search_completeness = SearchCompleteness::Limited;
+            }
             if full_search {
                 diagnostics.full_anchor_searches =
                     diagnostics.full_anchor_searches.saturating_add(1);
@@ -159,20 +301,22 @@ impl<'a> Aligner<'a> {
             }
             let phase_started = Instant::now();
             let mut anchors = if full_search {
-                find_anchors_with_seed_hits(
+                find_anchors_with_seed_hits_with_policy_and_diagnostics(
                     read,
                     candidate,
                     self.reference,
-                    &self.config,
+                    &self.policy.anchors,
                     &query_seed_hits,
+                    &mut diagnostics,
                 )
             } else {
-                find_sparse_anchors_with_seed_hits(
+                find_sparse_anchors_with_seed_hits_with_policy_and_diagnostics(
                     read,
                     candidate,
                     self.reference,
-                    &self.config,
+                    &self.policy.anchors,
                     &query_seed_hits,
+                    &mut diagnostics,
                 )
             }
             .map_err(MapError::Anchor)?;
@@ -191,26 +335,29 @@ impl<'a> Aligner<'a> {
             if idx > 0 && !placements.is_empty() {
                 let best_covered_fraction = placements
                     .iter()
-                    .map(|p: &(crate::ContigId, Chain, EndpointSupport)| p.1.query_covered_fraction)
+                    .map(|p: &ChainPlacement| p.1.query_covered_fraction)
                     .fold(0.0f64, f64::max);
-                if best_covered_fraction >= 0.85 {
+                if best_covered_fraction >= self.policy.work_budget.high_coverage_fraction {
                     let total_anchor_span: usize = anchors
                         .iter()
                         .map(|a| a.q_end.saturating_sub(a.q_start) as usize)
                         .sum();
                     let approx_coverage =
                         total_anchor_span as f64 / read.sequence.len().max(1) as f64;
-                    if approx_coverage < best_covered_fraction * 0.40 {
+                    if approx_coverage
+                        < best_covered_fraction * self.policy.work_budget.low_coverage_fraction
+                    {
+                        search_completeness = SearchCompleteness::Limited;
                         continue;
                     }
                 }
             }
 
             let phase_started = Instant::now();
-            let mut chain_set = chain_anchors(
-                anchors.clone(),
+            let mut chain_set = crate::chain::chain_anchors_with_policy(
+                std::mem::take(&mut anchors),
                 read.sequence.len(),
-                self.config.candidates.diagonal_tolerance,
+                &self.policy.chaining,
             );
             diagnostics.chain_nanos = diagnostics
                 .chain_nanos
@@ -218,7 +365,7 @@ impl<'a> Aligner<'a> {
             diagnostics.chains = diagnostics.chains.saturating_add(saturating_u32(
                 usize::from(chain_set.primary.is_some()) + chain_set.alternatives.len(),
             ));
-            if let Some(mut chain) = chain_set.primary {
+            if let Some(mut chain) = chain_set.primary.take() {
                 // Match FlashMap's fixed LR validity floor: a chain must
                 // explain at least one fifth of the read or 300 query bases.
                 // Without this guard, a single isolated exact anchor could
@@ -237,19 +384,20 @@ impl<'a> Aligner<'a> {
                 );
                 let best_existing_rank = placements
                     .iter()
-                    .map(|placement: &(crate::ContigId, Chain, EndpointSupport)| {
+                    .map(|placement: &ChainPlacement| {
                         endpoint_rank_score(placement.1.score, placement.2, read.sequence.len())
                     })
                     .max();
                 if !full_search && best_existing_rank.is_none_or(|best| sparse_rank >= best) {
                     diagnostics.sparse_promotions = diagnostics.sparse_promotions.saturating_add(1);
                     let phase_started = Instant::now();
-                    anchors = find_anchors_with_seed_hits(
+                    anchors = find_anchors_with_seed_hits_with_policy_and_diagnostics(
                         read,
                         candidate,
                         self.reference,
-                        &self.config,
+                        &self.policy.anchors,
                         &query_seed_hits,
+                        &mut diagnostics,
                     )
                     .map_err(MapError::Anchor)?;
                     diagnostics.anchor_nanos = diagnostics
@@ -259,15 +407,15 @@ impl<'a> Aligner<'a> {
                         .anchors
                         .saturating_add(saturating_u32(anchors.len()));
                     let phase_started = Instant::now();
-                    chain_set = chain_anchors(
+                    chain_set = crate::chain::chain_anchors_with_policy(
                         anchors,
                         read.sequence.len(),
-                        self.config.candidates.diagonal_tolerance,
+                        &self.policy.chaining,
                     );
                     diagnostics.chain_nanos = diagnostics
                         .chain_nanos
                         .saturating_add(elapsed_nanos(phase_started));
-                    let Some(full_chain) = chain_set.primary else {
+                    let Some(full_chain) = chain_set.primary.take() else {
                         continue;
                     };
                     if full_chain.query_covered_fraction < 0.20
@@ -278,6 +426,17 @@ impl<'a> Aligner<'a> {
                     chain = full_chain;
                 }
                 placements.push((candidate.contig, chain, candidate.endpoint_support));
+                for alternative in chain_set.alternatives.drain(..) {
+                    if alternative.query_covered_fraction >= 0.20
+                        || alternative.query_covered_bases >= 300
+                    {
+                        placements.push((
+                            candidate.contig,
+                            alternative,
+                            candidate.endpoint_support,
+                        ));
+                    }
+                }
             }
         }
 
@@ -294,6 +453,15 @@ impl<'a> Aligner<'a> {
             }
         }
         placements = unique_placements;
+
+        diagnostics.structural_chain_bridges =
+            diagnostics
+                .structural_chain_bridges
+                .saturating_add(saturating_u32(bridge_structural_placements(
+                    &mut placements,
+                    read.sequence.len(),
+                    &self.policy.structural,
+                )));
 
         placements.sort_by(|left, right| {
             endpoint_rank_score(right.1.score, right.2, read.sequence.len())
@@ -313,21 +481,75 @@ impl<'a> Aligner<'a> {
                 primary: None,
                 supplementary: Vec::new(),
                 diagnostics: self.diagnostics.map(|_| diagnostics),
+                placement_search: PlacementSearchResult {
+                    primary_score: None,
+                    runner_up_score: None,
+                    alternatives_seen: 0,
+                    completeness: search_completeness,
+                },
             });
         };
 
         let best_rank_score =
             endpoint_rank_score(chain.score, *endpoint_support, read.sequence.len());
-        let second_score = placements.get(1).map(|placement| {
-            endpoint_rank_score(placement.1.score, placement.2, read.sequence.len())
+        let second_score = placements.iter().skip(1).find_map(|placement| {
+            chains_compete_for_query(
+                chain,
+                &placement.1,
+                self.policy
+                    .structural
+                    .max_supplementary_query_overlap_fraction,
+            )
+            .then(|| endpoint_rank_score(placement.1.score, placement.2, read.sequence.len()))
         });
-        let mapq = mapping_quality(best_rank_score, second_score, chain.query_covered_fraction);
+        let mut mapq = mapping_quality(best_rank_score, second_score, chain.query_covered_fraction);
+        if matches!(search_completeness, SearchCompleteness::Limited) {
+            mapq = mapq.min(self.policy.work_budget.limited_mapq_cap);
+        }
+        if ambiguity_limited {
+            mapq = mapq.min(self.policy.work_budget.ambiguity_mapq_cap);
+        }
         let contig = self.reference.contig(*contig_id).ok_or(MapError::Anchor(
             crate::AnchorError::MissingReference(*contig_id),
         ))?;
         let phase_started = Instant::now();
-        let primary = build_chain_alignment(read, contig, chain, mapq, &self.config)
+        let primary = crate::alignment::build_chain_alignment_with_policy(
+            read,
+            contig,
+            chain,
+            mapq,
+            &self.policy.gaps,
+            &self.policy.terminal,
+            &self.policy.normalization,
+            &self.policy.scoring,
+            Some(&mut diagnostics),
+        )
+        .map_err(MapError::Cigar)?;
+        let mut supplementary = Vec::new();
+        for (supplementary_contig, supplementary_chain, _) in
+            select_supplementary_chains(chain, placements.iter().skip(1), &self.policy.structural)
+        {
+            let contig = self
+                .reference
+                .contig(supplementary_contig)
+                .ok_or(MapError::Anchor(crate::AnchorError::MissingReference(
+                    supplementary_contig,
+                )))?;
+            let alignment = crate::alignment::build_chain_alignment_with_policy(
+                read,
+                contig,
+                supplementary_chain,
+                mapq,
+                &self.policy.gaps,
+                &self.policy.terminal,
+                &self.policy.normalization,
+                &self.policy.scoring,
+                Some(&mut diagnostics),
+            )
             .map_err(MapError::Cigar)?;
+            supplementary.push(alignment);
+        }
+        diagnostics.supplementary_alignments = saturating_u32(supplementary.len());
         diagnostics.cigar_nanos = elapsed_nanos(phase_started);
         diagnostics.mapped_bases = primary
             .query_end
@@ -342,8 +564,14 @@ impl<'a> Aligner<'a> {
         self.notify(read.name, &diagnostics);
         Ok(MappingResult {
             primary: Some(primary),
-            supplementary: Vec::new(),
+            supplementary,
             diagnostics: self.diagnostics.map(|_| diagnostics),
+            placement_search: PlacementSearchResult {
+                primary_score: Some(best_rank_score),
+                runner_up_score: second_score,
+                alternatives_seen: placements.len().saturating_sub(1),
+                completeness: search_completeness,
+            },
         })
     }
 
@@ -498,7 +726,7 @@ fn try_exact_unique_chain(
                 strand,
                 score: read.len().min(i32::MAX as usize) as i32,
             };
-            let chain = chain_anchors(vec![anchor], read.len(), 0).primary?;
+            let chain = crate::chain::chain_anchors(vec![anchor], read.len(), 0).primary?;
             return Some((hit.contig, chain));
         }
         if tested >= 3 {
@@ -553,6 +781,106 @@ fn endpoint_rank_score(score: i32, support: EndpointSupport, read_len: usize) ->
     score.saturating_add(support.score_adjustment(read_len))
 }
 
+fn bridge_structural_placements(
+    placements: &mut Vec<ChainPlacement>,
+    read_len: usize,
+    policy: &StructuralPolicy,
+) -> usize {
+    let mut bridges = 0usize;
+    loop {
+        let mut best: Option<(usize, usize, Chain)> = None;
+        for left_index in 0..placements.len() {
+            for right_index in left_index + 1..placements.len() {
+                if placements[left_index].0 != placements[right_index].0 {
+                    continue;
+                }
+                let Some(merged) = crate::chain::bridge_structural_indel_chains(
+                    &placements[left_index].1,
+                    &placements[right_index].1,
+                    read_len,
+                    policy,
+                ) else {
+                    continue;
+                };
+                let replace = best.as_ref().is_none_or(|(_, _, current)| {
+                    (merged.query_covered_bases, merged.score)
+                        > (current.query_covered_bases, current.score)
+                });
+                if replace {
+                    best = Some((left_index, right_index, merged));
+                }
+            }
+        }
+
+        let Some((left_index, right_index, merged)) = best else {
+            break;
+        };
+        let right = placements.remove(right_index);
+        let left = placements.remove(left_index);
+        placements.push((left.0, merged, left.2.merged(right.2)));
+        bridges += 1;
+    }
+    bridges
+}
+
+fn chains_compete_for_query(left: &Chain, right: &Chain, max_split_overlap: f64) -> bool {
+    let overlap = interval_overlap(left.q_start, left.q_end, right.q_start, right.q_end);
+    let shorter_span = left
+        .q_end
+        .saturating_sub(left.q_start)
+        .min(right.q_end.saturating_sub(right.q_start));
+    shorter_span == 0 || overlap as f64 / shorter_span as f64 > max_split_overlap
+}
+
+fn select_supplementary_chains<'a>(
+    primary: &Chain,
+    candidates: impl Iterator<Item = &'a ChainPlacement>,
+    policy: &StructuralPolicy,
+) -> Vec<(crate::ContigId, &'a Chain, EndpointSupport)> {
+    let mut candidates = candidates
+        .filter(|(_, chain, _)| {
+            chain.query_covered_bases >= policy.min_supplementary_bases
+                && !chains_compete_for_query(
+                    primary,
+                    chain,
+                    policy.max_supplementary_query_overlap_fraction,
+                )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .1
+            .query_covered_bases
+            .cmp(&left.1.query_covered_bases)
+            .then_with(|| right.1.score.cmp(&left.1.score))
+            .then_with(|| left.1.q_start.cmp(&right.1.q_start))
+    });
+
+    let mut selected: Vec<(crate::ContigId, &'a Chain, EndpointSupport)> = Vec::new();
+    for candidate in candidates {
+        if selected.iter().any(|(_, selected_chain, _)| {
+            chains_compete_for_query(
+                selected_chain,
+                &candidate.1,
+                policy.max_supplementary_query_overlap_fraction,
+            )
+        }) {
+            continue;
+        }
+        selected.push((candidate.0, &candidate.1, candidate.2));
+        if selected.len() == policy.max_supplementary_alignments {
+            break;
+        }
+    }
+    selected
+}
+
+fn interval_overlap(left_start: u32, left_end: u32, right_start: u32, right_end: u32) -> u32 {
+    left_end
+        .min(right_end)
+        .saturating_sub(left_start.max(right_start))
+}
+
 fn same_chain_placement(left: &crate::Chain, right: &crate::Chain) -> bool {
     let Some(left_anchor) = left.anchors.first() else {
         return false;
@@ -570,7 +898,10 @@ fn same_chain_placement(left: &crate::Chain, right: &crate::Chain) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Contig, ContigId, OwnedRead, QuerySeed, SeedHit, SeedKey, SeedLookup, Strand};
+    use crate::{
+        Contig, ContigId, InMemoryReference, InMemorySeedIndex, OwnedRead, QuerySeed, SeedHit,
+        SeedKey, SeedLookup, Strand,
+    };
 
     struct TestReference {
         sequence: Vec<u8>,
@@ -651,11 +982,198 @@ mod tests {
         Aligner::new(reference, index, config).unwrap()
     }
 
+    fn placement_chain(
+        contig: ContigId,
+        q_start: u32,
+        q_end: u32,
+        ref_start: u64,
+        strand: Strand,
+        read_len: usize,
+    ) -> Chain {
+        let length = q_end - q_start;
+        crate::chain::chain_anchors(
+            vec![Anchor {
+                ref_id: contig,
+                ref_start,
+                ref_end: ref_start + length as u64,
+                q_start,
+                q_end,
+                strand,
+                score: length as i32,
+            }],
+            read_len,
+            0,
+        )
+        .primary
+        .unwrap()
+    }
+
+    fn structural_policy() -> StructuralPolicy {
+        ResolvedMapperPolicy::from_mapper_config(&MapperConfig::default())
+            .unwrap()
+            .structural
+    }
+
+    fn pseudo_dna(length: usize, mut state: u64) -> Vec<u8> {
+        (0..length)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                b"ACGT"[((state >> 32) & 3) as usize]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn placements_from_separate_candidate_clusters_bridge_the_same_long_insertion() {
+        let mut placements = vec![
+            (
+                ContigId(0),
+                placement_chain(ContigId(0), 0, 600, 1_000, Strand::Forward, 4_165),
+                EndpointSupport::LeftOnly,
+            ),
+            (
+                ContigId(0),
+                placement_chain(ContigId(0), 3_565, 4_165, 1_600, Strand::Forward, 4_165),
+                EndpointSupport::RightOnly,
+            ),
+        ];
+
+        assert_eq!(
+            bridge_structural_placements(&mut placements, 4_165, &structural_policy()),
+            1
+        );
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].1.q_start, 0);
+        assert_eq!(placements[0].1.q_end, 4_165);
+        assert_eq!(placements[0].1.max_query_gap, 2_965);
+        assert_eq!(placements[0].2, EndpointSupport::BothEnds);
+    }
+
+    #[test]
+    fn supplementary_selection_keeps_disjoint_segments_not_competing_loci() {
+        let primary = placement_chain(ContigId(0), 3_000, 4_000, 10_000, Strand::Forward, 4_000);
+        let disjoint = (
+            ContigId(1),
+            placement_chain(ContigId(1), 0, 1_000, 20_000, Strand::Forward, 4_000),
+            EndpointSupport::LeftOnly,
+        );
+        let competing = (
+            ContigId(2),
+            placement_chain(ContigId(2), 3_100, 3_900, 30_000, Strand::Forward, 4_000),
+            EndpointSupport::RightOnly,
+        );
+        let candidates = [disjoint, competing];
+
+        let selected =
+            select_supplementary_chains(&primary, candidates.iter(), &structural_policy());
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].0, ContigId(1));
+        assert_eq!(selected[0].1.q_start, 0);
+        assert_eq!(selected[0].1.q_end, 1_000);
+    }
+
+    #[test]
+    fn mapper_preserves_both_unique_flanks_around_a_three_kilobase_insertion() {
+        struct KeepDiagnostics;
+        impl DiagnosticsSink for KeepDiagnostics {
+            fn read_complete(&self, _: &str, _: &ReadDiagnostics) {}
+        }
+        let reference_sequence = pseudo_dna(8_000, 101);
+        let reference = InMemoryReference::from_sequences([("chr0", reference_sequence.clone())]);
+        let index = InMemorySeedIndex::new(&reference);
+        let mut read = Vec::with_capacity(10_965);
+        read.extend_from_slice(&reference_sequence[..4_000]);
+        read.extend_from_slice(&pseudo_dna(2_965, 303));
+        read.extend_from_slice(&reference_sequence[4_000..]);
+        let diagnostics_sink = KeepDiagnostics;
+        let aligner = Aligner::new(&reference, &index, MapperConfig::default())
+            .unwrap()
+            .with_diagnostics_sink(&diagnostics_sink);
+
+        let result = aligner.map(Read::new("long-ins", &read)).unwrap();
+        let primary = result.primary.expect("long insertion should map");
+        assert!(
+            primary
+                .cigar
+                .ops()
+                .iter()
+                .any(|op| matches!(op, crate::CigarOp::Ins(length) if *length == 2_965)),
+            "unexpected CIGAR: {:?}",
+            (
+                primary.cigar.ops(),
+                result.supplementary.len(),
+                result.placement_search,
+                result.diagnostics.as_ref(),
+            )
+        );
+        assert_eq!(primary.cigar.query_len(), read.len() as u32);
+        assert_eq!(
+            primary.cigar.reference_len(),
+            reference_sequence.len() as u32
+        );
+        assert!(result.supplementary.is_empty());
+    }
+
+    #[test]
+    fn mapper_emits_a_supplementary_record_for_a_disjoint_second_contig() {
+        let first = pseudo_dna(5_000, 401);
+        let second = pseudo_dna(5_000, 809);
+        let reference =
+            InMemoryReference::from_sequences([("chr0", first.clone()), ("chr1", second.clone())]);
+        let index = InMemorySeedIndex::new(&reference);
+        let mut read = Vec::with_capacity(8_000);
+        read.extend_from_slice(&first[..4_000]);
+        read.extend_from_slice(&second[..4_000]);
+        let aligner = Aligner::new(&reference, &index, MapperConfig::default()).unwrap();
+
+        let result = aligner.map(Read::new("split-contig", &read)).unwrap();
+        let primary = result.primary.expect("one segment should be primary");
+        assert_eq!(result.supplementary.len(), 1);
+        let supplementary = &result.supplementary[0];
+        assert_ne!(primary.contig, supplementary.contig);
+        assert!(primary
+            .cigar
+            .ops()
+            .iter()
+            .any(|op| matches!(op, crate::CigarOp::SoftClip(length) if *length >= 3_900)));
+        assert!(supplementary
+            .cigar
+            .ops()
+            .iter()
+            .any(|op| matches!(op, crate::CigarOp::SoftClip(length) if *length >= 3_900)));
+    }
+
+    #[test]
+    fn public_mapper_config_is_resolved_once_at_construction() {
+        let reference = Box::leak(Box::new(TestReference {
+            sequence: b"ACGT".repeat(25),
+        }));
+        let index = Box::leak(Box::new(SingleSeedIndex));
+        let config = MapperConfig {
+            mode: AlignmentMode::Sensitive,
+            runtime: RuntimeConfig {
+                workers: 2,
+                chunk_size: 3,
+                reader_batch_size: Some(6),
+            },
+        };
+        let aligner = Aligner::new(reference, index, config.clone()).unwrap();
+        assert_eq!(aligner.mapper_config(), &config);
+        assert_eq!(aligner.mode(), AlignmentMode::Sensitive);
+        assert_eq!(aligner.runtime_config(), &config.runtime);
+    }
+
     #[test]
     fn maps_one_exact_read_through_all_fixed_phases() {
         let aligner = test_aligner();
         let read_sequence = b"ACGT".repeat(25);
         let result = aligner.map(Read::new("r0", &read_sequence)).unwrap();
+        assert_eq!(
+            result.placement_search.completeness,
+            SearchCompleteness::Complete
+        );
         let primary = result.primary.expect("exact test read should map");
         assert_eq!(primary.contig, ContigId(0));
         assert_eq!(primary.ref_start, 0);

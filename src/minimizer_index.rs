@@ -40,14 +40,14 @@ const RC_BIT: u64 = 1 << 15;
 
 /// Errors raised before a persistent index is made visible to the mapper.
 #[derive(Debug)]
-pub enum FmiError {
+pub enum MinimizerIndexError {
     Io(io::Error),
     Format(String),
     Metadata(String),
     Unsupported(String),
 }
 
-impl std::fmt::Display for FmiError {
+impl std::fmt::Display for MinimizerIndexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(f, "I/O error: {error}"),
@@ -58,7 +58,7 @@ impl std::fmt::Display for FmiError {
     }
 }
 
-impl std::error::Error for FmiError {
+impl std::error::Error for MinimizerIndexError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
@@ -67,7 +67,7 @@ impl std::error::Error for FmiError {
     }
 }
 
-impl From<io::Error> for FmiError {
+impl From<io::Error> for MinimizerIndexError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
     }
@@ -185,22 +185,28 @@ struct MmapSlice<T: Copy + 'static> {
 }
 
 impl<T: Copy + 'static> MmapSlice<T> {
-    fn new(mmap: Arc<Mmap>, offset: usize, len: usize) -> Result<Self, FmiError> {
+    fn new(mmap: Arc<Mmap>, offset: usize, len: usize) -> Result<Self, MinimizerIndexError> {
         let byte_len = len
             .checked_mul(std::mem::size_of::<T>())
-            .ok_or_else(|| FmiError::Format("section length overflow".to_owned()))?;
+            .ok_or_else(|| MinimizerIndexError::Format("section length overflow".to_owned()))?;
         let end = offset
             .checked_add(byte_len)
-            .ok_or_else(|| FmiError::Format("section offset overflow".to_owned()))?;
+            .ok_or_else(|| MinimizerIndexError::Format("section offset overflow".to_owned()))?;
         if end > mmap.len() {
-            return Err(FmiError::Format("section extends beyond file".to_owned()));
+            return Err(MinimizerIndexError::Format(
+                "section extends beyond file".to_owned(),
+            ));
         }
         if len > 0 {
             let address = (mmap.as_ptr() as usize)
                 .checked_add(offset)
-                .ok_or_else(|| FmiError::Format("section address overflow".to_owned()))?;
+                .ok_or_else(|| {
+                    MinimizerIndexError::Format("section address overflow".to_owned())
+                })?;
             if address % std::mem::align_of::<T>() != 0 {
-                return Err(FmiError::Format("typed section is misaligned".to_owned()));
+                return Err(MinimizerIndexError::Format(
+                    "typed section is misaligned".to_owned(),
+                ));
             }
         }
         Ok(Self {
@@ -244,14 +250,14 @@ struct CappedEntry {
 
 /// Metadata view used by SAM adapters without exposing the internal mmap.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FmiContigInfo {
+pub struct MinimizerContigInfo {
     pub id: ContigId,
     pub name: String,
     pub length: usize,
 }
 
 /// A read-only FlashMap v13 packed minimizer index.
-pub struct FmiIndex {
+pub struct MinimizerIndex {
     mmap: Arc<Mmap>,
     ref_names: Vec<String>,
     ref_lengths: Vec<u32>,
@@ -268,9 +274,9 @@ pub struct FmiIndex {
     capped_metadata: Vec<CappedEntry>,
 }
 
-impl std::fmt::Debug for FmiIndex {
+impl std::fmt::Debug for MinimizerIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FmiIndex")
+        f.debug_struct("MinimizerIndex")
             .field("contigs", &self.ref_names.len())
             .field("k", &self.k)
             .field("w", &self.w)
@@ -280,37 +286,42 @@ impl std::fmt::Debug for FmiIndex {
     }
 }
 
-impl FmiIndex {
+impl MinimizerIndex {
     /// Open and validate a current FlashMap `.fmi` file.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, FmiError> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, MinimizerIndexError> {
         if cfg!(target_endian = "big") {
-            return Err(FmiError::Unsupported(
+            return Err(MinimizerIndexError::Unsupported(
                 "big-endian hosts are not supported by the packed v13 reader".to_owned(),
             ));
         }
-        let file = File::open(path).map_err(FmiError::Io)?;
-        let mmap = unsafe { Mmap::map(&file).map_err(FmiError::Io)? };
+        let file = File::open(path).map_err(MinimizerIndexError::Io)?;
+        let mmap = unsafe { Mmap::map(&file).map_err(MinimizerIndexError::Io)? };
         let mmap = Arc::new(mmap);
         if mmap.len() < FMI_HEADER_LEN {
-            return Err(FmiError::Format(
+            return Err(MinimizerIndexError::Format(
                 "file is smaller than FMI header".to_owned(),
             ));
         }
         if &mmap[..4] != FMI_MAGIC {
-            return Err(FmiError::Format("missing FMI\\x01 magic".to_owned()));
+            return Err(MinimizerIndexError::Format(
+                "missing FMI\\x01 magic".to_owned(),
+            ));
         }
         let meta_len = read_u64(&mmap[4..12])?;
-        let meta_len = usize::try_from(meta_len)
-            .map_err(|_| FmiError::Format("metadata length does not fit usize".to_owned()))?;
+        let meta_len = usize::try_from(meta_len).map_err(|_| {
+            MinimizerIndexError::Format("metadata length does not fit usize".to_owned())
+        })?;
         let meta_end = FMI_HEADER_LEN
             .checked_add(meta_len)
-            .ok_or_else(|| FmiError::Format("metadata length overflow".to_owned()))?;
+            .ok_or_else(|| MinimizerIndexError::Format("metadata length overflow".to_owned()))?;
         if meta_end > mmap.len() {
-            return Err(FmiError::Format("metadata is truncated".to_owned()));
+            return Err(MinimizerIndexError::Format(
+                "metadata is truncated".to_owned(),
+            ));
         }
         let metadata: FmiMetadata = bincode::deserialize(&mmap[FMI_HEADER_LEN..meta_end])
             .map_err(|error| {
-                FmiError::Metadata(format!(
+                MinimizerIndexError::Metadata(format!(
                     "cannot decode FlashMap v13 metadata ({error}); rebuild the index with current FlashMap"
                 ))
             })?;
@@ -319,7 +330,7 @@ impl FmiIndex {
         let ref_names = metadata.ref_names;
         let ref_lengths = metadata.ref_lengths;
         if ref_names.len() != ref_lengths.len() || ref_names.is_empty() {
-            return Err(FmiError::Metadata(
+            return Err(MinimizerIndexError::Metadata(
                 "reference names and lengths must be non-empty and have equal size".to_owned(),
             ));
         }
@@ -328,34 +339,34 @@ impl FmiIndex {
             .iter()
             .any(|name| name.is_empty() || !names.insert(name))
         {
-            return Err(FmiError::Metadata(
+            return Err(MinimizerIndexError::Metadata(
                 "reference names must be non-empty and unique".to_owned(),
             ));
         }
         if ref_names.len() > u16::MAX as usize + 1 {
-            return Err(FmiError::Unsupported(
+            return Err(MinimizerIndexError::Unsupported(
                 "more than 65536 contigs cannot be represented by PackedLocation".to_owned(),
             ));
         }
 
         let seqs_start = to_usize(metadata.seqs_offset, "reference sequence offset")?;
         let seqs_len = to_usize(metadata.seqs_len, "reference sequence length")?;
-        let seqs_end = seqs_start
-            .checked_add(seqs_len)
-            .ok_or_else(|| FmiError::Format("reference sequence range overflow".to_owned()))?;
+        let seqs_end = seqs_start.checked_add(seqs_len).ok_or_else(|| {
+            MinimizerIndexError::Format("reference sequence range overflow".to_owned())
+        })?;
         if seqs_end > mmap.len() {
-            return Err(FmiError::Format(
+            return Err(MinimizerIndexError::Format(
                 "reference sequence section extends beyond file".to_owned(),
             ));
         }
         let mut ref_ranges = Vec::with_capacity(ref_lengths.len());
         let mut cursor = seqs_start;
         for &length in &ref_lengths {
-            let end = cursor
-                .checked_add(length as usize)
-                .ok_or_else(|| FmiError::Format("reference contig length overflow".to_owned()))?;
+            let end = cursor.checked_add(length as usize).ok_or_else(|| {
+                MinimizerIndexError::Format("reference contig length overflow".to_owned())
+            })?;
             if end > seqs_end {
-                return Err(FmiError::Format(
+                return Err(MinimizerIndexError::Format(
                     "reference contigs exceed metadata sequence section".to_owned(),
                 ));
             }
@@ -363,21 +374,21 @@ impl FmiIndex {
             cursor = end;
         }
         if cursor != seqs_end {
-            return Err(FmiError::Format(
+            return Err(MinimizerIndexError::Format(
                 "reference sequence length does not equal contig lengths".to_owned(),
             ));
         }
 
         let capped_count = to_usize(metadata.capped_metadata_len, "capped metadata count")?;
         let capped_offset = to_usize(metadata.capped_metadata_offset, "capped metadata offset")?;
-        let capped_byte_len = capped_count
-            .checked_mul(16)
-            .ok_or_else(|| FmiError::Format("capped metadata length overflow".to_owned()))?;
-        let capped_end = capped_offset
-            .checked_add(capped_byte_len)
-            .ok_or_else(|| FmiError::Format("capped metadata range overflow".to_owned()))?;
+        let capped_byte_len = capped_count.checked_mul(16).ok_or_else(|| {
+            MinimizerIndexError::Format("capped metadata length overflow".to_owned())
+        })?;
+        let capped_end = capped_offset.checked_add(capped_byte_len).ok_or_else(|| {
+            MinimizerIndexError::Format("capped metadata range overflow".to_owned())
+        })?;
         if capped_count > 0 && capped_end > mmap.len() {
-            return Err(FmiError::Format(
+            return Err(MinimizerIndexError::Format(
                 "capped metadata extends beyond file".to_owned(),
             ));
         }
@@ -407,7 +418,7 @@ impl FmiIndex {
             ranges_section.element_count,
         )?;
         if hashes.len() != ranges.len() {
-            return Err(FmiError::Format(
+            return Err(MinimizerIndexError::Format(
                 "packed hash and range arrays have different lengths".to_owned(),
             ));
         }
@@ -436,12 +447,12 @@ impl FmiIndex {
         self.w
     }
 
-    pub fn contigs(&self) -> Vec<FmiContigInfo> {
+    pub fn contigs(&self) -> Vec<MinimizerContigInfo> {
         self.ref_names
             .iter()
             .zip(&self.ref_lengths)
             .enumerate()
-            .map(|(index, (name, &length))| FmiContigInfo {
+            .map(|(index, (name, &length))| MinimizerContigInfo {
                 id: ContigId(index as u32),
                 name: name.clone(),
                 length: length as usize,
@@ -553,7 +564,7 @@ impl FmiIndex {
     }
 }
 
-impl crate::Reference for FmiIndex {
+impl crate::Reference for MinimizerIndex {
     fn contig(&self, id: ContigId) -> Option<Contig<'_>> {
         let index = id.0 as usize;
         let range = self.ref_ranges.get(index)?;
@@ -565,7 +576,7 @@ impl crate::Reference for FmiIndex {
     }
 }
 
-impl SeedIndex for FmiIndex {
+impl SeedIndex for MinimizerIndex {
     fn seed_span(&self) -> usize {
         self.k
     }
@@ -698,9 +709,9 @@ impl SeedIndex for FmiIndex {
     }
 }
 
-fn validate_metadata(metadata: &FmiMetadata) -> Result<(), FmiError> {
+fn validate_metadata(metadata: &FmiMetadata) -> Result<(), MinimizerIndexError> {
     if metadata.index_format_version != 13 {
-        return Err(FmiError::Unsupported(format!(
+        return Err(MinimizerIndexError::Unsupported(format!(
             "format v{} is not the supported v13 packed format",
             metadata.index_format_version
         )));
@@ -712,60 +723,64 @@ fn validate_metadata(metadata: &FmiMetadata) -> Result<(), FmiError> {
     // carried by `SeedIndex::seed_span`; local anchor verification continues
     // to use `Config::candidates.anchor_k`.
     if metadata.k == 0 || metadata.k > 32 {
-        return Err(FmiError::Unsupported(format!(
+        return Err(MinimizerIndexError::Unsupported(format!(
             "index k={} is outside the packed 2-bit range 1..=32",
             metadata.k
         )));
     }
     if metadata.w == 0 || metadata.w > u8::MAX as usize {
-        return Err(FmiError::Unsupported(format!(
+        return Err(MinimizerIndexError::Unsupported(format!(
             "minimizer window w={} is outside the packed LR range",
             metadata.w
         )));
     }
     if metadata.seed_type != FmiSeedType::Minimizer {
-        return Err(FmiError::Unsupported(format!(
+        return Err(MinimizerIndexError::Unsupported(format!(
             "seed type {:?}; RS-LRA currently accepts minimizers only",
             metadata.seed_type
         )));
     }
     if !metadata.seed_shape.is_contiguous(metadata.k) {
-        return Err(FmiError::Unsupported(
+        return Err(MinimizerIndexError::Unsupported(
             "gapped/spaced seed shapes are not supported by the fixed LR path".to_owned(),
         ));
     }
     Ok(())
 }
 
-fn to_usize(value: u64, label: &str) -> Result<usize, FmiError> {
-    usize::try_from(value).map_err(|_| FmiError::Format(format!("{label} does not fit usize")))
+fn to_usize(value: u64, label: &str) -> Result<usize, MinimizerIndexError> {
+    usize::try_from(value)
+        .map_err(|_| MinimizerIndexError::Format(format!("{label} does not fit usize")))
 }
 
-fn read_u32(bytes: &[u8]) -> Result<u32, FmiError> {
+fn read_u32(bytes: &[u8]) -> Result<u32, MinimizerIndexError> {
     let array: [u8; 4] = bytes
         .get(..4)
-        .ok_or_else(|| FmiError::Format("truncated u32".to_owned()))?
+        .ok_or_else(|| MinimizerIndexError::Format("truncated u32".to_owned()))?
         .try_into()
-        .map_err(|_| FmiError::Format("invalid u32".to_owned()))?;
+        .map_err(|_| MinimizerIndexError::Format("invalid u32".to_owned()))?;
     Ok(u32::from_le_bytes(array))
 }
 
-fn read_u64(bytes: &[u8]) -> Result<u64, FmiError> {
+fn read_u64(bytes: &[u8]) -> Result<u64, MinimizerIndexError> {
     let array: [u8; 8] = bytes
         .get(..8)
-        .ok_or_else(|| FmiError::Format("truncated u64".to_owned()))?
+        .ok_or_else(|| MinimizerIndexError::Format("truncated u64".to_owned()))?
         .try_into()
-        .map_err(|_| FmiError::Format("invalid u64".to_owned()))?;
+        .map_err(|_| MinimizerIndexError::Format("invalid u64".to_owned()))?;
     Ok(u64::from_le_bytes(array))
 }
 
-fn validate_scalar_section(section: Section, element_size: usize) -> Result<(), FmiError> {
+fn validate_scalar_section(
+    section: Section,
+    element_size: usize,
+) -> Result<(), MinimizerIndexError> {
     let expected = section
         .element_count
         .checked_mul(element_size)
-        .ok_or_else(|| FmiError::Format("section element count overflow".to_owned()))?;
+        .ok_or_else(|| MinimizerIndexError::Format("section element count overflow".to_owned()))?;
     if section.byte_len != expected {
-        return Err(FmiError::Format(format!(
+        return Err(MinimizerIndexError::Format(format!(
             "section kind {} has byte length {}, expected {}",
             section.kind, section.byte_len, expected
         )));
@@ -773,24 +788,26 @@ fn validate_scalar_section(section: Section, element_size: usize) -> Result<(), 
     Ok(())
 }
 
-fn required_section(sections: &[Section], kind: u32) -> Result<Section, FmiError> {
+fn required_section(sections: &[Section], kind: u32) -> Result<Section, MinimizerIndexError> {
     sections
         .iter()
         .find(|section| section.kind == kind)
         .copied()
-        .ok_or_else(|| FmiError::Unsupported(format!("missing required section kind {kind}")))
+        .ok_or_else(|| {
+            MinimizerIndexError::Unsupported(format!("missing required section kind {kind}"))
+        })
 }
 
-fn load_sections(mmap: &Mmap) -> Result<Vec<Section>, FmiError> {
+fn load_sections(mmap: &Mmap) -> Result<Vec<Section>, MinimizerIndexError> {
     if mmap.len() < SECTION_FOOTER_LEN {
-        return Err(FmiError::Unsupported(
+        return Err(MinimizerIndexError::Unsupported(
             "file has no packed section directory".to_owned(),
         ));
     }
     let footer_offset = mmap.len() - SECTION_FOOTER_LEN;
     let footer = &mmap[footer_offset..];
     if footer.get(..4) != Some(SECTION_FOOTER_MAGIC.as_slice()) {
-        return Err(FmiError::Unsupported(
+        return Err(MinimizerIndexError::Unsupported(
             "file has no current FMST section footer".to_owned(),
         ));
     }
@@ -799,24 +816,26 @@ fn load_sections(mmap: &Mmap) -> Result<Vec<Section>, FmiError> {
     let expected_crc = read_u32(&footer[16..20])?;
     let pad = read_u32(&footer[20..24])?;
     if pad != 0 {
-        return Err(FmiError::Format(
+        return Err(MinimizerIndexError::Format(
             "section footer padding is non-zero".to_owned(),
         ));
     }
     let table_len = section_count
         .checked_mul(SECTION_ENTRY_LEN)
-        .ok_or_else(|| FmiError::Format("section directory length overflow".to_owned()))?;
-    let table_end = table_offset
-        .checked_add(table_len)
-        .ok_or_else(|| FmiError::Format("section directory offset overflow".to_owned()))?;
+        .ok_or_else(|| {
+            MinimizerIndexError::Format("section directory length overflow".to_owned())
+        })?;
+    let table_end = table_offset.checked_add(table_len).ok_or_else(|| {
+        MinimizerIndexError::Format("section directory offset overflow".to_owned())
+    })?;
     if table_end > footer_offset {
-        return Err(FmiError::Format(
+        return Err(MinimizerIndexError::Format(
             "section directory is outside the file".to_owned(),
         ));
     }
     let table_bytes = &mmap[table_offset..table_end];
     if crc32fast::hash(table_bytes) != expected_crc {
-        return Err(FmiError::Format(
+        return Err(MinimizerIndexError::Format(
             "section directory CRC mismatch".to_owned(),
         ));
     }
@@ -829,15 +848,15 @@ fn load_sections(mmap: &Mmap) -> Result<Vec<Section>, FmiError> {
         let byte_len = to_usize(read_u64(&entry[16..24])?, "section byte length")?;
         let element_count = to_usize(read_u64(&entry[24..32])?, "section element count")?;
         if flags != 0 {
-            return Err(FmiError::Format(format!(
+            return Err(MinimizerIndexError::Format(format!(
                 "section kind {kind} has unsupported flags {flags:#x}"
             )));
         }
         let end = offset
             .checked_add(byte_len)
-            .ok_or_else(|| FmiError::Format("section range overflow".to_owned()))?;
+            .ok_or_else(|| MinimizerIndexError::Format("section range overflow".to_owned()))?;
         if end > table_offset {
-            return Err(FmiError::Format(format!(
+            return Err(MinimizerIndexError::Format(format!(
                 "section kind {kind} overlaps section directory"
             )));
         }
@@ -845,7 +864,7 @@ fn load_sections(mmap: &Mmap) -> Result<Vec<Section>, FmiError> {
             .iter()
             .any(|section: &Section| section.kind == kind)
         {
-            return Err(FmiError::Format(format!(
+            return Err(MinimizerIndexError::Format(format!(
                 "section kind {kind} occurs more than once"
             )));
         }
@@ -871,12 +890,14 @@ fn load_sections(mmap: &Mmap) -> Result<Vec<Section>, FmiError> {
         .windows(2)
         .any(|pair| pair[0].1 > pair[1].0 && pair[0].1 != pair[0].0 && pair[1].1 != pair[1].0)
     {
-        return Err(FmiError::Format("section data ranges overlap".to_owned()));
+        return Err(MinimizerIndexError::Format(
+            "section data ranges overlap".to_owned(),
+        ));
     }
     Ok(sections)
 }
 
-fn validate_ranges(ranges: &[u64], hit_count: usize) -> Result<(), FmiError> {
+fn validate_ranges(ranges: &[u64], hit_count: usize) -> Result<(), MinimizerIndexError> {
     for &range in ranges {
         if range & INLINE_BIT != 0 {
             continue;
@@ -885,9 +906,9 @@ fn validate_ranges(ranges: &[u64], hit_count: usize) -> Result<(), FmiError> {
         let len = ((range >> 32) & 0xffff) as usize;
         let end = start
             .checked_add(len)
-            .ok_or_else(|| FmiError::Format("packed range overflow".to_owned()))?;
+            .ok_or_else(|| MinimizerIndexError::Format("packed range overflow".to_owned()))?;
         if end > hit_count {
-            return Err(FmiError::Format(
+            return Err(MinimizerIndexError::Format(
                 "packed range points outside hit section".to_owned(),
             ));
         }
@@ -899,16 +920,16 @@ fn parse_capped_metadata(
     mmap: &Mmap,
     offset: usize,
     count: usize,
-) -> Result<Vec<CappedEntry>, FmiError> {
+) -> Result<Vec<CappedEntry>, MinimizerIndexError> {
     let byte_len = count
         .checked_mul(16)
-        .ok_or_else(|| FmiError::Format("capped metadata length overflow".to_owned()))?;
+        .ok_or_else(|| MinimizerIndexError::Format("capped metadata length overflow".to_owned()))?;
     let end = offset
         .checked_add(byte_len)
-        .ok_or_else(|| FmiError::Format("capped metadata range overflow".to_owned()))?;
-    let raw = mmap
-        .get(offset..end)
-        .ok_or_else(|| FmiError::Format("capped metadata extends beyond file".to_owned()))?;
+        .ok_or_else(|| MinimizerIndexError::Format("capped metadata range overflow".to_owned()))?;
+    let raw = mmap.get(offset..end).ok_or_else(|| {
+        MinimizerIndexError::Format("capped metadata extends beyond file".to_owned())
+    })?;
     let mut entries = Vec::with_capacity(count);
     for index in 0..count {
         let entry = &raw[index * 16..index * 16 + 16];
@@ -917,18 +938,18 @@ fn parse_capped_metadata(
         let stored_count = u16::from_le_bytes(
             entry[12..14]
                 .try_into()
-                .map_err(|_| FmiError::Format("invalid capped metadata".to_owned()))?,
+                .map_err(|_| MinimizerIndexError::Format("invalid capped metadata".to_owned()))?,
         );
         // `drop` cap policy intentionally records a zero stored count while
         // retaining the raw frequency, so zero is valid here.
         if raw_count < stored_count as u32 {
-            return Err(FmiError::Format(
+            return Err(MinimizerIndexError::Format(
                 "capped metadata has invalid raw/stored counts".to_owned(),
             ));
         }
         // Byte 14 is FlashMap's cap class; byte 15 is the only padding byte.
         if entry[15] != 0 {
-            return Err(FmiError::Format(
+            return Err(MinimizerIndexError::Format(
                 "capped metadata padding is non-zero".to_owned(),
             ));
         }
@@ -939,7 +960,7 @@ fn parse_capped_metadata(
     // the multi-gigabyte seed-hit sections.
     entries.sort_unstable_by_key(|entry| entry.hash);
     if entries.windows(2).any(|pair| pair[0].hash == pair[1].hash) {
-        return Err(FmiError::Format(
+        return Err(MinimizerIndexError::Format(
             "capped metadata contains duplicate full hashes".to_owned(),
         ));
     }
@@ -1295,7 +1316,7 @@ mod tests {
     fn opens_v13_fixture_and_round_trips_minimizer_hits() {
         let path = fixture_path("open");
         let reference = write_minimizer_fixture(&path);
-        let index = FmiIndex::open(&path).expect("open generated v13 fixture");
+        let index = MinimizerIndex::open(&path).expect("open generated v13 fixture");
         assert_eq!(index.k(), 15);
         assert_eq!(index.window(), 5);
         assert_eq!(index.contig(ContigId(0)).unwrap().sequence, reference);
@@ -1341,8 +1362,8 @@ mod tests {
         let footer_offset = bytes.len() - SECTION_FOOTER_LEN;
         bytes[footer_offset - 1] ^= 1;
         fs::write(&path, bytes).expect("rewrite corrupt fixture");
-        let error = FmiIndex::open(&path).expect_err("corrupt directory must be rejected");
-        assert!(matches!(error, FmiError::Format(message) if message.contains("CRC")));
+        let error = MinimizerIndex::open(&path).expect_err("corrupt directory must be rejected");
+        assert!(matches!(error, MinimizerIndexError::Format(message) if message.contains("CRC")));
         fs::remove_file(path).expect("remove corrupt fixture");
     }
 

@@ -1,7 +1,8 @@
 use rs_lra::io::{load_reference_path, open_fastx, AlignmentSink, SamWriter};
 use rs_lra::{
-    Aligner, CigarOp, Config, DiagnosticsSink, FmiIndex, InMemorySeedIndex, MappedRead,
-    ReadDiagnostics, Reference, SeedIndex, WorkerPool, WorkerPoolError, WorkerPoolStats,
+    Aligner, AlignerConfig, AlignmentMode, CigarOp, Config, DiagnosticsSink, InMemorySeedIndex,
+    MappedRead, MapperConfig, MinimizerIndex, MinimizerIndexError, ReadDiagnostics, Reference,
+    RuntimeConfig, SeedIndex, WorkerPool, WorkerPoolError, WorkerPoolStats,
 };
 use std::env;
 use std::io::{self, Write};
@@ -22,7 +23,7 @@ struct Options {
     emms_max_mismatch_run: usize,
     emms_relock_span: usize,
     tiered_candidates: bool,
-    sensitive: bool,
+    mode: AlignmentMode,
 }
 
 impl Options {
@@ -40,14 +41,15 @@ impl Options {
             .map(|count| count.get())
             .unwrap_or(1)
             .max(1);
-        let mut chunk_size = Config::default().worker_pool.chunk_size;
+        let mut chunk_size = MapperConfig::default().runtime.chunk_size;
         let mut quiet = false;
         let mut profile = false;
         let mut paired_emms = false;
         let mut emms_max_mismatch_run = 1;
         let mut emms_relock_span = 24;
         let mut tiered_candidates = false;
-        let mut sensitive = true;
+        let mut mode = AlignmentMode::default();
+        let mut explicit_mode = None;
 
         let mut positional = Vec::new();
 
@@ -106,19 +108,20 @@ impl Options {
                     tiered_candidates = true;
                 }
                 "--sensitive" => {
-                    sensitive = true;
+                    set_mode(&mut mode, &mut explicit_mode, AlignmentMode::Sensitive)?;
                 }
                 "--fast" | "--no-sensitive" => {
-                    sensitive = false;
+                    set_mode(&mut mode, &mut explicit_mode, AlignmentMode::Fast)?;
                 }
                 "-x" | "--preset" => {
                     let val = next_value(&mut args, &argument)?;
-                    if val.contains("sensitive") || val.contains("accurate") {
-                        sensitive = true;
-                    }
-                }
-                "-y" | "--copy-comment" => {
-                    // FASTQ header comments / SAM optional tags are preserved automatically.
+                    let preset = match val.as_str() {
+                        "standard" => AlignmentMode::Sensitive,
+                        "fast" => AlignmentMode::Fast,
+                        "sensitive" => AlignmentMode::Sensitive,
+                        _ => return Err(CliError::UnknownPreset(val)),
+                    };
+                    set_mode(&mut mode, &mut explicit_mode, preset)?;
                 }
                 option if option.starts_with('-') => {
                     return Err(CliError::UnknownOption(option.to_owned()));
@@ -193,9 +196,22 @@ impl Options {
             emms_max_mismatch_run,
             emms_relock_span,
             tiered_candidates,
-            sensitive,
+            mode,
         })
     }
+}
+
+fn set_mode(
+    mode: &mut AlignmentMode,
+    explicit_mode: &mut Option<AlignmentMode>,
+    requested: AlignmentMode,
+) -> Result<(), CliError> {
+    if explicit_mode.is_some_and(|previous| previous != requested) {
+        return Err(CliError::ConflictingMode);
+    }
+    *explicit_mode = Some(requested);
+    *mode = requested;
+    Ok(())
 }
 
 fn is_index_path(path: &std::path::Path) -> bool {
@@ -215,10 +231,12 @@ enum CliError {
     ConflictingInput,
     MissingOption(&'static str),
     InvalidNumber { option: &'static str, value: String },
+    UnknownPreset(String),
+    ConflictingMode,
     UnknownOption(String),
     UnexpectedArgument(String),
     Reference(rs_lra::ReferenceIoError),
-    Index(rs_lra::FmiError),
+    Index(MinimizerIndexError),
     Reads(rs_lra::FastxError),
     Output(io::Error),
     Pool(String),
@@ -237,6 +255,13 @@ impl std::fmt::Display for CliError {
             Self::MissingOption(option) => write!(f, "missing required option {option}"),
             Self::InvalidNumber { option, value } => {
                 write!(f, "{option} must be a positive integer, got {value:?}")
+            }
+            Self::UnknownPreset(preset) => write!(
+                f,
+                "unknown preset {preset:?}; expected \"standard\", \"fast\", or \"sensitive\""
+            ),
+            Self::ConflictingMode => {
+                f.write_str("conflicting alignment modes; choose --fast or --sensitive")
             }
             Self::UnknownOption(option) => write!(f, "unknown option {option}\n\n{}", usage()),
             Self::UnexpectedArgument(value) => {
@@ -273,7 +298,7 @@ fn usage() -> &'static str {
     "Usage: rs-lra [options] -i INDEX.fmi -q READS.fq\n\
      Usage: rs-lra [options] INDEX.fmi READS.fq\n\n\
 Options:\n\
-  -i, --index PATH       FlashMap persistent index (.fmi) [required unless positional or -r]\n\
+  -i, --index PATH       Legacy packed minimizer index (.fmi) [required unless positional or -r]\n\
   -r, --ref, --reference PATH\n\
                          Reference FASTA (small-fixture adapter)\n\
   -q, -f, --query, --fastq, --reads PATH\n\
@@ -285,19 +310,20 @@ Options:\n\
   -c, --chunk-size N     Reads per worker batch (default: 10)\n\
       --quiet            Suppress progress indicators and summary\n\
       --profile          Print aggregate mapper phase timings\n\
-      --sensitive        High-sensitivity mode with deeper DP gap bounds and full STR left-alignment\n\
-  -x, --preset STR       Preset profile: standard (default) or sensitive\n\
+      --fast             Fast bounded-gap mode\n\
+      --sensitive        Sensitive mode with deeper DP and full STR left-alignment (default)\n\
+  -x, --preset STR       Preset profile: standard, fast, or sensitive\n\
       --paired-emms      Experimental mismatch-tolerant paired anchors\n\
       --tiered-candidates Experimental cheap pass for weak candidates\n\
   -h, --help             Show this help\n\
   -v, --version          Show version\n\n\
-The index path uses the read-only FlashMap v13 packed minimizer adapter.\n\
+The index path uses the read-only legacy packed minimizer adapter.\n\
 The reference path builds a bounded in-memory k=15 index for small fixtures."
 }
 
 fn run(options: Options) -> Result<(), CliError> {
     if let Some(index_path) = &options.index {
-        let index = FmiIndex::open(index_path).map_err(CliError::Index)?;
+        let index = MinimizerIndex::open(index_path).map_err(CliError::Index)?;
         let metadata = index.reference_metadata();
         return execute_mapping(&index, &index, metadata, &options);
     }
@@ -306,7 +332,7 @@ fn run(options: Options) -> Result<(), CliError> {
         .reference
         .as_ref()
         .expect("CLI input validation guarantees a reference or index");
-    if let Ok(index) = FmiIndex::open(reference_path) {
+    if let Ok(index) = MinimizerIndex::open(reference_path) {
         let metadata = index.reference_metadata();
         return execute_mapping(&index, &index, metadata, &options);
     }
@@ -489,23 +515,48 @@ fn execute_mapping(
     metadata: Vec<(rs_lra::ContigId, String, usize)>,
     options: &Options,
 ) -> Result<(), CliError> {
-    let mut config = Config::default();
-    config.worker_pool.workers = options.workers;
-    config.worker_pool.chunk_size = options.chunk_size;
-    config.candidates.paired_emms = options.paired_emms;
-    config.candidates.emms_max_mismatch_run = options.emms_max_mismatch_run;
-    config.candidates.emms_relock_span = options.emms_relock_span;
-    config.candidates.tiered_candidates = options.tiered_candidates;
-    config.alignment.sensitive = options.sensitive;
+    let mapper_config = MapperConfig {
+        mode: options.mode,
+        runtime: RuntimeConfig {
+            workers: options.workers,
+            chunk_size: options.chunk_size,
+            reader_batch_size: None,
+        },
+    };
+    // Experimental phase switches remain an explicit compatibility escape
+    // hatch for benchmark/debug runs.  The normal CLI path always constructs
+    // the small public MapperConfig and therefore cannot accidentally combine
+    // hidden algorithm thresholds with a mode selection.
+    let aligner_config = if options.paired_emms || options.tiered_candidates {
+        let defaults = Config::default();
+        let legacy = Config {
+            seeding: defaults.seeding,
+            candidates: rs_lra::CandidateConfig {
+                paired_emms: options.paired_emms,
+                emms_max_mismatch_run: options.emms_max_mismatch_run,
+                emms_relock_span: options.emms_relock_span,
+                tiered_candidates: options.tiered_candidates,
+                ..defaults.candidates
+            },
+            alignment: rs_lra::AlignmentConfig {
+                mode: options.mode,
+                ..defaults.alignment
+            },
+            worker_pool: mapper_config.runtime.clone(),
+        };
+        AlignerConfig::Legacy(legacy)
+    } else {
+        AlignerConfig::Mapper(mapper_config)
+    };
     let profile = ProfileReporter::default();
-    let aligner = Aligner::new(reference, index, config)
+    let aligner = Aligner::new(reference, index, aligner_config)
         .map_err(|error| CliError::Pool(format!("invalid mapper configuration: {error}")))?;
     let aligner = if options.profile {
         aligner.with_diagnostics_sink(&profile)
     } else {
         aligner
     };
-    let pool = WorkerPool::new(aligner.config().worker_pool.clone())
+    let pool = WorkerPool::new(aligner.runtime_config().clone())
         .map_err(|error| CliError::Pool(error.to_string()))?;
 
     let reads = open_fastx(&options.reads).map_err(CliError::Reads)?;
@@ -538,6 +589,35 @@ struct ProfileReporter {
     full_anchor_searches: AtomicU64,
     sparse_anchor_searches: AtomicU64,
     sparse_promotions: AtomicU64,
+    emms_pairs_considered: AtomicU64,
+    emms_anchors_accepted: AtomicU64,
+    emms_anchor_bases: AtomicU64,
+    emms_variant_anchors: AtomicU64,
+    emms_variant_anchor_bases: AtomicU64,
+    emms_anchor_mismatches: AtomicU64,
+    structural_chain_bridges: AtomicU64,
+    supplementary_alignments: AtomicU64,
+    small_dp_calls: AtomicU64,
+    small_dp_nanos: AtomicU64,
+    medium_dp_calls: AtomicU64,
+    medium_dp_nanos: AtomicU64,
+    flank_dp_calls: AtomicU64,
+    flank_dp_nanos: AtomicU64,
+    exact_island_calls: AtomicU64,
+    exact_island_nanos: AtomicU64,
+    exact_island_max_bucket: AtomicU64,
+    exact_island_rejected_buckets: AtomicU64,
+    terminal_dp_calls: AtomicU64,
+    terminal_dp_nanos: AtomicU64,
+    terminal_recursive_calls: AtomicU64,
+    terminal_recursive_nanos: AtomicU64,
+    phase_repair_calls: AtomicU64,
+    phase_repairs: AtomicU64,
+    phase_repair_nanos: AtomicU64,
+    approximate_gap_fallbacks: AtomicU64,
+    adaptive_gap_escalations: AtomicU64,
+    ambiguous_candidate_stops: AtomicU64,
+    ambiguous_candidates_skipped: AtomicU64,
     query_seed_nanos: AtomicU64,
     probe_nanos: AtomicU64,
     candidate_nanos: AtomicU64,
@@ -563,6 +643,101 @@ impl DiagnosticsSink for ProfileReporter {
             .fetch_add(diagnostics.sparse_anchor_searches as u64, Ordering::Relaxed);
         self.sparse_promotions
             .fetch_add(diagnostics.sparse_promotions as u64, Ordering::Relaxed);
+        for (target, value) in [
+            (&self.small_dp_calls, diagnostics.small_dp_calls as u64),
+            (
+                &self.emms_pairs_considered,
+                diagnostics.emms_pairs_considered as u64,
+            ),
+            (
+                &self.emms_anchors_accepted,
+                diagnostics.emms_anchors_accepted as u64,
+            ),
+            (&self.emms_anchor_bases, diagnostics.emms_anchor_bases),
+            (
+                &self.emms_variant_anchors,
+                diagnostics.emms_variant_anchors as u64,
+            ),
+            (
+                &self.emms_variant_anchor_bases,
+                diagnostics.emms_variant_anchor_bases,
+            ),
+            (
+                &self.emms_anchor_mismatches,
+                diagnostics.emms_anchor_mismatches,
+            ),
+            (
+                &self.structural_chain_bridges,
+                diagnostics.structural_chain_bridges as u64,
+            ),
+            (
+                &self.supplementary_alignments,
+                diagnostics.supplementary_alignments as u64,
+            ),
+            (&self.small_dp_nanos, diagnostics.small_dp_nanos),
+            (&self.medium_dp_calls, diagnostics.medium_dp_calls as u64),
+            (&self.medium_dp_nanos, diagnostics.medium_dp_nanos),
+            (&self.flank_dp_calls, diagnostics.flank_dp_calls as u64),
+            (&self.flank_dp_nanos, diagnostics.flank_dp_nanos),
+            (
+                &self.exact_island_calls,
+                diagnostics.exact_island_calls as u64,
+            ),
+            (&self.exact_island_nanos, diagnostics.exact_island_nanos),
+            (
+                &self.exact_island_rejected_buckets,
+                diagnostics.exact_island_rejected_buckets as u64,
+            ),
+            (
+                &self.terminal_dp_calls,
+                diagnostics.terminal_dp_calls as u64,
+            ),
+            (&self.terminal_dp_nanos, diagnostics.terminal_dp_nanos),
+            (
+                &self.terminal_recursive_calls,
+                diagnostics.terminal_recursive_calls as u64,
+            ),
+            (
+                &self.terminal_recursive_nanos,
+                diagnostics.terminal_recursive_nanos,
+            ),
+            (
+                &self.phase_repair_calls,
+                diagnostics.phase_repair_calls as u64,
+            ),
+            (&self.phase_repairs, diagnostics.phase_repairs as u64),
+            (&self.phase_repair_nanos, diagnostics.phase_repair_nanos),
+            (
+                &self.approximate_gap_fallbacks,
+                diagnostics.approximate_gap_fallbacks as u64,
+            ),
+            (
+                &self.adaptive_gap_escalations,
+                diagnostics.adaptive_gap_escalations as u64,
+            ),
+            (
+                &self.ambiguous_candidate_stops,
+                diagnostics.ambiguous_candidate_stops as u64,
+            ),
+            (
+                &self.ambiguous_candidates_skipped,
+                diagnostics.ambiguous_candidates_skipped as u64,
+            ),
+        ] {
+            target.fetch_add(value, Ordering::Relaxed);
+        }
+        let mut observed_max_bucket = self.exact_island_max_bucket.load(Ordering::Relaxed);
+        while observed_max_bucket < diagnostics.exact_island_max_bucket as u64 {
+            match self.exact_island_max_bucket.compare_exchange_weak(
+                observed_max_bucket,
+                diagnostics.exact_island_max_bucket as u64,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => observed_max_bucket = current,
+            }
+        }
         for (target, value) in [
             (&self.query_seed_nanos, diagnostics.query_seed_nanos),
             (&self.probe_nanos, diagnostics.probe_nanos),
@@ -610,6 +785,66 @@ impl ProfileReporter {
             self.full_anchor_searches.load(Ordering::Relaxed),
             self.sparse_anchor_searches.load(Ordering::Relaxed),
             self.sparse_promotions.load(Ordering::Relaxed)
+        );
+        let emms_bases = self.emms_anchor_bases.load(Ordering::Relaxed);
+        let emms_variant_bases = self.emms_variant_anchor_bases.load(Ordering::Relaxed);
+        let emms_mismatches = self.emms_anchor_mismatches.load(Ordering::Relaxed);
+        eprintln!(
+            "  Paired EMMS:           {} accepted / {} considered; {} variant anchors",
+            self.emms_anchors_accepted.load(Ordering::Relaxed),
+            self.emms_pairs_considered.load(Ordering::Relaxed),
+            self.emms_variant_anchors.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "                         {:.3} Mb total / {:.3} Mb variant span; {:.3}% variant mismatches",
+            emms_bases as f64 / 1_000_000.0,
+            emms_variant_bases as f64 / 1_000_000.0,
+            if emms_variant_bases > 0 {
+                100.0 * emms_mismatches as f64 / emms_variant_bases as f64
+            } else {
+                0.0
+            },
+        );
+        eprintln!(
+            "  Structural splits:     {} bridged / {} supplementary records",
+            self.structural_chain_bridges.load(Ordering::Relaxed),
+            self.supplementary_alignments.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "  Gap DP calls:          {} small ({:.3} s) / {} medium ({:.3} s) / {} flank ({:.3} s)",
+            self.small_dp_calls.load(Ordering::Relaxed),
+            self.small_dp_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+            self.medium_dp_calls.load(Ordering::Relaxed),
+            self.medium_dp_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+            self.flank_dp_calls.load(Ordering::Relaxed),
+            self.flank_dp_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+        );
+        eprintln!(
+            "  Exact islands:         {} calls ({:.3} s), max bucket {}, rejected buckets {}",
+            self.exact_island_calls.load(Ordering::Relaxed),
+            self.exact_island_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+            self.exact_island_max_bucket.load(Ordering::Relaxed),
+            self.exact_island_rejected_buckets.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "  Terminal rescue:       {} DP ({:.3} s) / {} recursive ({:.3} s)",
+            self.terminal_dp_calls.load(Ordering::Relaxed),
+            self.terminal_dp_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+            self.terminal_recursive_calls.load(Ordering::Relaxed),
+            self.terminal_recursive_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+        );
+        eprintln!(
+            "  Phase repair:         {} calls / {} repairs ({:.3} s); approximate gap fallbacks {}",
+            self.phase_repair_calls.load(Ordering::Relaxed),
+            self.phase_repairs.load(Ordering::Relaxed),
+            self.phase_repair_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+            self.approximate_gap_fallbacks.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "  Fast escalation:      {} suspicious gaps; {} ambiguous reads ({} candidates skipped)",
+            self.adaptive_gap_escalations.load(Ordering::Relaxed),
+            self.ambiguous_candidate_stops.load(Ordering::Relaxed),
+            self.ambiguous_candidates_skipped.load(Ordering::Relaxed),
         );
         for (name, value) in [
             ("Query seeds", self.query_seed_nanos.load(Ordering::Relaxed)),
@@ -742,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_accepts_flashmap_flags() {
+    fn parser_accepts_index_and_worker_flags() {
         let options = Options::parse(
             [
                 "rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "-t", "18", "-o", "out.bam", "-c", "5",
@@ -857,7 +1092,7 @@ mod tests {
                 .map(str::to_owned),
         )
         .unwrap();
-        assert!(options.sensitive);
+        assert_eq!(options.mode, AlignmentMode::Sensitive);
 
         let options_preset = Options::parse(
             [
@@ -867,13 +1102,13 @@ mod tests {
                 "-q",
                 "reads.fq",
                 "-x",
-                "map-hifi-sensitive",
+                "sensitive",
             ]
             .into_iter()
             .map(str::to_owned),
         )
         .unwrap();
-        assert!(options_preset.sensitive);
+        assert_eq!(options_preset.mode, AlignmentMode::Sensitive);
 
         let options_fast = Options::parse(
             ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "--fast"]
@@ -881,6 +1116,80 @@ mod tests {
                 .map(str::to_owned),
         )
         .unwrap();
-        assert!(!options_fast.sensitive);
+        assert_eq!(options_fast.mode, AlignmentMode::Fast);
+    }
+
+    #[test]
+    fn parser_defaults_to_sensitive_mode_and_accepts_standard_preset() {
+        let options = Options::parse(
+            ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(options.mode, AlignmentMode::Sensitive);
+
+        let options_preset = Options::parse(
+            [
+                "rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "-x", "standard",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(options_preset.mode, AlignmentMode::Sensitive);
+
+        let options_fast_preset = Options::parse(
+            ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "-x", "fast"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(options_fast_preset.mode, AlignmentMode::Fast);
+    }
+
+    #[test]
+    fn parser_rejects_unknown_or_conflicting_modes() {
+        assert!(matches!(
+            Options::parse(
+                ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "-x", "accurate"]
+                    .into_iter()
+                    .map(str::to_owned),
+            ),
+            Err(CliError::UnknownPreset(_))
+        ));
+        assert!(matches!(
+            Options::parse(
+                [
+                    "rs-lra",
+                    "-i",
+                    "ref.fmi",
+                    "-q",
+                    "reads.fq",
+                    "--fast",
+                    "--sensitive"
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            ),
+            Err(CliError::ConflictingMode)
+        ));
+        assert!(matches!(
+            Options::parse(
+                [
+                    "rs-lra",
+                    "-i",
+                    "ref.fmi",
+                    "-q",
+                    "reads.fq",
+                    "-x",
+                    "sensitive",
+                    "--fast"
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            ),
+            Err(CliError::ConflictingMode)
+        ));
     }
 }

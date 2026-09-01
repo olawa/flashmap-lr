@@ -13,6 +13,35 @@ pub struct ReadDiagnostics {
     pub full_anchor_searches: u32,
     pub sparse_anchor_searches: u32,
     pub sparse_promotions: u32,
+    pub emms_pairs_considered: u32,
+    pub emms_anchors_accepted: u32,
+    pub emms_anchor_bases: u64,
+    pub emms_variant_anchors: u32,
+    pub emms_variant_anchor_bases: u64,
+    pub emms_anchor_mismatches: u64,
+    pub structural_chain_bridges: u32,
+    pub supplementary_alignments: u32,
+    pub small_dp_calls: u32,
+    pub small_dp_nanos: u64,
+    pub medium_dp_calls: u32,
+    pub medium_dp_nanos: u64,
+    pub flank_dp_calls: u32,
+    pub flank_dp_nanos: u64,
+    pub exact_island_calls: u32,
+    pub exact_island_nanos: u64,
+    pub exact_island_max_bucket: u32,
+    pub exact_island_rejected_buckets: u32,
+    pub terminal_dp_calls: u32,
+    pub terminal_dp_nanos: u64,
+    pub terminal_recursive_calls: u32,
+    pub terminal_recursive_nanos: u64,
+    pub phase_repair_calls: u32,
+    pub phase_repairs: u32,
+    pub phase_repair_nanos: u64,
+    pub approximate_gap_fallbacks: u32,
+    pub adaptive_gap_escalations: u32,
+    pub ambiguous_candidate_stops: u32,
+    pub ambiguous_candidates_skipped: u32,
     pub query_seed_nanos: u64,
     pub probe_nanos: u64,
     pub candidate_nanos: u64,
@@ -27,4 +56,8 @@ pub struct ReadDiagnostics {
 
 pub trait DiagnosticsSink: Send + Sync {
     fn read_complete(&self, read_name: &str, diagnostics: &ReadDiagnostics);
+}
+
+pub(crate) fn elapsed_nanos(start: std::time::Instant) -> u64 {
+    start.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
