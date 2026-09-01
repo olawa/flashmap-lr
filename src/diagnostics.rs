@@ -41,6 +41,8 @@ pub struct ReadDiagnostics {
     pub approximate_gap_fallbacks: u32,
     pub adaptive_gap_escalations: u32,
     /// Reads where rare seeds in both end windows agree on a diagonal.
+    /// Reads whose candidate region was locked from the two ends.
+    pub near_exact_locked: u32,
     pub near_exact_two_ended: u32,
     /// Of those, reads where exactly one locus is consistent.
     pub near_exact_unique_locus: u32,

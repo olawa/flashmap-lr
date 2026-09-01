@@ -29,6 +29,7 @@ struct Options {
     mode: AlignmentMode,
     sort_memory: Option<String>,
     query_window: usize,
+    near_exact: bool,
     limit: Option<usize>,
     decompress_with: Option<String>,
 }
@@ -58,6 +59,7 @@ impl Options {
         let mut mode = AlignmentMode::default();
         let mut sort_memory: Option<String> = None;
         let mut query_window = 0usize;
+        let mut near_exact = false;
         let mut limit: Option<usize> = None;
         let mut decompress_with: Option<String> = None;
         let mut explicit_mode = None;
@@ -94,6 +96,9 @@ impl Options {
                 }
                 "-n" | "--limit" => {
                     limit = Some(parse_positive(next_value(&mut args, &argument)?, "limit")?);
+                }
+                "--near-exact" => {
+                    near_exact = true;
                 }
                 "--query-window" => {
                     query_window = parse_positive(next_value(&mut args, &argument)?, "query-window")?;
@@ -225,6 +230,7 @@ impl Options {
             mode,
             sort_memory,
             query_window,
+            near_exact,
             limit,
             decompress_with,
         })
@@ -343,6 +349,8 @@ Options:\n\
   -n, --limit N          Stop after mapping N reads (for benchmarking)\n\
       --decompress-with CMD  Command to decompress gzip reads; the file path is\n\
                          appended (default: pigz -dc when on PATH)\n\
+      --near-exact       Lock the candidate region when both read ends agree\n\
+                         on one diagonal, skipping probe clustering\n\
       --query-window N   Minimizer window used to query the index, independent\n\
                          of the window it was built with (clamped up to it)\n\
       --sort-memory SIZE samtools sort memory PER THREAD for .bam output\n\
@@ -583,10 +591,12 @@ fn execute_mapping(
     let aligner_config = if options.paired_emms
         || options.tiered_candidates
         || options.query_window > 0
+        || options.near_exact
     {
         let defaults = Config::default();
         let legacy = Config {
             seeding: rs_lra::SeedingConfig {
+                near_exact_candidate: options.near_exact,
                 query_window: options.query_window,
                 ..defaults.seeding
             },

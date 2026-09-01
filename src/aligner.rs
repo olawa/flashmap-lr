@@ -206,27 +206,60 @@ impl<'a> Aligner<'a> {
                 },
             });
         }
+        // A read whose two ends agree on one diagonal has already named its
+        // locus. Taking it skips probe selection and clustering entirely; the
+        // rest of the pipeline then runs against a given region instead of a
+        // searched one.
         let phase_started = phase_timer(profiling);
-        let probes = extract_read_probes_from_seeds(
-            read,
-            &query_seeds,
-            &query_seed_hits,
-            self.index,
-            &self.policy.probes,
-        );
-        diagnostics.probe_nanos = phase_nanos(phase_started);
-        diagnostics.seeds_seen = saturating_u32(probes.len());
-        diagnostics.seeds_used = diagnostics.seeds_seen;
-        let phase_started = phase_timer(profiling);
-        let candidates = cluster_probe_hits_with_policy(
-            &probes,
-            read.sequence.len(),
-            self.index,
-            &self.policy.probes,
-            &self.policy.candidates,
-        );
-        diagnostics.candidate_nanos = phase_nanos(phase_started);
-        diagnostics.candidates = saturating_u32(candidates.len());
+        let locked = self.policy.probes.near_exact_candidate.then(|| {
+            let mut loci = Vec::new();
+            let mut single_ended = false;
+            find_two_ended_loci(
+                read.sequence.len(),
+                &query_seeds,
+                &query_seed_hits,
+                &self.policy.probes,
+                &mut loci,
+                &mut single_ended,
+            );
+            loci
+        });
+        let locked = match locked.as_deref() {
+            // Only an unambiguous locus may bypass the search. More than one
+            // means the ends disagree, which is exactly when the full
+            // candidate ranking is worth paying for.
+            Some([locus]) => self.locked_candidate(*locus, read.sequence.len()),
+            _ => None,
+        };
+
+        let candidates = if let Some(candidate) = locked {
+            diagnostics.candidate_nanos = phase_nanos(phase_started);
+            diagnostics.near_exact_locked = 1;
+            diagnostics.candidates = 1;
+            vec![candidate]
+        } else {
+            let probes = extract_read_probes_from_seeds(
+                read,
+                &query_seeds,
+                &query_seed_hits,
+                self.index,
+                &self.policy.probes,
+            );
+            diagnostics.probe_nanos = phase_nanos(phase_started);
+            diagnostics.seeds_seen = saturating_u32(probes.len());
+            diagnostics.seeds_used = diagnostics.seeds_seen;
+            let phase_started = phase_timer(profiling);
+            let candidates = cluster_probe_hits_with_policy(
+                &probes,
+                read.sequence.len(),
+                self.index,
+                &self.policy.probes,
+                &self.policy.candidates,
+            );
+            diagnostics.candidate_nanos = phase_nanos(phase_started);
+            diagnostics.candidates = saturating_u32(candidates.len());
+            candidates
+        };
 
         let mut placements = Vec::new();
         let top_candidate_score = candidates.first().map(|c| c.score).unwrap_or(0);
@@ -662,6 +695,40 @@ impl<'a> Aligner<'a> {
         })
     }
 
+    /// Turn a locked locus into the candidate the rest of the pipeline expects.
+    ///
+    /// Returns `None` when the projected region does not fit the contig, so a
+    /// malformed projection falls back to the normal search rather than
+    /// producing an out-of-bounds candidate.
+    fn locked_candidate(
+        &self,
+        locus: TwoEndedLocus,
+        read_len: usize,
+    ) -> Option<crate::CandidateRegion> {
+        let contig = self.reference.contig(locus.contig)?;
+        let contig_len = contig.sequence.len() as u64;
+        let ref_start = locus.ref_start.min(contig_len);
+        let ref_end = locus.ref_end.min(contig_len);
+        if ref_start >= ref_end {
+            return None;
+        }
+        Some(crate::CandidateRegion {
+            contig: locus.contig,
+            ref_start,
+            ref_end,
+            strand: locus.strand,
+            // Both read ends contributed, by construction.
+            supporting_segments: 2,
+            unique_probes: 2,
+            mean_probe_frequency: 1.0,
+            best_probe_frequency: 1,
+            diagonal_mean: 0.0,
+            diagonal_median: 0.0,
+            score: saturating_i32(read_len),
+            endpoint_support: EndpointSupport::BothEnds,
+        })
+    }
+
     fn notify(&self, read_name: &str, diagnostics: &ReadDiagnostics) {
         if let Some(sink) = self.diagnostics {
             sink.read_complete(read_name, diagnostics);
@@ -762,34 +829,43 @@ fn exact_bases_match(query: u8, reference: u8, strand: crate::Strand) -> bool {
     }
 }
 
-/// Would a two-ended near-exact fast path fire on this read?
+/// One locus that rare seeds from both read ends agree on.
+#[derive(Clone, Copy, Debug)]
+struct TwoEndedLocus {
+    contig: crate::ContigId,
+    strand: crate::Strand,
+    ref_start: u64,
+    ref_end: u64,
+}
+
+/// Loci that rare seeds from the two end windows agree on, diagonally.
 ///
-/// Measurement only: this decides nothing. It asks whether rare seeds drawn
-/// from the two end windows agree on a diagonal within the tolerance a real
-/// fast path would use, which is what bounds the work for a clean read in
-/// unique sequence. `try_exact_unique_chain` cannot answer that -- it demands
-/// a whole-read exact match and so never fires on HiFi.
-fn probe_near_exact_potential(
+/// A clean read in unique sequence pins its own placement: two rare seeds one
+/// read-length apart can only agree on a diagonal at the locus the read came
+/// from. Enumerating every hit of those seeds means a second consistent locus
+/// would have been seen, so a single survivor is evidence of uniqueness rather
+/// than an absence of search.
+fn find_two_ended_loci(
     read_len: usize,
     query_seeds: &[crate::QuerySeed],
     hits: &CachedQuerySeedHits,
     policy: &crate::config::ProbePolicy,
-    diagnostics: &mut ReadDiagnostics,
+    out: &mut Vec<TwoEndedLocus>,
+    single_ended: &mut bool,
 ) {
     const MAX_SEEDS_PER_END: usize = 8;
     const MAX_HITS_PER_SEED: usize = 32;
     const DIAGONAL_TOLERANCE: i64 = 1_000;
-    // A locus is one diagonal band; two pairs that agree to within the
-    // tolerance are the same placement, not competing ones.
     const LOCUS_BAND: i64 = 2 * DIAGONAL_TOLERANCE;
+    const MAX_LOCI: usize = 8;
 
+    let seed_span = hits.seed_span();
     let window = policy.endpoint_window.min(read_len / 2);
-    if window == 0 || read_len < 2 * window {
+    if window == 0 || read_len < 2 * window || seed_span == 0 {
         return;
     }
     let right_window_start = read_len - window;
 
-    // Rarest first, mirroring how a fast path would spend its lookups.
     let mut left: Vec<(usize, u32)> = Vec::new();
     let mut right: Vec<(usize, u32)> = Vec::new();
     for (index, seed) in query_seeds.iter().enumerate() {
@@ -799,10 +875,16 @@ fn probe_near_exact_potential(
         if !matches!(lookup.completeness, crate::HitCompleteness::Complete)
             || lookup.reported_hits == 0
             || lookup.reported_hits as usize > policy.endpoint_max_frequency
+            // A capped hit list could hide the competing locus that would
+            // disqualify this read, so only fully enumerated seeds may vote.
+            || hits.callback_count_at(index) > MAX_HITS_PER_SEED
         {
             continue;
         }
         let position = seed.query_pos as usize;
+        if position + seed_span > read_len {
+            continue;
+        }
         if position < window {
             left.push((index, lookup.reported_hits));
         } else if position >= right_window_start {
@@ -813,34 +895,36 @@ fn probe_near_exact_potential(
         return;
     }
     if left.is_empty() || right.is_empty() {
-        diagnostics.near_exact_single_ended = 1;
+        *single_ended = true;
         return;
     }
+    // Rarest first: the fewer places a seed occurs, the more it constrains.
     left.sort_unstable_by_key(|(_, frequency)| *frequency);
     right.sort_unstable_by_key(|(_, frequency)| *frequency);
     left.truncate(MAX_SEEDS_PER_END);
     right.truncate(MAX_SEEDS_PER_END);
 
-    let mut loci: Vec<(crate::ContigId, crate::Strand, i64)> = Vec::new();
     for &(left_index, _) in &left {
         let left_seed = query_seeds[left_index];
+        let query_left = left_seed.query_pos as usize;
         for left_hit in hits.hits_at(left_index).iter().take(MAX_HITS_PER_SEED) {
-            let left_strand = effective_strand(left_seed.strand, left_hit.strand);
+            let strand = effective_strand(left_seed.strand, left_hit.strand);
             for &(right_index, _) in &right {
                 let right_seed = query_seeds[right_index];
-                let query_span = right_seed.query_pos as i64 - left_seed.query_pos as i64;
+                let query_right = right_seed.query_pos as usize;
+                let query_span = query_right as i64 - query_left as i64;
                 if query_span <= 0 {
                     continue;
                 }
                 for right_hit in hits.hits_at(right_index).iter().take(MAX_HITS_PER_SEED) {
                     if right_hit.contig != left_hit.contig
-                        || effective_strand(right_seed.strand, right_hit.strand) != left_strand
+                        || effective_strand(right_seed.strand, right_hit.strand) != strand
                     {
                         continue;
                     }
                     // On the reverse strand the read runs backwards along the
                     // reference, so the expected span changes sign.
-                    let reference_span = match left_strand {
+                    let reference_span = match strand {
                         crate::Strand::Forward => {
                             right_hit.ref_pos as i64 - left_hit.ref_pos as i64
                         }
@@ -851,19 +935,58 @@ fn probe_near_exact_potential(
                     if (reference_span - query_span).abs() > DIAGONAL_TOLERANCE {
                         continue;
                     }
-                    let band = left_hit.ref_pos as i64 / LOCUS_BAND;
-                    if !loci.iter().any(|(contig, strand, existing)| {
-                        *contig == left_hit.contig
-                            && *strand == left_strand
-                            && (*existing - band).abs() <= 1
-                    }) {
-                        loci.push((left_hit.contig, left_strand, band));
+                    let span_start = left_hit.ref_pos.min(right_hit.ref_pos);
+                    let span_end = left_hit
+                        .ref_pos
+                        .max(right_hit.ref_pos)
+                        .saturating_add(seed_span as u64);
+                    // Extend by the query that lies outside the two seeds, so
+                    // the region covers the whole read rather than the span
+                    // between its anchors.
+                    let outside_left = query_left;
+                    let outside_right = read_len.saturating_sub(query_right + seed_span);
+                    let (front, back) = match strand {
+                        crate::Strand::Forward => (outside_left, outside_right),
+                        crate::Strand::Reverse => (outside_right, outside_left),
+                    };
+                    let locus = TwoEndedLocus {
+                        contig: left_hit.contig,
+                        strand,
+                        ref_start: span_start.saturating_sub(front as u64),
+                        ref_end: span_end.saturating_add(back as u64),
+                    };
+                    let band = span_start as i64 / LOCUS_BAND;
+                    let known = out.iter().any(|existing| {
+                        existing.contig == locus.contig
+                            && existing.strand == locus.strand
+                            && (existing.ref_start as i64 / LOCUS_BAND - band).abs() <= 1
+                    });
+                    if !known {
+                        out.push(locus);
+                        if out.len() >= MAX_LOCI {
+                            return;
+                        }
                     }
                 }
             }
         }
     }
+}
 
+/// Record how often a two-ended near-exact path would fire, without acting.
+fn probe_near_exact_potential(
+    read_len: usize,
+    query_seeds: &[crate::QuerySeed],
+    hits: &CachedQuerySeedHits,
+    policy: &crate::config::ProbePolicy,
+    diagnostics: &mut ReadDiagnostics,
+) {
+    let mut loci = Vec::new();
+    let mut single_ended = false;
+    find_two_ended_loci(read_len, query_seeds, hits, policy, &mut loci, &mut single_ended);
+    if single_ended {
+        diagnostics.near_exact_single_ended = 1;
+    }
     if loci.is_empty() {
         return;
     }
@@ -880,6 +1003,10 @@ fn effective_strand(query: crate::Strand, reference: crate::Strand) -> crate::St
     } else {
         crate::Strand::Reverse
     }
+}
+
+fn saturating_i32(value: usize) -> i32 {
+    value.min(i32::MAX as usize) as i32
 }
 
 fn saturating_u32(value: usize) -> u32 {

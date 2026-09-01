@@ -110,6 +110,8 @@ pub struct Config {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeedingConfig {
+    /// Lock the candidate region from two consistent end seeds.
+    pub near_exact_candidate: bool,
     /// Minimizer window used to query the index, independent of the window the
     /// index was built with. `0` uses the index's own window.
     ///
@@ -159,6 +161,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             seeding: SeedingConfig {
+                near_exact_candidate: false,
                 query_window: 0,
                 segment_size: 2048,
                 segment_overlap: 512,
@@ -296,6 +299,9 @@ fn validate_runtime(runtime: &RuntimeConfig) -> Result<(), ConfigError> {
 /// resolver selects one complete value before a worker is started.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProbePolicy {
+    /// Lock the candidate region from two diagonally consistent end seeds
+    /// when exactly one locus survives, skipping probe clustering.
+    pub(crate) near_exact_candidate: bool,
     pub(crate) query_window: usize,
     pub(crate) segment_size: usize,
     pub(crate) segment_overlap: usize,
@@ -482,6 +488,7 @@ impl ResolvedMapperPolicy {
         policy.gaps.bridge_flank = config.alignment.bridge_flank;
         policy.gaps.bridge_max_gap = config.alignment.bridge_max_gap;
         policy.probes = ProbePolicy {
+            near_exact_candidate: config.seeding.near_exact_candidate,
             query_window: config.seeding.query_window,
             segment_size: config.seeding.segment_size,
             segment_overlap: config.seeding.segment_overlap,
@@ -524,6 +531,9 @@ impl ResolvedMapperPolicy {
             // Default to the index's own window so a decoupled query is an
             // explicit choice, measured per index, rather than a silent change
             // in which seeds every existing caller sees.
+            // Off until measured against variant calling: it changes which
+            // region is searched, not just how fast the search is.
+            near_exact_candidate: false,
             query_window: 0,
             segment_size: 2_048,
             segment_overlap: 512,
@@ -688,6 +698,7 @@ impl ResolvedMapperPolicy {
     pub(crate) fn as_legacy_config(&self) -> Config {
         Config {
             seeding: SeedingConfig {
+                near_exact_candidate: self.probes.near_exact_candidate,
                 query_window: self.probes.query_window,
                 segment_size: self.probes.segment_size,
                 segment_overlap: self.probes.segment_overlap,
