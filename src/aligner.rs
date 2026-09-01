@@ -210,6 +210,7 @@ impl<'a> Aligner<'a> {
         // locus. Taking it skips probe selection and clustering entirely; the
         // rest of the pipeline then runs against a given region instead of a
         // searched one.
+        let mut near_exact_drift = 0usize;
         let phase_started = phase_timer(profiling);
         let locked = self.policy.probes.near_exact_candidate.then(|| {
             let mut loci = Vec::new();
@@ -228,9 +229,44 @@ impl<'a> Aligner<'a> {
             // Only an unambiguous locus may bypass the search. More than one
             // means the ends disagree, which is exactly when the full
             // candidate ranking is worth paying for.
-            Some([locus]) => self.locked_candidate(*locus, read.sequence.len()),
+            Some([locus]) => {
+                diagnostics.near_exact_drift = locus.drift;
+                near_exact_drift = locus.drift as usize;
+                self.locked_candidate(*locus, read.sequence.len())
+            }
             _ => None,
         };
+
+        // With the diagonal known, a single banded pass over the whole read
+        // can replace anchor discovery and chaining entirely. The band comes
+        // from the measured drift, so it is narrow exactly when the read is
+        // clean -- and a wide drift falls through to the anchor path, which is
+        // where a structural difference belongs anyway.
+        if let (Some(candidate), true) = (locked.as_ref(), self.policy.probes.near_exact_dp) {
+            if let Some(primary) = self.try_banded_whole_read(
+                read,
+                candidate,
+                near_exact_drift,
+                &mut diagnostics,
+                profiling,
+            )? {
+                diagnostics.near_exact_dp_accepted = 1;
+                diagnostics.mapped_bases = saturating_u32(read.sequence.len());
+                diagnostics.elapsed_nanos = phase_nanos(started);
+                self.notify(read.name, &diagnostics);
+                return Ok(MappingResult {
+                    primary: Some(primary),
+                    supplementary: Vec::new(),
+                    diagnostics: self.diagnostics.map(|_| diagnostics),
+                    placement_search: PlacementSearchResult {
+                        primary_score: Some(saturating_i32(read.sequence.len())),
+                        runner_up_score: None,
+                        alternatives_seen: 0,
+                        completeness: SearchCompleteness::Complete,
+                    },
+                });
+            }
+        }
 
         let candidates = if let Some(candidate) = locked {
             diagnostics.candidate_nanos = phase_nanos(phase_started);
@@ -695,6 +731,69 @@ impl<'a> Aligner<'a> {
         })
     }
 
+    /// Align a whole read in one banded pass against a locked region.
+    ///
+    /// Returns `Ok(None)` whenever the pass is declined or its result is not
+    /// clearly good, so every uncertain read still reaches anchor discovery.
+    fn try_banded_whole_read(
+        &self,
+        read: Read<'_>,
+        candidate: &crate::CandidateRegion,
+        drift: usize,
+        diagnostics: &mut ReadDiagnostics,
+        profiling: bool,
+    ) -> Result<Option<crate::Alignment>, MapError> {
+        let policy = &self.policy.probes;
+        if drift > policy.near_exact_dp_max_drift {
+            return Ok(None);
+        }
+        let contig = self.reference.contig(candidate.contig).ok_or(MapError::Anchor(
+            crate::AnchorError::MissingReference(candidate.contig),
+        ))?;
+        let start = candidate.ref_start as usize;
+        let end = (candidate.ref_end as usize).min(contig.sequence.len());
+        let window = contig.sequence.get(start..end).filter(|w| !w.is_empty());
+        let Some(window) = window else {
+            return Ok(None);
+        };
+
+        let oriented = crate::alignment::oriented_query(read.sequence, candidate.strand);
+        // Room for the measured drift plus the local indels it cannot see,
+        // since the two end seeds only bound the net shift between them.
+        let band = drift.saturating_add(policy.near_exact_dp_band_slack);
+
+        let started = phase_timer(profiling);
+        let aligned = crate::dp::align_banded(&oriented, window, band);
+        diagnostics.near_exact_dp_nanos = diagnostics
+            .near_exact_dp_nanos
+            .saturating_add(phase_nanos(started));
+        diagnostics.near_exact_dp_calls = diagnostics.near_exact_dp_calls.saturating_add(1);
+        let Some(aligned) = aligned else {
+            return Ok(None);
+        };
+
+        // A banded pass that had to spend heavily is a read whose geometry the
+        // two ends did not actually describe; give it to the anchor path.
+        let query_len = read.sequence.len();
+        let divergence = aligned.edit_distance as f64 / query_len.max(1) as f64;
+        if divergence > policy.near_exact_dp_max_divergence {
+            return Ok(None);
+        }
+
+        Ok(Some(crate::Alignment {
+            contig: candidate.contig,
+            ref_start: (start + aligned.ref_start) as u64,
+            ref_end: (start + aligned.ref_end) as u64,
+            query_start: 0,
+            query_end: saturating_u32(query_len),
+            strand: candidate.strand,
+            score: aligned.score,
+            mapq: 60,
+            cigar: aligned.cigar,
+            edit_distance: aligned.edit_distance,
+        }))
+    }
+
     /// Turn a locked locus into the candidate the rest of the pipeline expects.
     ///
     /// Returns `None` when the projected region does not fit the contig, so a
@@ -836,6 +935,10 @@ struct TwoEndedLocus {
     strand: crate::Strand,
     ref_start: u64,
     ref_end: u64,
+    /// Smallest |reference span - query span| seen for this locus. It bounds
+    /// the net indel between the two end seeds, so it is the band a DP over
+    /// the whole read would need.
+    drift: u32,
 }
 
 /// Loci that rare seeds from the two end windows agree on, diagonally.
@@ -949,22 +1052,29 @@ fn find_two_ended_loci(
                         crate::Strand::Forward => (outside_left, outside_right),
                         crate::Strand::Reverse => (outside_right, outside_left),
                     };
+                    let drift = (reference_span - query_span).unsigned_abs() as u32;
                     let locus = TwoEndedLocus {
                         contig: left_hit.contig,
                         strand,
                         ref_start: span_start.saturating_sub(front as u64),
                         ref_end: span_end.saturating_add(back as u64),
+                        drift,
                     };
                     let band = span_start as i64 / LOCUS_BAND;
-                    let known = out.iter().any(|existing| {
+                    match out.iter_mut().find(|existing| {
                         existing.contig == locus.contig
                             && existing.strand == locus.strand
                             && (existing.ref_start as i64 / LOCUS_BAND - band).abs() <= 1
-                    });
-                    if !known {
-                        out.push(locus);
-                        if out.len() >= MAX_LOCI {
-                            return;
+                    }) {
+                        // Keep the tightest pair seen for this locus: it is
+                        // the one that bounds a DP band most sharply.
+                        Some(existing) if drift < existing.drift => *existing = locus,
+                        Some(_) => {}
+                        None => {
+                            out.push(locus);
+                            if out.len() >= MAX_LOCI {
+                                return;
+                            }
                         }
                     }
                 }
@@ -992,8 +1102,9 @@ fn probe_near_exact_potential(
     }
     diagnostics.near_exact_two_ended = 1;
     diagnostics.near_exact_loci = saturating_u32(loci.len());
-    if loci.len() == 1 {
+    if let [locus] = loci.as_slice() {
         diagnostics.near_exact_unique_locus = 1;
+        diagnostics.near_exact_drift = locus.drift;
     }
 }
 

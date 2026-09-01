@@ -8,6 +8,14 @@ use crate::{types::cigar_edit_distance, Cigar, CigarOp};
 use std::cell::RefCell;
 
 const MAX_WINDOW: usize = 8_192;
+/// Ceiling for a banded whole-read alignment.
+///
+/// [`MAX_WINDOW`] bounds a gap fill, where cost grows with the product of the
+/// two spans. A banded pass costs span times band, so a read many times longer
+/// than that window is still cheap provided the band stays narrow -- which is
+/// the whole reason to run one.
+const MAX_BANDED_SPAN: usize = 262_144;
+const MAX_BANDED_CELLS: usize = 64_000_000;
 const MAX_CELLS: usize = 16_000_000;
 pub(crate) const MATCH_SCORE: i8 = 2;
 pub(crate) const MISMATCH_PENALTY: i8 = 4;
@@ -135,8 +143,47 @@ pub fn align_full_with_scoring(
     {
         return None;
     }
+    run_extz2(
+        query,
+        reference,
+        band_width.clamp(1, MAX_WINDOW),
+        gap_open,
+        gap_extend,
+    )
+}
 
-    let band_width = band_width.clamp(1, MAX_WINDOW);
+/// Align a whole read against a known reference window inside a narrow band.
+///
+/// This is [`align_full`] without the quadratic guard: the caller must have
+/// established the diagonal already, so the band -- not the span product --
+/// bounds the work. `None` means the span or the band is too large to be
+/// worth it, and the caller should fall back to anchor discovery.
+pub fn align_banded(query: &[u8], reference: &[u8], band_width: usize) -> Option<LocalAlignment> {
+    if query.is_empty() || reference.is_empty() {
+        return None;
+    }
+    let span = query.len().max(reference.len());
+    if span > MAX_BANDED_SPAN {
+        return None;
+    }
+    let band = band_width.clamp(1, MAX_WINDOW);
+    if span.saturating_mul(band.saturating_mul(2).saturating_add(1)) > MAX_BANDED_CELLS {
+        return None;
+    }
+    run_extz2(query, reference, band, GAP_OPEN, GAP_EXTEND)
+}
+
+/// Shared KSW2 extz2 call and CIGAR validation.
+///
+/// Callers own the size policy: a gap fill and a banded whole-read pass have
+/// different reasons to decline, but the alignment itself is the same.
+fn run_extz2(
+    query: &[u8],
+    reference: &[u8],
+    band_width: usize,
+    gap_open: i8,
+    gap_extend: i8,
+) -> Option<LocalAlignment> {
     let (score, raw_cigar) = KSW2_ALIGNER.with(|aligner_cell| {
         QUERY_DNA5.with(|query_cell| {
             REFERENCE_DNA5.with(|reference_cell| {

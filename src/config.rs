@@ -112,6 +112,8 @@ pub struct Config {
 pub struct SeedingConfig {
     /// Lock the candidate region from two consistent end seeds.
     pub near_exact_candidate: bool,
+    /// Align a locked region in one banded pass instead of finding anchors.
+    pub near_exact_dp: bool,
     /// Minimizer window used to query the index, independent of the window the
     /// index was built with. `0` uses the index's own window.
     ///
@@ -162,6 +164,7 @@ impl Default for Config {
         Self {
             seeding: SeedingConfig {
                 near_exact_candidate: false,
+                near_exact_dp: false,
                 query_window: 0,
                 segment_size: 2048,
                 segment_overlap: 512,
@@ -297,11 +300,15 @@ fn validate_runtime(runtime: &RuntimeConfig) -> Result<(), ConfigError> {
 
 /// Startup-resolved query-probe policy.  It contains no mode branch; the
 /// resolver selects one complete value before a worker is started.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ProbePolicy {
     /// Lock the candidate region from two diagonally consistent end seeds
     /// when exactly one locus survives, skipping probe clustering.
     pub(crate) near_exact_candidate: bool,
+    pub(crate) near_exact_dp: bool,
+    pub(crate) near_exact_dp_max_drift: usize,
+    pub(crate) near_exact_dp_band_slack: usize,
+    pub(crate) near_exact_dp_max_divergence: f64,
     pub(crate) query_window: usize,
     pub(crate) segment_size: usize,
     pub(crate) segment_overlap: usize,
@@ -489,6 +496,10 @@ impl ResolvedMapperPolicy {
         policy.gaps.bridge_max_gap = config.alignment.bridge_max_gap;
         policy.probes = ProbePolicy {
             near_exact_candidate: config.seeding.near_exact_candidate,
+            near_exact_dp: config.seeding.near_exact_dp,
+            near_exact_dp_max_drift: policy.probes.near_exact_dp_max_drift,
+            near_exact_dp_band_slack: policy.probes.near_exact_dp_band_slack,
+            near_exact_dp_max_divergence: policy.probes.near_exact_dp_max_divergence,
             query_window: config.seeding.query_window,
             segment_size: config.seeding.segment_size,
             segment_overlap: config.seeding.segment_overlap,
@@ -534,7 +545,13 @@ impl ResolvedMapperPolicy {
             // Off until measured against variant calling: it changes which
             // region is searched, not just how fast the search is.
             near_exact_candidate: false,
+            near_exact_dp: false,
             query_window: 0,
+            // 93% of unambiguous loci drift under 50 bases; beyond a few
+            // hundred the band stops being cheaper than anchor discovery.
+            near_exact_dp_max_drift: 256,
+            near_exact_dp_band_slack: 64,
+            near_exact_dp_max_divergence: 0.10,
             segment_size: 2_048,
             segment_overlap: 512,
             max_probes_per_segment: 6,
@@ -699,6 +716,7 @@ impl ResolvedMapperPolicy {
         Config {
             seeding: SeedingConfig {
                 near_exact_candidate: self.probes.near_exact_candidate,
+                near_exact_dp: self.probes.near_exact_dp,
                 query_window: self.probes.query_window,
                 segment_size: self.probes.segment_size,
                 segment_overlap: self.probes.segment_overlap,

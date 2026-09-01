@@ -15,3 +15,4 @@ mod refine;
 pub use assembly::{build_chain_alignment, build_chain_cigar, ChainCigarError};
 
 pub(crate) use assembly::build_chain_alignment_with_policy;
+pub(crate) use prepare::oriented_query;

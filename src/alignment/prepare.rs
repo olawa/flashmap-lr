@@ -373,7 +373,7 @@ pub(super) fn unlock_register_shifted_str_anchors_with_policy(
     anchors
 }
 
-pub(super) fn oriented_query(sequence: &[u8], strand: Strand) -> Vec<u8> {
+pub(crate) fn oriented_query(sequence: &[u8], strand: Strand) -> Vec<u8> {
     match strand {
         Strand::Forward => sequence.to_vec(),
         Strand::Reverse => sequence

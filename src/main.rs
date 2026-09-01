@@ -30,6 +30,7 @@ struct Options {
     sort_memory: Option<String>,
     query_window: usize,
     near_exact: bool,
+    near_exact_dp: bool,
     limit: Option<usize>,
     decompress_with: Option<String>,
 }
@@ -60,6 +61,7 @@ impl Options {
         let mut sort_memory: Option<String> = None;
         let mut query_window = 0usize;
         let mut near_exact = false;
+        let mut near_exact_dp = false;
         let mut limit: Option<usize> = None;
         let mut decompress_with: Option<String> = None;
         let mut explicit_mode = None;
@@ -99,6 +101,10 @@ impl Options {
                 }
                 "--near-exact" => {
                     near_exact = true;
+                }
+                "--near-exact-dp" => {
+                    near_exact = true;
+                    near_exact_dp = true;
                 }
                 "--query-window" => {
                     query_window = parse_positive(next_value(&mut args, &argument)?, "query-window")?;
@@ -231,6 +237,7 @@ impl Options {
             sort_memory,
             query_window,
             near_exact,
+            near_exact_dp,
             limit,
             decompress_with,
         })
@@ -351,6 +358,8 @@ Options:\n\
                          appended (default: pigz -dc when on PATH)\n\
       --near-exact       Lock the candidate region when both read ends agree\n\
                          on one diagonal, skipping probe clustering\n\
+      --near-exact-dp    As --near-exact, and align the locked region in one\n\
+                         banded pass instead of finding anchors\n\
       --query-window N   Minimizer window used to query the index, independent\n\
                          of the window it was built with (clamped up to it)\n\
       --sort-memory SIZE samtools sort memory PER THREAD for .bam output\n\
@@ -597,6 +606,7 @@ fn execute_mapping(
         let legacy = Config {
             seeding: rs_lra::SeedingConfig {
                 near_exact_candidate: options.near_exact,
+                near_exact_dp: options.near_exact_dp,
                 query_window: options.query_window,
                 ..defaults.seeding
             },
@@ -715,6 +725,10 @@ struct ProfileReporter {
     phase_repair_nanos: AtomicU64,
     approximate_gap_fallbacks: AtomicU64,
     adaptive_gap_escalations: AtomicU64,
+    near_exact_dp_calls: AtomicU64,
+    near_exact_dp_accepted: AtomicU64,
+    near_exact_dp_nanos: AtomicU64,
+    near_exact_drift: [AtomicU64; 6],
     near_exact_two_ended: AtomicU64,
     near_exact_unique_locus: AtomicU64,
     near_exact_single_ended: AtomicU64,
@@ -819,6 +833,15 @@ impl DiagnosticsSink for ProfileReporter {
                 diagnostics.adaptive_gap_escalations as u64,
             ),
             (
+                &self.near_exact_dp_calls,
+                u64::from(diagnostics.near_exact_dp_calls),
+            ),
+            (
+                &self.near_exact_dp_accepted,
+                u64::from(diagnostics.near_exact_dp_accepted),
+            ),
+            (&self.near_exact_dp_nanos, diagnostics.near_exact_dp_nanos),
+            (
                 &self.near_exact_two_ended,
                 u64::from(diagnostics.near_exact_two_ended),
             ),
@@ -865,6 +888,17 @@ impl DiagnosticsSink for ProfileReporter {
             (&self.total_nanos, diagnostics.elapsed_nanos),
         ] {
             target.fetch_add(value, Ordering::Relaxed);
+        }
+        if diagnostics.near_exact_unique_locus == 1 {
+            let bucket = match diagnostics.near_exact_drift {
+                0..=10 => 0,
+                11..=50 => 1,
+                51..=100 => 2,
+                101..=250 => 3,
+                251..=500 => 4,
+                _ => 5,
+            };
+            self.near_exact_drift[bucket].fetch_add(1, Ordering::Relaxed);
         }
         let cigar_bucket = match diagnostics.cigar_nanos {
             0..=99_999 => 0,
@@ -965,6 +999,36 @@ impl ProfileReporter {
             if reads > 0 { 100.0 * two_ended as f64 / reads as f64 } else { 0.0 },
             if two_ended > 0 { 100.0 * unique as f64 / two_ended as f64 } else { 0.0 },
         );
+        let dp_calls = self.near_exact_dp_calls.load(Ordering::Relaxed);
+        if dp_calls > 0 {
+            eprintln!(
+                "  Banded whole-read DP:  {} calls, {} accepted ({:.1}%), {:.3} s ({:.0} us/call)",
+                dp_calls,
+                self.near_exact_dp_accepted.load(Ordering::Relaxed),
+                100.0 * self.near_exact_dp_accepted.load(Ordering::Relaxed) as f64
+                    / dp_calls as f64,
+                self.near_exact_dp_nanos.load(Ordering::Relaxed) as f64 / 1e9,
+                self.near_exact_dp_nanos.load(Ordering::Relaxed) as f64 / 1000.0 / dp_calls as f64,
+            );
+        }
+        let drift: Vec<u64> = self
+            .near_exact_drift
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
+        let drift_total: u64 = drift.iter().sum();
+        if drift_total > 0 {
+            eprintln!("  Diagonal drift (unambiguous loci, = DP band needed):");
+            for (label, count) in ["<=10", "11-50", "51-100", "101-250", "251-500", ">500"]
+                .iter()
+                .zip(&drift)
+            {
+                eprintln!(
+                    "    {label:<8} {count:>8}  ({:.1}%)",
+                    100.0 * *count as f64 / drift_total as f64
+                );
+            }
+        }
         eprintln!(
             "                        {single} single-ended only; {:.2} mean consistent loci",
             if two_ended > 0 { loci as f64 / two_ended as f64 } else { 0.0 },
