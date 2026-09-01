@@ -595,7 +595,14 @@ impl SeedIndex for MinimizerIndex {
     }
 
     fn query_seeds(&self, sequence: &[u8]) -> Vec<QuerySeed> {
-        query_minimizers(sequence, self.k, self.w)
+        self.query_seeds_with_window(sequence, 0)
+    }
+
+    fn query_seeds_with_window(&self, sequence: &[u8], window: usize) -> Vec<QuerySeed> {
+        // Clamped up to the index window: a smaller query window would select
+        // minimizers the index never stored, so those lookups could only miss.
+        let window = if window == 0 { self.w } else { window.max(self.w) };
+        query_minimizers(sequence, self.k, window)
             .into_iter()
             .map(|(position, hash, code, is_rc)| {
                 QuerySeed::new(
@@ -1373,6 +1380,48 @@ mod tests {
         assert_eq!(reverse_lookup, SeedLookup::complete(1));
         assert_eq!(reverse_hits.len(), 1);
         assert_ne!(reverse_seed.strand, reverse_hits[0].strand);
+        fs::remove_file(path).expect("remove fixture index");
+    }
+
+    #[test]
+    fn a_sparser_query_window_selects_a_subset_of_the_index_window_seeds() {
+        // The decoupled query rests entirely on this: a minimizer chosen as
+        // the minimum over a wide window is also the minimum over the narrow
+        // window containing it, so querying a dense index sparsely still finds
+        // genuine hits. If it failed, the extra seeds would simply miss.
+        let path = fixture_path("query-window");
+        let reference = write_minimizer_fixture(&path);
+        let index = MinimizerIndex::open(&path).expect("open generated v13 fixture");
+
+        let dense: HashSet<(u32, SeedKey)> = index
+            .query_seeds_with_window(&reference, 0)
+            .into_iter()
+            .map(|seed| (seed.query_pos, seed.key()))
+            .collect();
+        assert!(!dense.is_empty());
+
+        let mut previous = dense.len();
+        for window in [index.window() * 2, index.window() * 4] {
+            let sparse: HashSet<(u32, SeedKey)> = index
+                .query_seeds_with_window(&reference, window)
+                .into_iter()
+                .map(|seed| (seed.query_pos, seed.key()))
+                .collect();
+            assert!(
+                sparse.is_subset(&dense),
+                "window {window} selected seeds the index window did not"
+            );
+            assert!(sparse.len() <= previous);
+            previous = sparse.len();
+        }
+
+        // A window below the index window is clamped up rather than selecting
+        // seeds the index never stored.
+        assert_eq!(
+            index.query_seeds_with_window(&reference, 1).len(),
+            index.query_seeds(&reference).len()
+        );
+
         fs::remove_file(path).expect("remove fixture index");
     }
 

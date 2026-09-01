@@ -255,6 +255,20 @@ pub trait SeedIndex: Sync {
 
     fn query_seeds(&self, sequence: &[u8]) -> Vec<QuerySeed>;
 
+    /// Extract query seeds using an explicit minimizer window.
+    ///
+    /// A window larger than the one the index was built with selects a subset
+    /// of the index's own minimizers, so the resulting seeds still resolve to
+    /// genuine reference hits while costing proportionally fewer lookups. `0`
+    /// means "use the index's window", and backends clamp any smaller value up
+    /// to it, because the subset relation only holds in one direction.
+    ///
+    /// The default ignores the window so that small adapters and tests do not
+    /// have to implement a second seeding path.
+    fn query_seeds_with_window(&self, sequence: &[u8], _window: usize) -> Vec<QuerySeed> {
+        self.query_seeds(sequence)
+    }
+
     fn visit_query_seeds(&self, sequence: &[u8], visitor: &mut dyn FnMut(QuerySeed) -> bool) {
         for seed in self.query_seeds(sequence) {
             if !visitor(seed) {

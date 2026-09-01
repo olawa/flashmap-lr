@@ -140,7 +140,9 @@ impl<'a> Aligner<'a> {
             ..ReadDiagnostics::default()
         };
         let phase_started = Instant::now();
-        let query_seeds = self.index.query_seeds(read.sequence);
+        let query_seeds = self
+            .index
+            .query_seeds_with_window(read.sequence, self.policy.probes.query_window);
         diagnostics.query_seed_nanos = elapsed_nanos(phase_started);
 
         // Every downstream phase needs the same read-global seed hits, and

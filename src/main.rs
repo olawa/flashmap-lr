@@ -25,6 +25,7 @@ struct Options {
     tiered_candidates: bool,
     mode: AlignmentMode,
     sort_memory: Option<String>,
+    query_window: usize,
 }
 
 impl Options {
@@ -51,6 +52,7 @@ impl Options {
         let mut tiered_candidates = false;
         let mut mode = AlignmentMode::default();
         let mut sort_memory: Option<String> = None;
+        let mut query_window = 0usize;
         let mut explicit_mode = None;
 
         let mut positional = Vec::new();
@@ -79,6 +81,9 @@ impl Options {
                 }
                 "--quiet" => {
                     quiet = true;
+                }
+                "--query-window" => {
+                    query_window = parse_positive(next_value(&mut args, &argument)?, "query-window")?;
                 }
                 "--sort-memory" => {
                     sort_memory = Some(next_value(&mut args, &argument)?);
@@ -206,6 +211,7 @@ impl Options {
             tiered_candidates,
             mode,
             sort_memory,
+            query_window,
         })
     }
 }
@@ -319,6 +325,8 @@ Options:\n\
   -c, --chunk-size N     Reads per worker batch (default: 10)\n\
       --quiet            Suppress progress indicators and summary\n\
       --profile          Print aggregate mapper phase timings\n\
+      --query-window N   Minimizer window used to query the index, independent\n\
+                         of the window it was built with (clamped up to it)\n\
       --sort-memory SIZE samtools sort memory PER THREAD for .bam output\n\
                          (e.g. 768M, 2G); default is samtools' own 768M\n\
       --fast             Bounded work budget for high throughput\n\
@@ -539,10 +547,16 @@ fn execute_mapping(
     // hatch for benchmark/debug runs.  The normal CLI path always constructs
     // the small public MapperConfig and therefore cannot accidentally combine
     // hidden algorithm thresholds with a mode selection.
-    let aligner_config = if options.paired_emms || options.tiered_candidates {
+    let aligner_config = if options.paired_emms
+        || options.tiered_candidates
+        || options.query_window > 0
+    {
         let defaults = Config::default();
         let legacy = Config {
-            seeding: defaults.seeding,
+            seeding: rs_lra::SeedingConfig {
+                query_window: options.query_window,
+                ..defaults.seeding
+            },
             candidates: rs_lra::CandidateConfig {
                 paired_emms: options.paired_emms,
                 emms_max_mismatch_run: options.emms_max_mismatch_run,

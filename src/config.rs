@@ -110,6 +110,15 @@ pub struct Config {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeedingConfig {
+    /// Minimizer window used to query the index, independent of the window the
+    /// index was built with. `0` uses the index's own window.
+    ///
+    /// Minimizers selected with a larger window are a subset of those selected
+    /// with a smaller one, so a sparse query against a dense index still finds
+    /// genuine hits -- it just finds fewer of them. Values below the index
+    /// window are clamped up, because the subset relation does not hold in that
+    /// direction.
+    pub query_window: usize,
     pub segment_size: usize,
     pub segment_overlap: usize,
     pub max_probes_per_segment: usize,
@@ -150,6 +159,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             seeding: SeedingConfig {
+                query_window: 0,
                 segment_size: 2048,
                 segment_overlap: 512,
                 // Fixed LR/HiFi-balanced probe schedule. This is resolved
@@ -286,6 +296,7 @@ fn validate_runtime(runtime: &RuntimeConfig) -> Result<(), ConfigError> {
 /// resolver selects one complete value before a worker is started.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProbePolicy {
+    pub(crate) query_window: usize,
     pub(crate) segment_size: usize,
     pub(crate) segment_overlap: usize,
     pub(crate) max_probes_per_segment: usize,
@@ -471,6 +482,7 @@ impl ResolvedMapperPolicy {
         policy.gaps.bridge_flank = config.alignment.bridge_flank;
         policy.gaps.bridge_max_gap = config.alignment.bridge_max_gap;
         policy.probes = ProbePolicy {
+            query_window: config.seeding.query_window,
             segment_size: config.seeding.segment_size,
             segment_overlap: config.seeding.segment_overlap,
             max_probes_per_segment: config.seeding.max_probes_per_segment,
@@ -509,6 +521,10 @@ impl ResolvedMapperPolicy {
 
     fn for_mode(mode: AlignmentMode, runtime: RuntimeConfig) -> Self {
         let probes = ProbePolicy {
+            // Default to the index's own window so a decoupled query is an
+            // explicit choice, measured per index, rather than a silent change
+            // in which seeds every existing caller sees.
+            query_window: 0,
             segment_size: 2_048,
             segment_overlap: 512,
             max_probes_per_segment: 6,
@@ -672,6 +688,7 @@ impl ResolvedMapperPolicy {
     pub(crate) fn as_legacy_config(&self) -> Config {
         Config {
             seeding: SeedingConfig {
+                query_window: self.probes.query_window,
                 segment_size: self.probes.segment_size,
                 segment_overlap: self.probes.segment_overlap,
                 max_probes_per_segment: self.probes.max_probes_per_segment,
