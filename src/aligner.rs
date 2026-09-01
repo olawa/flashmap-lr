@@ -132,27 +132,28 @@ impl<'a> Aligner<'a> {
     /// should wrap it in [`crate::WorkerPool`], which owns the reader,
     /// bounded batches, mapper workers, and ordered output sink.
     pub fn map(&self, read: Read<'_>) -> Result<MappingResult, MapError> {
-        let started = Instant::now();
+        let profiling = self.diagnostics.is_some();
+        let started = phase_timer(profiling);
         read.validate().map_err(MapError::InvalidRead)?;
 
         let mut diagnostics = ReadDiagnostics {
             query_bases: saturating_u32(read.sequence.len()),
             ..ReadDiagnostics::default()
         };
-        let phase_started = Instant::now();
+        let phase_started = phase_timer(profiling);
         let query_seeds = self
             .index
             .query_seeds_with_window(read.sequence, self.policy.probes.query_window);
-        diagnostics.query_seed_nanos = elapsed_nanos(phase_started);
+        diagnostics.query_seed_nanos = phase_nanos(phase_started);
 
         // Every downstream phase needs the same read-global seed hits, and
         // `SeedIndex::lookup` and `SeedIndex::visit_hits` run the same table
         // probe.  Resolve each query minimizer exactly once here so the
         // fastpath, probe frequency selection, and anchor discovery all share
         // one pass instead of binary-searching the index two or three times.
-        let phase_started = Instant::now();
+        let phase_started = phase_timer(profiling);
         let query_seed_hits = cache_query_seed_hits(&query_seeds, self.index);
-        diagnostics.seed_cache_nanos = elapsed_nanos(phase_started);
+        diagnostics.seed_cache_nanos = phase_nanos(phase_started);
 
         diagnostics.exact_fastpath_attempts = 1;
         if let Some((contig_id, chain)) = try_exact_unique_chain(
@@ -164,7 +165,7 @@ impl<'a> Aligner<'a> {
             let contig = self.reference.contig(contig_id).ok_or(MapError::Anchor(
                 crate::AnchorError::MissingReference(contig_id),
             ))?;
-            let cigar_started = Instant::now();
+            let cigar_started = phase_timer(profiling);
             let primary = crate::alignment::build_chain_alignment_with_policy(
                 read,
                 contig,
@@ -177,12 +178,12 @@ impl<'a> Aligner<'a> {
                 Some(&mut diagnostics),
             )
             .map_err(MapError::Cigar)?;
-            diagnostics.cigar_nanos = elapsed_nanos(cigar_started);
+            diagnostics.cigar_nanos = phase_nanos(cigar_started);
             diagnostics.exact_fastpath_accepted = 1;
             diagnostics.anchors = 1;
             diagnostics.chains = 1;
             diagnostics.mapped_bases = saturating_u32(read.sequence.len());
-            diagnostics.elapsed_nanos = elapsed_nanos(started);
+            diagnostics.elapsed_nanos = phase_nanos(started);
             self.notify(read.name, &diagnostics);
             return Ok(MappingResult {
                 primary: Some(primary),
@@ -196,7 +197,7 @@ impl<'a> Aligner<'a> {
                 },
             });
         }
-        let phase_started = Instant::now();
+        let phase_started = phase_timer(profiling);
         let probes = extract_read_probes_from_seeds(
             read,
             &query_seeds,
@@ -204,10 +205,10 @@ impl<'a> Aligner<'a> {
             self.index,
             &self.policy.probes,
         );
-        diagnostics.probe_nanos = elapsed_nanos(phase_started);
+        diagnostics.probe_nanos = phase_nanos(phase_started);
         diagnostics.seeds_seen = saturating_u32(probes.len());
         diagnostics.seeds_used = diagnostics.seeds_seen;
-        let phase_started = Instant::now();
+        let phase_started = phase_timer(profiling);
         let candidates = cluster_probe_hits_with_policy(
             &probes,
             read.sequence.len(),
@@ -215,7 +216,7 @@ impl<'a> Aligner<'a> {
             &self.policy.probes,
             &self.policy.candidates,
         );
-        diagnostics.candidate_nanos = elapsed_nanos(phase_started);
+        diagnostics.candidate_nanos = phase_nanos(phase_started);
         diagnostics.candidates = saturating_u32(candidates.len());
 
         let mut placements = Vec::new();
@@ -306,7 +307,7 @@ impl<'a> Aligner<'a> {
                 diagnostics.sparse_anchor_searches =
                     diagnostics.sparse_anchor_searches.saturating_add(1);
             }
-            let phase_started = Instant::now();
+            let phase_started = phase_timer(profiling);
             let mut anchors = if full_search {
                 find_anchors_with_seed_hits_with_policy_and_diagnostics(
                     read,
@@ -329,7 +330,7 @@ impl<'a> Aligner<'a> {
             .map_err(MapError::Anchor)?;
             diagnostics.anchor_nanos = diagnostics
                 .anchor_nanos
-                .saturating_add(elapsed_nanos(phase_started));
+                .saturating_add(phase_nanos(phase_started));
             diagnostics.anchors = diagnostics
                 .anchors
                 .saturating_add(saturating_u32(anchors.len()));
@@ -360,7 +361,7 @@ impl<'a> Aligner<'a> {
                 }
             }
 
-            let phase_started = Instant::now();
+            let phase_started = phase_timer(profiling);
             let mut chain_set = crate::chain::chain_anchors_with_policy(
                 std::mem::take(&mut anchors),
                 read.sequence.len(),
@@ -368,7 +369,7 @@ impl<'a> Aligner<'a> {
             );
             diagnostics.chain_nanos = diagnostics
                 .chain_nanos
-                .saturating_add(elapsed_nanos(phase_started));
+                .saturating_add(phase_nanos(phase_started));
             diagnostics.chains = diagnostics.chains.saturating_add(saturating_u32(
                 usize::from(chain_set.primary.is_some()) + chain_set.alternatives.len(),
             ));
@@ -397,7 +398,7 @@ impl<'a> Aligner<'a> {
                     .max();
                 if !full_search && best_existing_rank.is_none_or(|best| sparse_rank >= best) {
                     diagnostics.sparse_promotions = diagnostics.sparse_promotions.saturating_add(1);
-                    let phase_started = Instant::now();
+                    let phase_started = phase_timer(profiling);
                     anchors = find_anchors_with_seed_hits_with_policy_and_diagnostics(
                         read,
                         candidate,
@@ -409,11 +410,11 @@ impl<'a> Aligner<'a> {
                     .map_err(MapError::Anchor)?;
                     diagnostics.anchor_nanos = diagnostics
                         .anchor_nanos
-                        .saturating_add(elapsed_nanos(phase_started));
+                        .saturating_add(phase_nanos(phase_started));
                     diagnostics.anchors = diagnostics
                         .anchors
                         .saturating_add(saturating_u32(anchors.len()));
-                    let phase_started = Instant::now();
+                    let phase_started = phase_timer(profiling);
                     chain_set = crate::chain::chain_anchors_with_policy(
                         anchors,
                         read.sequence.len(),
@@ -421,7 +422,7 @@ impl<'a> Aligner<'a> {
                     );
                     diagnostics.chain_nanos = diagnostics
                         .chain_nanos
-                        .saturating_add(elapsed_nanos(phase_started));
+                        .saturating_add(phase_nanos(phase_started));
                     let Some(full_chain) = chain_set.primary.take() else {
                         continue;
                     };
@@ -482,7 +483,7 @@ impl<'a> Aligner<'a> {
         });
 
         let Some((contig_id, chain, endpoint_support)) = placements.first() else {
-            diagnostics.elapsed_nanos = elapsed_nanos(started);
+            diagnostics.elapsed_nanos = phase_nanos(started);
             self.notify(read.name, &diagnostics);
             return Ok(MappingResult {
                 primary: None,
@@ -519,7 +520,7 @@ impl<'a> Aligner<'a> {
         let contig = self.reference.contig(*contig_id).ok_or(MapError::Anchor(
             crate::AnchorError::MissingReference(*contig_id),
         ))?;
-        let phase_started = Instant::now();
+        let phase_started = phase_timer(profiling);
         let primary = crate::alignment::build_chain_alignment_with_policy(
             read,
             contig,
@@ -557,7 +558,7 @@ impl<'a> Aligner<'a> {
             supplementary.push(alignment);
         }
         diagnostics.supplementary_alignments = saturating_u32(supplementary.len());
-        diagnostics.cigar_nanos = elapsed_nanos(phase_started);
+        diagnostics.cigar_nanos = phase_nanos(phase_started);
         diagnostics.mapped_bases = primary
             .query_end
             .saturating_sub(primary.query_start)
@@ -567,7 +568,7 @@ impl<'a> Aligner<'a> {
                     _ => 0,
                 })
             }));
-        diagnostics.elapsed_nanos = elapsed_nanos(started);
+        diagnostics.elapsed_nanos = phase_nanos(started);
         self.notify(read.name, &diagnostics);
         Ok(MappingResult {
             primary: Some(primary),
@@ -758,6 +759,23 @@ fn saturating_u32(value: usize) -> u32 {
 
 fn elapsed_nanos(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+/// Read the clock only when a diagnostics sink will consume the result.
+///
+/// Phase timing costs a `clock_gettime` per phase per read. That is nearly
+/// free where the clock source is the TSC, but a machine that has fallen back
+/// to HPET or `acpi_pm` pays microseconds per call *and* serializes every
+/// worker on one device -- which looks exactly like a mapper that will not
+/// scale past a fraction of its cores.
+#[inline]
+fn phase_timer(enabled: bool) -> Option<Instant> {
+    enabled.then(Instant::now)
+}
+
+#[inline]
+fn phase_nanos(started: Option<Instant>) -> u64 {
+    started.map_or(0, elapsed_nanos)
 }
 
 fn mapping_quality(best_score: i32, second_score: Option<i32>, coverage: f64) -> u8 {

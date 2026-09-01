@@ -786,7 +786,9 @@ fn try_append_exact_island_chain(
     let reference_slice = reference
         .get(ref_start..ref_end)
         .ok_or(ChainCigarError::InvalidReferenceCoordinates)?;
-    let island_started = std::time::Instant::now();
+    let island_started = diagnostics
+        .as_ref()
+        .map(|_| std::time::Instant::now());
     let island_search = find_exact_island_chain(
         query_slice,
         reference_slice,
@@ -797,7 +799,9 @@ fn try_append_exact_island_chain(
         stats.exact_island_calls = stats.exact_island_calls.saturating_add(1);
         stats.exact_island_nanos = stats
             .exact_island_nanos
-            .saturating_add(crate::diagnostics::elapsed_nanos(island_started));
+            .saturating_add(
+                island_started.map_or(0, crate::diagnostics::elapsed_nanos),
+            );
         stats.exact_island_max_bucket = stats
             .exact_island_max_bucket
             .max(island_search.max_bucket as u32);

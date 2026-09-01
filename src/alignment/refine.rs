@@ -325,14 +325,14 @@ fn terminal_dp_fill(
         .abs_diff(reference.len())
         .saturating_add(64)
         .max(64);
-    let started = std::time::Instant::now();
+    let started = diagnostics.as_ref().map(|_| std::time::Instant::now());
     let alignment = align_full(query, reference, band);
     if let Some(stats) = diagnostics {
         stats.dp_calls = stats.dp_calls.saturating_add(1);
         stats.terminal_dp_calls = stats.terminal_dp_calls.saturating_add(1);
         stats.terminal_dp_nanos = stats
             .terminal_dp_nanos
-            .saturating_add(crate::diagnostics::elapsed_nanos(started));
+            .saturating_add(started.map_or(0, crate::diagnostics::elapsed_nanos));
     }
     let alignment = alignment?;
     if alignment.edit_distance as usize >= query.len()
@@ -382,7 +382,7 @@ fn terminal_recursive_fill(
     max_nm_rate: f64,
     mut diagnostics: Option<&mut crate::ReadDiagnostics>,
 ) -> Option<(Vec<CigarOp>, usize, usize)> {
-    let started = std::time::Instant::now();
+    let started = diagnostics.as_ref().map(|_| std::time::Instant::now());
     let result = (|| {
         let (local_start, local_end) =
             infer_terminal_reference_span(query, reference_window, side, k)?;
@@ -419,7 +419,7 @@ fn terminal_recursive_fill(
         stats.terminal_recursive_calls = stats.terminal_recursive_calls.saturating_add(1);
         stats.terminal_recursive_nanos = stats
             .terminal_recursive_nanos
-            .saturating_add(crate::diagnostics::elapsed_nanos(started));
+            .saturating_add(started.map_or(0, crate::diagnostics::elapsed_nanos));
     }
     result
 }

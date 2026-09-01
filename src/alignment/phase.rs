@@ -30,7 +30,7 @@ pub(crate) fn repair_phase_shifted_spans_with_diagnostics(
     initial_ref_pos: usize,
     diagnostics: Option<&mut crate::ReadDiagnostics>,
 ) -> Vec<CigarOp> {
-    let started = std::time::Instant::now();
+    let started = diagnostics.as_ref().map(|_| std::time::Instant::now());
     let mut repaired = Vec::with_capacity(ops.len() + 4);
     let mut q_pos = 0usize;
     let mut r_pos = initial_ref_pos;
@@ -75,7 +75,7 @@ pub(crate) fn repair_phase_shifted_spans_with_diagnostics(
             .saturating_add(repairs.min(u32::MAX as usize) as u32);
         stats.phase_repair_nanos = stats
             .phase_repair_nanos
-            .saturating_add(crate::diagnostics::elapsed_nanos(started));
+            .saturating_add(started.map_or(0, crate::diagnostics::elapsed_nanos));
     }
     result
 }
