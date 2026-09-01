@@ -376,6 +376,39 @@ impl Drop for ChildReader {
     }
 }
 
+/// Decide which external decompressor, if any, will be used for `path`.
+///
+/// Callers need this before opening, because a spawned decompressor competes
+/// for the same cores as the mapper workers and has to be budgeted for rather
+/// than added on top of them.
+pub fn resolve_decompressor(
+    path: impl AsRef<Path>,
+    requested: Option<&str>,
+) -> Option<String> {
+    let path = path.as_ref();
+    let mut file = File::open(path).ok()?;
+    let mut magic = [0u8; 2];
+    let gzipped = io::Read::read_exact(&mut file, &mut magic).is_ok() && magic == [0x1f, 0x8b];
+    if !gzipped {
+        return None;
+    }
+    let command = requested.unwrap_or(DEFAULT_DECOMPRESSOR);
+    let program = command.split_whitespace().next()?;
+    // `spawn` is the only honest availability test, but running the real
+    // command here would consume input, so probe the program alone.
+    Command::new(program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()
+        .filter(|status| status.success())
+        .map(|_| command.to_owned())
+}
+
+pub(crate) const DEFAULT_DECOMPRESSOR: &str = "pigz -dc";
+
 fn spawn_decompressor(command: &str, path: &Path) -> Option<FastxSource> {
     let mut parts = command.split_whitespace();
     let program = parts.next()?;
@@ -422,7 +455,7 @@ pub fn open_fastx_with_decompressor(
     let source: FastxSource = if gzipped {
         let external = decompressor
             .map(|command| (command, true))
-            .or(Some(("pigz -dc", false)))
+            .or(Some((DEFAULT_DECOMPRESSOR, false)))
             .and_then(|(command, explicit)| {
                 spawn_decompressor(command, path).or_else(|| {
                     if explicit {

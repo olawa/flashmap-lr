@@ -1,4 +1,7 @@
-use rs_lra::io::{load_reference_path, open_fastx_with_decompressor, AlignmentSink, SamWriter};
+use rs_lra::io::{
+    load_reference_path, open_fastx_with_decompressor, resolve_decompressor, AlignmentSink,
+    SamWriter,
+};
 use rs_lra::{
     Aligner, AlignerConfig, AlignmentMode, CigarOp, Config, DiagnosticsSink, InMemorySeedIndex,
     MappedRead, MapperConfig, MinimizerIndex, MinimizerIndexError, ReadDiagnostics, Reference,
@@ -544,6 +547,21 @@ impl ProgressReporter {
     }
 }
 
+/// Threads to hold back for a spawned decompressor.
+///
+/// Measured on a 24-core/48-thread Threadripper with HiFi input: 48 workers
+/// gave 10963 reads/s and 40 gave 12065, because `pigz` needs about 1.4 cores
+/// and gets only a proportional share of an oversubscribed run -- it then
+/// cannot feed the workers it is competing with. The reserve scales with the
+/// budget so a small run is not left with nothing to map with.
+fn decompressor_threads(workers: usize) -> usize {
+    if workers <= 4 {
+        0
+    } else {
+        (workers / 6).clamp(1, 8)
+    }
+}
+
 fn execute_mapping(
     reference: &dyn Reference,
     index: &dyn SeedIndex,
@@ -589,6 +607,27 @@ fn execute_mapping(
     } else {
         AlignerConfig::Mapper(mapper_config)
     };
+    // A spawned decompressor runs on the same cores as the workers, so it has
+    // to come out of the thread budget rather than be added on top of it.
+    // Oversubscribing starves it: it then cannot feed the workers it is
+    // competing with, and total throughput drops.
+    let decompressor = resolve_decompressor(&options.reads, options.decompress_with.as_deref());
+    let mut runtime = RuntimeConfig {
+        workers: options.workers,
+        chunk_size: options.chunk_size,
+        reader_batch_size: None,
+    };
+    if decompressor.is_some() {
+        let reserved = decompressor_threads(options.workers);
+        runtime.workers = options.workers.saturating_sub(reserved).max(1);
+        if !options.quiet && reserved > 0 {
+            eprintln!(
+                "[rs-lra] gzip input: {} of {} threads reserved for decompression",
+                reserved, options.workers
+            );
+        }
+    }
+
     let profile = ProfileReporter::default();
     let aligner = Aligner::new(reference, index, aligner_config)
         .map_err(|error| CliError::Pool(format!("invalid mapper configuration: {error}")))?;
@@ -597,10 +636,10 @@ fn execute_mapping(
     } else {
         aligner
     };
-    let pool = WorkerPool::new(aligner.runtime_config().clone())
+    let pool = WorkerPool::new(runtime)
         .map_err(|error| CliError::Pool(error.to_string()))?;
 
-    let reads = open_fastx_with_decompressor(&options.reads, options.decompress_with.as_deref())
+    let reads = open_fastx_with_decompressor(&options.reads, decompressor.as_deref())
         .map_err(CliError::Reads)?;
     // `usize::MAX` leaves the stream untouched, so the benchmarking path and
     // the production path run the same iterator adapter.
@@ -1167,6 +1206,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(options_fast.mode, AlignmentMode::Fast);
+    }
+
+    #[test]
+    fn decompressor_reserve_scales_and_never_starves_the_mapper() {
+        // Small budgets keep every thread: an external decompressor is only
+        // spawned when there is enough parallelism for it to matter.
+        assert_eq!(decompressor_threads(1), 0);
+        assert_eq!(decompressor_threads(4), 0);
+        // Above that it scales with the budget, always leaving workers behind.
+        assert_eq!(decompressor_threads(8), 1);
+        assert_eq!(decompressor_threads(24), 4);
+        assert_eq!(decompressor_threads(48), 8);
+        // And is capped, so a very large budget is not eaten by the reserve.
+        assert_eq!(decompressor_threads(256), 8);
+        for workers in 1..=256 {
+            assert!(
+                decompressor_threads(workers) < workers,
+                "reserve must leave at least one mapper thread at {workers}"
+            );
+        }
     }
 
     #[test]
