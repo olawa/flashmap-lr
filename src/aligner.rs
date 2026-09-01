@@ -210,7 +210,7 @@ impl<'a> Aligner<'a> {
         // locus. Taking it skips probe selection and clustering entirely; the
         // rest of the pipeline then runs against a given region instead of a
         // searched one.
-        let mut near_exact_drift = 0usize;
+        let mut near_exact_locus: Option<TwoEndedLocus> = None;
         let phase_started = phase_timer(profiling);
         let locked = self.policy.probes.near_exact_candidate.then(|| {
             let mut loci = Vec::new();
@@ -231,7 +231,7 @@ impl<'a> Aligner<'a> {
             // candidate ranking is worth paying for.
             Some([locus]) => {
                 diagnostics.near_exact_drift = locus.drift;
-                near_exact_drift = locus.drift as usize;
+                near_exact_locus = Some(*locus);
                 self.locked_candidate(*locus, read.sequence.len())
             }
             _ => None,
@@ -242,14 +242,14 @@ impl<'a> Aligner<'a> {
         // from the measured drift, so it is narrow exactly when the read is
         // clean -- and a wide drift falls through to the anchor path, which is
         // where a structural difference belongs anyway.
-        if let (Some(candidate), true) = (locked.as_ref(), self.policy.probes.near_exact_dp) {
-            if let Some(primary) = self.try_banded_whole_read(
-                read,
-                candidate,
-                near_exact_drift,
-                &mut diagnostics,
-                profiling,
-            )? {
+        if let (Some(candidate), Some(locus), true) = (
+            locked.as_ref(),
+            near_exact_locus,
+            self.policy.probes.near_exact_dp,
+        ) {
+            if let Some(primary) =
+                self.try_banded_whole_read(read, candidate, locus, &mut diagnostics, profiling)?
+            {
                 diagnostics.near_exact_dp_accepted = 1;
                 diagnostics.mapped_bases = saturating_u32(read.sequence.len());
                 diagnostics.elapsed_nanos = phase_nanos(started);
@@ -739,11 +739,12 @@ impl<'a> Aligner<'a> {
         &self,
         read: Read<'_>,
         candidate: &crate::CandidateRegion,
-        drift: usize,
+        locus: TwoEndedLocus,
         diagnostics: &mut ReadDiagnostics,
         profiling: bool,
     ) -> Result<Option<crate::Alignment>, MapError> {
         let policy = &self.policy.probes;
+        let drift = locus.drift as usize;
         if drift > policy.near_exact_dp_max_drift {
             return Ok(None);
         }
@@ -788,7 +789,7 @@ impl<'a> Aligner<'a> {
             query_end: saturating_u32(query_len),
             strand: candidate.strand,
             score: aligned.score,
-            mapq: 60,
+            mapq: near_exact_mapq(divergence, drift, locus.seed_frequency, policy),
             cigar: aligned.cigar,
             edit_distance: aligned.edit_distance,
         }))
@@ -939,6 +940,10 @@ struct TwoEndedLocus {
     /// the net indel between the two end seeds, so it is the band a DP over
     /// the whole read would need.
     drift: u32,
+    /// Larger of the two end seeds' genome-wide occurrence counts. A seed that
+    /// occurs once names its locus outright; one that occurs many times only
+    /// narrows it, and the pair had to agree to finish the job.
+    seed_frequency: u32,
 }
 
 /// Loci that rare seeds from the two end windows agree on, diagonally.
@@ -1007,12 +1012,12 @@ fn find_two_ended_loci(
     left.truncate(MAX_SEEDS_PER_END);
     right.truncate(MAX_SEEDS_PER_END);
 
-    for &(left_index, _) in &left {
+    for &(left_index, left_frequency) in &left {
         let left_seed = query_seeds[left_index];
         let query_left = left_seed.query_pos as usize;
         for left_hit in hits.hits_at(left_index).iter().take(MAX_HITS_PER_SEED) {
             let strand = effective_strand(left_seed.strand, left_hit.strand);
-            for &(right_index, _) in &right {
+            for &(right_index, right_frequency) in &right {
                 let right_seed = query_seeds[right_index];
                 let query_right = right_seed.query_pos as usize;
                 let query_span = query_right as i64 - query_left as i64;
@@ -1059,6 +1064,7 @@ fn find_two_ended_loci(
                         ref_start: span_start.saturating_sub(front as u64),
                         ref_end: span_end.saturating_add(back as u64),
                         drift,
+                        seed_frequency: left_frequency.max(right_frequency),
                     };
                     let band = span_start as i64 / LOCUS_BAND;
                     match out.iter_mut().find(|existing| {
@@ -1114,6 +1120,44 @@ fn effective_strand(query: crate::Strand, reference: crate::Strand) -> crate::St
     } else {
         crate::Strand::Reverse
     }
+}
+
+/// Confidence in a placement the two read ends named and a banded pass drew.
+///
+/// There is no runner-up to take a margin against -- the whole point is that
+/// no second locus was consistent -- so the evidence is the placement's own
+/// quality instead, in three parts.
+///
+/// `divergence` discriminates hardest. A HiFi read on its true locus sits near
+/// the error rate; one forced onto a paralog carries that paralog's difference
+/// as well, and the false positives this path adds cluster in high-coverage
+/// duplicated sequence where exactly that happens.
+///
+/// `drift` says how well the two ends agreed geometrically. It is a softer
+/// signal, because a real indel between them also widens it, so it can halve
+/// the score but not erase it.
+///
+/// `seed_frequency` is the weakest: the pair still had to agree on a diagonal,
+/// which a repeated seed rarely manages by accident, so a repeated seed only
+/// trims the result.
+fn near_exact_mapq(
+    divergence: f64,
+    drift: usize,
+    seed_frequency: u32,
+    policy: &crate::config::ProbePolicy,
+) -> u8 {
+    // Divergence at or below what a clean HiFi read shows is not evidence
+    // against the placement, so it costs nothing.
+    const CLEAN_DIVERGENCE: f64 = 0.02;
+    let ceiling = policy.near_exact_dp_max_divergence.max(CLEAN_DIVERGENCE + 1e-6);
+    let sequence = ((ceiling - divergence) / (ceiling - CLEAN_DIVERGENCE)).clamp(0.0, 1.0);
+
+    let max_drift = policy.near_exact_dp_max_drift.max(1) as f64;
+    let geometry = 1.0 - 0.5 * (drift as f64 / max_drift).clamp(0.0, 1.0);
+
+    let uniqueness = if seed_frequency <= 1 { 1.0 } else { 0.85 };
+
+    (60.0 * sequence * geometry * uniqueness).round().clamp(0.0, 60.0) as u8
 }
 
 fn saturating_i32(value: usize) -> i32 {
@@ -1285,6 +1329,40 @@ fn same_chain_placement(left: &crate::Chain, right: &crate::Chain) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn probe_policy() -> crate::config::ProbePolicy {
+        crate::config::ResolvedMapperPolicy::from_mapper_config(&crate::MapperConfig::default())
+            .expect("default policy")
+            .probes
+    }
+
+    #[test]
+    fn near_exact_mapq_is_earned_rather_than_assumed() {
+        let policy = probe_policy();
+        // A clean read whose ends agreed exactly and whose seeds are unique
+        // has nothing working against it.
+        assert_eq!(near_exact_mapq(0.005, 0, 1, &policy), 60);
+        // Divergence is the sharp signal: a read carrying a paralog's
+        // difference loses most of its confidence well before the rejection
+        // threshold refuses it outright.
+        assert!(near_exact_mapq(0.05, 0, 1, &policy) < 40);
+        assert_eq!(near_exact_mapq(policy.near_exact_dp_max_divergence, 0, 1, &policy), 0);
+        // Drift is softer: a real indel between the ends widens it too, so it
+        // can halve the score but not erase it.
+        let tight = near_exact_mapq(0.005, 0, 1, &policy);
+        let wide = near_exact_mapq(0.005, policy.near_exact_dp_max_drift, 1, &policy);
+        assert!(wide < tight && wide >= tight / 2);
+        // A repeated seed only trims, because the pair still had to agree.
+        assert!(near_exact_mapq(0.005, 0, 8, &policy) < 60);
+        assert!(near_exact_mapq(0.005, 0, 8, &policy) > 45);
+        // Confidence never increases as the evidence gets worse.
+        let mut previous = 60u8;
+        for step in 0..=10 {
+            let mapq = near_exact_mapq(step as f64 * 0.01, 0, 1, &policy);
+            assert!(mapq <= previous, "divergence {step} raised mapq");
+            previous = mapq;
+        }
+    }
     use crate::{
         Contig, ContigId, InMemoryReference, InMemorySeedIndex, OwnedRead, QuerySeed, SeedHit,
         SeedKey, SeedLookup, Strand,
