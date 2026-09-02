@@ -133,6 +133,37 @@ pub(crate) fn cache_query_seed_hits(
     cached
 }
 
+/// Query bases covered by at least one of `anchors`, counting overlap once.
+fn union_query_bases(anchors: &[Anchor]) -> u64 {
+    if anchors.is_empty() {
+        return 0;
+    }
+    let mut spans: Vec<(u32, u32)> = anchors
+        .iter()
+        .map(|anchor| (anchor.q_start, anchor.q_end))
+        .filter(|(start, end)| end > start)
+        .collect();
+    spans.sort_unstable();
+    let mut total = 0u64;
+    let mut open: Option<(u32, u32)> = None;
+    for (start, end) in spans {
+        match open {
+            Some((_, open_end)) if start <= open_end => {
+                open = Some((open.unwrap().0, open_end.max(end)));
+            }
+            Some((open_start, open_end)) => {
+                total += u64::from(open_end - open_start);
+                open = Some((start, end));
+            }
+            None => open = Some((start, end)),
+        }
+    }
+    if let Some((start, end)) = open {
+        total += u64::from(end - start);
+    }
+    total
+}
+
 /// Local reference k-mer positions for one candidate window.
 ///
 /// Stored as two parallel arrays sorted by `(code, position)` rather than a
@@ -721,6 +752,18 @@ fn find_anchors_with_seed_hits_depth(
         stats.stage_bc_anchors = stats
             .stage_bc_anchors
             .saturating_add(raw_anchors.len().saturating_sub(stage_a) as u32);
+        // Anchor counts are inflated by repeats: one query region matching many
+        // reference diagonals emits one anchor per diagonal while covering the
+        // read once. Union the query intervals to see what each stage explains.
+        let stage_a_covered = union_query_bases(&raw_anchors[..stage_a]);
+        let all_covered = union_query_bases(&raw_anchors);
+        stats.stage_a_query_bases = stats.stage_a_query_bases.saturating_add(stage_a_covered);
+        stats.stage_bc_added_query_bases = stats
+            .stage_bc_added_query_bases
+            .saturating_add(all_covered.saturating_sub(stage_a_covered));
+        stats.read_bases_scanned = stats
+            .read_bases_scanned
+            .saturating_add(read.sequence.len() as u64);
     }
     Ok(deduplicate_anchors(
         raw_anchors,

@@ -763,6 +763,9 @@ struct ProfileReporter {
     local_kmer_map_nanos: AtomicU64,
     stage_a_anchors: AtomicU64,
     stage_bc_anchors: AtomicU64,
+    stage_a_query_bases: AtomicU64,
+    stage_bc_added_query_bases: AtomicU64,
+    read_bases_scanned: AtomicU64,
     anchor_window_bases: AtomicU64,
     near_exact_dp_calls: AtomicU64,
     near_exact_dp_accepted: AtomicU64,
@@ -879,6 +882,12 @@ impl DiagnosticsSink for ProfileReporter {
             (&self.local_kmer_map_nanos, diagnostics.local_kmer_map_nanos),
             (&self.stage_a_anchors, u64::from(diagnostics.stage_a_anchors)),
             (&self.stage_bc_anchors, u64::from(diagnostics.stage_bc_anchors)),
+            (&self.stage_a_query_bases, diagnostics.stage_a_query_bases),
+            (
+                &self.stage_bc_added_query_bases,
+                diagnostics.stage_bc_added_query_bases,
+            ),
+            (&self.read_bases_scanned, diagnostics.read_bases_scanned),
             (
                 &self.near_exact_dp_calls,
                 u64::from(diagnostics.near_exact_dp_calls),
@@ -1064,6 +1073,14 @@ impl ProfileReporter {
             sa,
             sbc,
             100.0 * sbc as f64 / (sa + sbc).max(1) as f64,
+        );
+        let stage_a_bases = self.stage_a_query_bases.load(Ordering::Relaxed);
+        let added_bases = self.stage_bc_added_query_bases.load(Ordering::Relaxed);
+        let scanned = self.read_bases_scanned.load(Ordering::Relaxed).max(1);
+        eprintln!(
+            "                         query coverage: {:.1}% of scanned read bases from stage A, {:.1}% added by stage B/C",
+            100.0 * stage_a_bases as f64 / scanned as f64,
+            100.0 * added_bases as f64 / scanned as f64,
         );
         let dp_calls = self.near_exact_dp_calls.load(Ordering::Relaxed);
         if dp_calls > 0 {
