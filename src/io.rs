@@ -11,7 +11,7 @@ use crate::{
     Alignment, AlignmentError, CigarOp, ContigId, InMemoryReference, MappedRead, OwnedRead, Read,
     ReadError, Strand,
 };
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -891,6 +891,8 @@ impl Write for AlignmentSink {
 /// Streaming writer that pipes SAM text directly into `samtools sort` to produce
 /// coordinate-sorted, indexed BAM files without external crate dependencies.
 pub struct SamtoolsSortSink {
+    /// Directory holding this run's sort spill, removed once sorting is done.
+    spill_dir: Option<std::path::PathBuf>,
     child: Child,
     writer: Option<io::BufWriter<ChildStdin>>,
     output_path: PathBuf,
@@ -913,6 +915,24 @@ impl SamtoolsSortSink {
         if let Some(memory) = sort_memory {
             // samtools applies -m per sort thread.
             command.arg("-m").arg(memory);
+        }
+        // Give the sort its own spill prefix. Without `-T` samtools derives one
+        // from the output name, so a stale spill from an earlier run with the
+        // same output makes it refuse to create the file -- and it carries on
+        // regardless, merging fewer chunks than it wrote and dropping those
+        // reads from the BAM. Keep the directory beside the output so the
+        // spill lands on the same filesystem as the result it belongs to.
+        let spill = output_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!(".rs-lra-sort-{}", std::process::id()));
+        let spill_prefix = if fs::create_dir_all(&spill).is_ok() {
+            Some(spill.join("spill"))
+        } else {
+            None
+        };
+        if let Some(prefix) = spill_prefix.as_ref() {
+            command.arg("-T").arg(prefix);
         }
         command
             .arg("-O")
@@ -939,6 +959,7 @@ impl SamtoolsSortSink {
         })?;
 
         Ok(Self {
+            spill_dir: spill_prefix.as_ref().map(|_| spill),
             child,
             writer: Some(io::BufWriter::new(stdin)),
             output_path: output_path.to_path_buf(),
@@ -959,6 +980,11 @@ impl SamtoolsSortSink {
         }
 
         let status = self.child.wait()?;
+        // Remove the spill directory whether or not the sort succeeded, so a
+        // failed run does not leave chunks behind for the next one to trip on.
+        if let Some(spill) = self.spill_dir.take() {
+            let _ = fs::remove_dir_all(spill);
+        }
         if !status.success() {
             return Err(io::Error::other(format!(
                 "samtools sort failed with status {status}"
