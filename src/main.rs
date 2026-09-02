@@ -45,17 +45,22 @@ impl Options {
     /// across machines needs. Otherwise they come out of the `-t` budget with
     /// a share held back for a decompressor that would otherwise be starved
     /// by the very workers it feeds.
+    /// Whether the output path makes this run spawn `samtools sort`.
+    fn writes_bam(&self) -> bool {
+        self.output
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("bam"))
+    }
+
     fn resolved_workers(&self, decompressing: bool) -> usize {
         if let Some(workers) = self.workers {
             return workers;
         }
-        if decompressing {
-            self.threads
-                .saturating_sub(decompressor_threads(self.threads))
-                .max(1)
-        } else {
-            self.threads
-        }
+        // The budget covers everything this process spawns, which includes the
+        // BAM sort running beside the workers rather than after them.
+        let reserved = decompressor_threads(self.threads) * usize::from(decompressing)
+            + if self.writes_bam() { sort_threads(self.threads) } else { 0 };
+        self.threads.saturating_sub(reserved).max(1)
     }
 
     fn parse<I>(args: I) -> Result<Self, CliError>
@@ -497,8 +502,8 @@ fn usage() -> &'static str {
         "                            A .bam name is sorted and indexed on the way out.\n",
         "      --decompress-with CMD Command to decompress gzip reads; the path is\n",
         "                            appended (default: pigz -dc when on PATH)\n",
-        "      --sort-memory SIZE    samtools sort memory PER THREAD for .bam output,\n",
-        "                            e.g. 768M or 2G (default: samtools' own 768M)\n",
+        "      --sort-memory SIZE    Total memory the BAM sort may use, e.g. 8G.\n",
+        "                            Divided across its threads (default: samtools')\n",
         "\n",
         "Threads and batching:\n",
         "  -t, --threads N           Total threads the mapper may use, including the\n",
@@ -893,6 +898,48 @@ fn decompressor_threads(threads: usize) -> usize {
     usize::from(threads > 4)
 }
 
+/// Threads for the BAM sort, taken from the same budget as the workers.
+///
+/// `samtools sort` was given the whole `-t` value on top of them, so `-t 48`
+/// ran 47 mappers, a decompressor and 48 sort threads on 48 cores. The sort's
+/// work is BGZF compression and a merge -- bursty, and far smaller than the
+/// mapping it runs beside -- so it takes a bounded share instead of a second
+/// copy of the machine.
+fn sort_threads(threads: usize) -> usize {
+    (threads / 8).clamp(1, 8)
+}
+
+/// Bytes in a samtools-style size: a number with an optional K/M/G/T suffix.
+fn parse_size(value: &str) -> Option<u64> {
+    let upper = value.trim().to_ascii_uppercase();
+    // The unit letter can carry an "iB" or "B" tail, so shed that before
+    // reading it -- otherwise the B is taken for the unit and 4GiB is 4 bytes.
+    let body = upper.strip_suffix('B').unwrap_or(&upper);
+    let body = body.strip_suffix('I').unwrap_or(body);
+    let (digits, scale) = match body.chars().last()? {
+        'K' => (&body[..body.len() - 1], 1u64 << 10),
+        'M' => (&body[..body.len() - 1], 1u64 << 20),
+        'G' => (&body[..body.len() - 1], 1u64 << 30),
+        'T' => (&body[..body.len() - 1], 1u64 << 40),
+        _ => (body, 1),
+    };
+    digits.trim().parse::<u64>().ok()?.checked_mul(scale)
+}
+
+/// Split a total sort budget across the sort's threads.
+///
+/// samtools takes `-m` per thread, so a value that reads like the memory the
+/// machine has is multiplied by the thread count: `-@ 48 -m 4G` asks for 192
+/// GiB. Taking the flag as a total and dividing makes the number mean what it
+/// looks like. samtools needs room per thread to be worth having, so a budget
+/// too small to divide keeps a floor rather than thrashing on tiny blocks.
+fn sort_memory_per_thread(total: &str, threads: usize) -> Option<String> {
+    const FLOOR: u64 = 64 << 20;
+    let total = parse_size(total)?;
+    let per_thread = (total / threads.max(1) as u64).max(FLOOR);
+    Some(format!("{}M", (per_thread >> 20).max(1)))
+}
+
 fn execute_mapping(
     reference: &dyn Reference,
     index: &dyn SeedIndex,
@@ -910,11 +957,25 @@ fn execute_mapping(
         reader_batch_size: None,
     };
     if !options.quiet && options.workers.is_none() {
-        let reserved = options.threads.saturating_sub(runtime.workers);
-        if reserved > 0 {
+        // Name each reservation rather than deriving one number by subtraction:
+        // once the BAM sort also came out of the budget, the difference was no
+        // longer the decompressor's and the line said so anyway.
+        let mut reserved = Vec::new();
+        if decompressor.is_some() {
+            reserved.push(format!(
+                "{} for gzip input",
+                decompressor_threads(options.threads)
+            ));
+        }
+        if options.writes_bam() {
+            reserved.push(format!("{} for the BAM sort", sort_threads(options.threads)));
+        }
+        if !reserved.is_empty() {
             eprintln!(
-                "[rs-lra] gzip input: {} of {} threads reserved for decompression",
-                reserved, options.threads
+                "[rs-lra] threads: {} mapping, {} ({} total)",
+                runtime.workers,
+                reserved.join(", "),
+                options.threads
             );
         }
     }
@@ -975,10 +1036,23 @@ fn execute_mapping(
     // `usize::MAX` leaves the stream untouched, so the benchmarking path and
     // the production path run the same iterator adapter.
     let reads = reads.take(options.limit.unwrap_or(usize::MAX));
+    let sort_threads = sort_threads(options.threads);
+    let per_thread = options
+        .sort_memory
+        .as_deref()
+        .and_then(|total| sort_memory_per_thread(total, sort_threads));
+    if let (Some(total), Some(per_thread)) = (options.sort_memory.as_deref(), per_thread.as_deref())
+    {
+        if !options.quiet && options.writes_bam() {
+            eprintln!(
+                "[rs-lra] BAM sort: {sort_threads} threads, {total} total ({per_thread} each)"
+            );
+        }
+    }
     let output = AlignmentSink::open_with_sort_memory(
         &options.output,
-        options.threads,
-        options.sort_memory.as_deref(),
+        sort_threads,
+        per_thread.as_deref(),
     )
     .map_err(CliError::Output)?;
     let mut writer = SamWriter::from_contigs(output, metadata)
@@ -1526,6 +1600,65 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_sort_budget_is_divided_across_the_sort_threads() {
+        // The run that prompted this asked for 4G with 48 sort threads, which
+        // samtools reads as 192 GiB because -m is per thread.
+        assert_eq!(sort_memory_per_thread("48G", 6).as_deref(), Some("8192M"));
+        assert_eq!(sort_memory_per_thread("8G", 8).as_deref(), Some("1024M"));
+        assert_eq!(sort_memory_per_thread("4G", 4).as_deref(), Some("1024M"));
+    }
+
+    #[test]
+    fn a_budget_too_small_to_divide_keeps_a_floor_per_thread() {
+        // Tiny blocks make the merge thrash; a floor is better than honouring
+        // an unusable division.
+        assert_eq!(sort_memory_per_thread("64M", 8).as_deref(), Some("64M"));
+    }
+
+    #[test]
+    fn sizes_parse_the_way_samtools_writes_them() {
+        assert_eq!(parse_size("1024"), Some(1024));
+        assert_eq!(parse_size("1K"), Some(1 << 10));
+        assert_eq!(parse_size("768M"), Some(768 << 20));
+        assert_eq!(parse_size("4G"), Some(4 << 30));
+        assert_eq!(parse_size("4GiB"), Some(4 << 30));
+        assert_eq!(parse_size("2T"), Some(2u64 << 40));
+        assert_eq!(parse_size("not a size"), None);
+    }
+
+    #[test]
+    fn the_sort_takes_a_bounded_share_of_the_budget() {
+        assert_eq!(sort_threads(48), 6);
+        assert_eq!(sort_threads(18), 2);
+        assert_eq!(sort_threads(4), 1);
+        // A very large budget does not hand the sort a second machine.
+        assert_eq!(sort_threads(256), 8);
+        for threads in 1..=256 {
+            assert!(sort_threads(threads) < threads.max(2));
+        }
+    }
+
+    #[test]
+    fn a_bam_output_gives_up_threads_that_a_sam_output_keeps() {
+        let bam = Options::parse(
+            ["rs-lra", "-i", "r.fmi", "-q", "r.fq", "-o", "out.bam", "-t", "48"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        // 48 less one decompressor and six sort threads.
+        assert_eq!(bam.resolved_workers(true), 41);
+
+        let sam = Options::parse(
+            ["rs-lra", "-i", "r.fmi", "-q", "r.fq", "-o", "out.sam", "-t", "48"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(sam.resolved_workers(true), 47);
+    }
 
     #[test]
     fn a_truncated_option_suggests_the_one_it_abbreviates() {
