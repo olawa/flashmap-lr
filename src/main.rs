@@ -56,11 +56,13 @@ impl Options {
         if let Some(workers) = self.workers {
             return workers;
         }
-        // The budget covers everything this process spawns, which includes the
-        // BAM sort running beside the workers rather than after them.
-        let reserved = decompressor_threads(self.threads) * usize::from(decompressing)
-            + if self.writes_bam() { sort_threads(self.threads) } else { 0 };
-        self.threads.saturating_sub(reserved).max(1)
+        if decompressing {
+            self.threads
+                .saturating_sub(decompressor_threads(self.threads))
+                .max(1)
+        } else {
+            self.threads
+        }
     }
 
     fn parse<I>(args: I) -> Result<Self, CliError>
@@ -905,15 +907,21 @@ fn decompressor_threads(threads: usize) -> usize {
     usize::from(threads > 4)
 }
 
-/// Threads for the BAM sort, taken from the same budget as the workers.
+/// Threads for the BAM sort.
 ///
-/// `samtools sort` was given the whole `-t` value on top of them, so `-t 48`
-/// ran 47 mappers, a decompressor and 48 sort threads on 48 cores. The sort's
-/// work is BGZF compression and a merge -- bursty, and far smaller than the
-/// mapping it runs beside -- so it takes a bounded share instead of a second
-/// copy of the machine.
+/// All of them. Holding the sort to a share of the budget looked right --
+/// `-t 48` otherwise runs 47 mappers and 48 sort threads on 48 cores -- but
+/// it measurably is not: at `-@ 2` the sort could not compress its output
+/// fast enough, the mapper blocked on the pipe, and a chr20 run fell from
+/// about 9900 to 8470 reads/s at 741% CPU on eighteen cores.
+///
+/// The sort's threads are mostly blocked on the pipe and on I/O, so they
+/// oversubscribe far less than their count suggests, and BGZF compression of
+/// a whole-genome BAM is not the small bursty job the earlier reasoning here
+/// assumed. Nothing ever measured a gain from reserving them; that came from
+/// reading the -t documentation rather than the clock.
 fn sort_threads(threads: usize) -> usize {
-    (threads / 8).clamp(1, 8)
+    threads.max(1)
 }
 
 /// Bytes in a samtools-style size: a number with an optional K/M/G/T suffix.
@@ -974,9 +982,7 @@ fn execute_mapping(
                 decompressor_threads(options.threads)
             ));
         }
-        if options.writes_bam() {
-            reserved.push(format!("{} for the BAM sort", sort_threads(options.threads)));
-        }
+
         if !reserved.is_empty() {
             eprintln!(
                 "[rs-lra] threads: {} mapping, {} ({} total)",
@@ -1673,35 +1679,25 @@ mod tests {
     }
 
     #[test]
-    fn the_sort_takes_a_bounded_share_of_the_budget() {
-        assert_eq!(sort_threads(48), 6);
-        assert_eq!(sort_threads(18), 2);
-        assert_eq!(sort_threads(4), 1);
-        // A very large budget does not hand the sort a second machine.
-        assert_eq!(sort_threads(256), 8);
-        for threads in 1..=256 {
-            assert!(sort_threads(threads) < threads.max(2));
-        }
+    fn the_sort_keeps_every_thread_it_is_given() {
+        // Reserving a share of them starved the BGZF compression and the
+        // mapper blocked on the pipe; the sort's threads spend most of their
+        // time waiting, so they cost far less than their count.
+        assert_eq!(sort_threads(48), 48);
+        assert_eq!(sort_threads(18), 18);
+        assert_eq!(sort_threads(0), 1);
     }
 
     #[test]
-    fn a_bam_output_gives_up_threads_that_a_sam_output_keeps() {
+    fn only_the_decompressor_comes_out_of_the_budget() {
         let bam = Options::parse(
             ["rs-lra", "-i", "r.fmi", "-q", "r.fq", "-o", "out.bam", "-t", "48"]
                 .into_iter()
                 .map(str::to_owned),
         )
         .unwrap();
-        // 48 less one decompressor and six sort threads.
-        assert_eq!(bam.resolved_workers(true), 41);
-
-        let sam = Options::parse(
-            ["rs-lra", "-i", "r.fmi", "-q", "r.fq", "-o", "out.sam", "-t", "48"]
-                .into_iter()
-                .map(str::to_owned),
-        )
-        .unwrap();
-        assert_eq!(sam.resolved_workers(true), 47);
+        assert_eq!(bam.resolved_workers(true), 47);
+        assert_eq!(bam.resolved_workers(false), 48);
     }
 
     #[test]
