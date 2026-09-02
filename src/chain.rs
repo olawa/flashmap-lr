@@ -126,7 +126,20 @@ pub(crate) fn chain_anchors_with_policy(
             dp[i] = anchor_score(&anchors[i]);
             let mut iterations = 0usize;
 
-            for j in (0..i).rev() {
+            // Anchors sharing this query start sit next to it under the sort
+            // and can never be predecessors, so step over the whole block at
+            // once. Rejecting its members one at a time walks the bulk of a
+            // dense tandem repeat, and doing that without charging max_iter
+            // leaves the budget unable to bound the scan at all.
+            let current_key = (
+                anchors[i].ref_id,
+                strand_key(anchors[i].strand),
+                anchors[i].q_start,
+            );
+            let block_start = anchors[..i]
+                .partition_point(|a| (a.ref_id, strand_key(a.strand), a.q_start) < current_key);
+
+            for j in (0..block_start).rev() {
                 let previous_anchor = &anchors[j];
                 let current_anchor = &anchors[i];
 
@@ -143,10 +156,6 @@ pub(crate) fn chain_anchors_with_policy(
                     > max_dist
                 {
                     break;
-                }
-
-                if current_anchor.q_start == previous_anchor.q_start {
-                    continue;
                 }
 
                 iterations += 1;
