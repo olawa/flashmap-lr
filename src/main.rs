@@ -644,11 +644,30 @@ fn print_cap_distribution(index: &MinimizerIndex) {
     println!();
     println!("  What an adaptive policy would add, by its `high` threshold:");
     println!("    high        seeds answerable    extra hits     index growth");
-    for &threshold in &[32u32, 64, 128, 256, 1024, 4096, u32::MAX] {
-        let answerable = counts.partition_point(|count| *count <= threshold);
-        // Spaced sampling stores `cap` positions for each of those seeds.
-        let extra_hits = answerable as u64 * cap;
-        let label = if threshold == u32::MAX {
+    for &threshold in &[32usize, 64, 128, 256, 1024, 4096, usize::MAX] {
+        // Ask the policy itself rather than reimplementing it here, so this
+        // reports what a build would actually store.
+        let policy = fmi::SeedCapPolicy::Adaptive {
+            medium: summary.max_freq,
+            high: threshold,
+        };
+        let mut answerable = 0usize;
+        let extra_hits: u64 = counts
+            .iter()
+            .map(|&count| {
+                let count = count as usize;
+                let kept = match policy.plan(count, summary.max_freq) {
+                    fmi::KeepPlan::All => count,
+                    fmi::KeepPlan::None => 0,
+                    fmi::KeepPlan::First(n) | fmi::KeepPlan::Spaced(n) => n.min(count),
+                };
+                if kept > 0 {
+                    answerable += 1;
+                }
+                kept as u64
+            })
+            .sum();
+        let label = if threshold == usize::MAX {
             "no limit".to_owned()
         } else {
             threshold.to_string()
