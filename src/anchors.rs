@@ -572,6 +572,7 @@ fn find_anchors_with_seed_hits_depth(
     }
     // Counted through a cell so the scan closure needs only shared access.
     let map_builds = std::cell::Cell::new(0u32);
+    let map_nanos = std::cell::Cell::new(0u64);
     let scan_positions = |positions: &[usize],
                           local_kmer_map: &mut Option<LocalKmerMap>,
                           raw_anchors: &mut Vec<Anchor>,
@@ -589,11 +590,17 @@ fn find_anchors_with_seed_hits_depth(
             } else {
                 if local_kmer_map.is_none() {
                     map_builds.set(map_builds.get().saturating_add(1));
+                    let build_started = std::time::Instant::now();
                     *local_kmer_map = Some(LocalKmerMap::build(
                         &contig.sequence[window_start..window_end],
                         window_start,
                         k,
                     ));
+                    map_nanos.set(
+                        map_nanos
+                            .get()
+                            .saturating_add(build_started.elapsed().as_nanos() as u64),
+                    );
                 }
                 let Some(code) = encode_kmer(&read.sequence[q_start..q_start + k]) else {
                     continue;
@@ -664,6 +671,7 @@ fn find_anchors_with_seed_hits_depth(
         &mut full_span_found,
     );
 
+    let stage_a = raw_anchors.len();
     let sufficient = is_sufficient_anchors(&raw_anchors, read.sequence.len(), *anchor_policy);
 
     if allow_local_fallback && !full_span_found && !sufficient {
@@ -708,6 +716,11 @@ fn find_anchors_with_seed_hits_depth(
         stats.local_kmer_map_builds = stats
             .local_kmer_map_builds
             .saturating_add(map_builds.get());
+        stats.local_kmer_map_nanos = stats.local_kmer_map_nanos.saturating_add(map_nanos.get());
+        stats.stage_a_anchors = stats.stage_a_anchors.saturating_add(stage_a as u32);
+        stats.stage_bc_anchors = stats
+            .stage_bc_anchors
+            .saturating_add(raw_anchors.len().saturating_sub(stage_a) as u32);
     }
     Ok(deduplicate_anchors(
         raw_anchors,

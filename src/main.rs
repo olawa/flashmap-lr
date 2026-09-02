@@ -760,6 +760,9 @@ struct ProfileReporter {
     approximate_gap_fallbacks: AtomicU64,
     adaptive_gap_escalations: AtomicU64,
     local_kmer_map_builds: AtomicU64,
+    local_kmer_map_nanos: AtomicU64,
+    stage_a_anchors: AtomicU64,
+    stage_bc_anchors: AtomicU64,
     anchor_window_bases: AtomicU64,
     near_exact_dp_calls: AtomicU64,
     near_exact_dp_accepted: AtomicU64,
@@ -873,6 +876,9 @@ impl DiagnosticsSink for ProfileReporter {
                 u64::from(diagnostics.local_kmer_map_builds),
             ),
             (&self.anchor_window_bases, diagnostics.anchor_window_bases),
+            (&self.local_kmer_map_nanos, diagnostics.local_kmer_map_nanos),
+            (&self.stage_a_anchors, u64::from(diagnostics.stage_a_anchors)),
+            (&self.stage_bc_anchors, u64::from(diagnostics.stage_bc_anchors)),
             (
                 &self.near_exact_dp_calls,
                 u64::from(diagnostics.near_exact_dp_calls),
@@ -1046,6 +1052,18 @@ impl ProfileReporter {
             reads,
             self.local_kmer_map_builds.load(Ordering::Relaxed) as f64 / reads.max(1) as f64,
             self.anchor_window_bases.load(Ordering::Relaxed) as f64 / reads.max(1) as f64,
+        );
+        let sa = self.stage_a_anchors.load(Ordering::Relaxed);
+        let sbc = self.stage_bc_anchors.load(Ordering::Relaxed);
+        eprintln!(
+            "                         build time {:.3} worker-s ({:.0} us/build); anchors: {} stage A, {} stage B/C ({:.1}% from the map)",
+            self.local_kmer_map_nanos.load(Ordering::Relaxed) as f64 / 1e9,
+            self.local_kmer_map_nanos.load(Ordering::Relaxed) as f64
+                / 1000.0
+                / self.local_kmer_map_builds.load(Ordering::Relaxed).max(1) as f64,
+            sa,
+            sbc,
+            100.0 * sbc as f64 / (sa + sbc).max(1) as f64,
         );
         let dp_calls = self.near_exact_dp_calls.load(Ordering::Relaxed);
         if dp_calls > 0 {
