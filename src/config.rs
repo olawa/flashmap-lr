@@ -110,6 +110,8 @@ pub struct Config {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeedingConfig {
+    /// Search inside query intervals no placement explains.
+    pub reseed_uncovered: bool,
     /// Lock the candidate region from two consistent end seeds.
     pub near_exact_candidate: bool,
     /// Align a locked region in one banded pass instead of finding anchors.
@@ -163,6 +165,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             seeding: SeedingConfig {
+                reseed_uncovered: false,
                 near_exact_candidate: false,
                 near_exact_dp: false,
                 query_window: 0,
@@ -304,6 +307,9 @@ fn validate_runtime(runtime: &RuntimeConfig) -> Result<(), ConfigError> {
 pub(crate) struct ProbePolicy {
     /// Lock the candidate region from two diagonally consistent end seeds
     /// when exactly one locus survives, skipping probe clustering.
+    pub(crate) reseed_uncovered: bool,
+    pub(crate) reseed_max_intervals: usize,
+    pub(crate) reseed_min_hits: u32,
     pub(crate) near_exact_candidate: bool,
     pub(crate) near_exact_dp: bool,
     pub(crate) near_exact_dp_max_drift: usize,
@@ -495,6 +501,9 @@ impl ResolvedMapperPolicy {
         policy.gaps.bridge_flank = config.alignment.bridge_flank;
         policy.gaps.bridge_max_gap = config.alignment.bridge_max_gap;
         policy.probes = ProbePolicy {
+            reseed_uncovered: config.seeding.reseed_uncovered,
+            reseed_max_intervals: policy.probes.reseed_max_intervals,
+            reseed_min_hits: policy.probes.reseed_min_hits,
             near_exact_candidate: config.seeding.near_exact_candidate,
             near_exact_dp: config.seeding.near_exact_dp,
             near_exact_dp_max_drift: policy.probes.near_exact_dp_max_drift,
@@ -544,6 +553,9 @@ impl ResolvedMapperPolicy {
             // in which seeds every existing caller sees.
             // Off until measured against variant calling: it changes which
             // region is searched, not just how fast the search is.
+            reseed_uncovered: false,
+            reseed_max_intervals: 4,
+            reseed_min_hits: 2,
             near_exact_candidate: false,
             near_exact_dp: false,
             query_window: 0,
@@ -715,6 +727,7 @@ impl ResolvedMapperPolicy {
     pub(crate) fn as_legacy_config(&self) -> Config {
         Config {
             seeding: SeedingConfig {
+                reseed_uncovered: self.probes.reseed_uncovered,
                 near_exact_candidate: self.probes.near_exact_candidate,
                 near_exact_dp: self.probes.near_exact_dp,
                 query_window: self.probes.query_window,

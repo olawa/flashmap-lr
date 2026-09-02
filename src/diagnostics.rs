@@ -44,6 +44,8 @@ pub struct ReadDiagnostics {
     /// Reads whose candidate region was locked from the two ends.
     pub near_exact_locked: u32,
     /// Diagonal drift of an unambiguous locus: the band a whole-read DP needs.
+    pub reseed_intervals: u32,
+    pub reseed_placements: u32,
     pub near_exact_drift: u32,
     pub near_exact_dp_calls: u32,
     pub near_exact_dp_accepted: u32,

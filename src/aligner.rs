@@ -540,6 +540,50 @@ impl<'a> Aligner<'a> {
         }
         placements = unique_placements;
 
+        // A chain that explains only part of the read leaves the rest
+        // unaccounted for. The candidate loop ranks loci by how much of the
+        // whole read supports them, so a short second segment scores far below
+        // the competitive floor and the search stops before reaching it -- the
+        // read is then emitted with its other side silently clipped. Go back
+        // and look specifically inside the query it did not explain.
+        if self.policy.probes.reseed_uncovered {
+            let reseeded = self.reseed_uncovered_intervals(
+                read,
+                &query_seeds,
+                &query_seed_hits,
+                &placements,
+                &mut diagnostics,
+            )?;
+            for candidate in reseeded {
+                let mut anchors = find_anchors_with_seed_hits_with_policy_and_diagnostics(
+                    read,
+                    &candidate,
+                    self.reference,
+                    &self.policy.anchors,
+                    &query_seed_hits,
+                    &mut diagnostics,
+                )
+                .map_err(MapError::Anchor)?;
+                if anchors.is_empty() {
+                    continue;
+                }
+                let mut chain_set = crate::chain::chain_anchors_with_policy(
+                    std::mem::take(&mut anchors),
+                    read.sequence.len(),
+                    &self.policy.chaining,
+                );
+                if let Some(chain) = chain_set.primary.take() {
+                    if chain.query_covered_bases
+                        >= self.policy.structural.min_supplementary_bases
+                    {
+                        diagnostics.reseed_placements =
+                            diagnostics.reseed_placements.saturating_add(1);
+                        placements.push((candidate.contig, chain, candidate.endpoint_support));
+                    }
+                }
+            }
+        }
+
         diagnostics.structural_chain_bridges =
             diagnostics
                 .structural_chain_bridges
@@ -729,6 +773,116 @@ impl<'a> Aligner<'a> {
             tags,
             mapping,
         })
+    }
+
+    /// Find candidate loci for the query a chain set did not explain.
+    ///
+    /// The ordinary ranking scores a locus by how much of the *whole* read
+    /// supports it, which is the right question when a read has one home and
+    /// the wrong one when it has two: the shorter side of a split scores in
+    /// proportion to its length and loses to the longer side long before it is
+    /// evaluated. Restricting the score to one uncovered interval removes that
+    /// asymmetry, because inside it the second segment is the only evidence
+    /// there is.
+    fn reseed_uncovered_intervals(
+        &self,
+        read: Read<'_>,
+        query_seeds: &[crate::QuerySeed],
+        hits: &CachedQuerySeedHits,
+        placements: &[ChainPlacement],
+        diagnostics: &mut ReadDiagnostics,
+    ) -> Result<Vec<crate::CandidateRegion>, MapError> {
+        let min_interval = self.policy.structural.min_supplementary_bases as usize;
+        let intervals = uncovered_query_intervals(placements, read.sequence.len(), min_interval);
+        if intervals.is_empty() {
+            return Ok(Vec::new());
+        }
+        diagnostics.reseed_intervals = saturating_u32(intervals.len());
+
+        let seed_span = hits.seed_span();
+        let tolerance = self.policy.candidates.diagonal_tolerance.max(0) as i64;
+        let mut found = Vec::new();
+        for (q_start, q_end) in intervals
+            .into_iter()
+            .take(self.policy.probes.reseed_max_intervals)
+        {
+            // Group this interval's hits by locus. A short segment yields few
+            // seeds, so every hit is worth grouping rather than sampling.
+            let mut groups: std::collections::HashMap<(crate::ContigId, crate::Strand, i64), (u64, u64, u32)> =
+                std::collections::HashMap::new();
+            for (index, seed) in query_seeds.iter().enumerate() {
+                let position = seed.query_pos as usize;
+                if position < q_start || position + seed_span > q_end {
+                    continue;
+                }
+                let Some(lookup) = hits.lookup_at(index) else {
+                    continue;
+                };
+                if !matches!(lookup.completeness, crate::HitCompleteness::Complete)
+                    || lookup.reported_hits as usize > self.policy.probes.endpoint_max_frequency
+                {
+                    continue;
+                }
+                for hit in hits.hits_at(index) {
+                    let strand = effective_strand(seed.strand, hit.strand);
+                    let diagonal = match strand {
+                        crate::Strand::Forward => seed.query_pos as i64 - hit.ref_pos as i64,
+                        crate::Strand::Reverse => {
+                            seed.query_pos as i64 + hit.ref_pos as i64 + seed_span as i64 - 1
+                        }
+                    };
+                    let band = if tolerance > 0 { diagonal / tolerance } else { diagonal };
+                    let entry = groups
+                        .entry((hit.contig, strand, band))
+                        .or_insert((hit.ref_pos, hit.ref_pos, 0));
+                    entry.0 = entry.0.min(hit.ref_pos);
+                    entry.1 = entry.1.max(hit.ref_pos);
+                    entry.2 = entry.2.saturating_add(1);
+                }
+            }
+
+            let Some((&(contig, strand, _), &(ref_start, ref_last, support))) = groups
+                .iter()
+                .max_by_key(|(_, (_, _, support))| *support)
+            else {
+                continue;
+            };
+            if support < self.policy.probes.reseed_min_hits {
+                continue;
+            }
+            // Widen by the query that lies outside the seeds so the region
+            // covers the whole uncovered interval, not just its seeded part,
+            // and clamp to the contig: anchor discovery rejects a candidate
+            // that runs past the end rather than trimming it.
+            let Some(reference) = self.reference.contig(contig) else {
+                continue;
+            };
+            let contig_len = reference.sequence.len() as u64;
+            let span = (q_end - q_start) as u64;
+            let ref_start = ref_start.saturating_sub(span);
+            let ref_end = ref_last
+                .saturating_add(seed_span as u64)
+                .saturating_add(span)
+                .min(contig_len);
+            if ref_start >= ref_end {
+                continue;
+            }
+            found.push(crate::CandidateRegion {
+                contig,
+                ref_start,
+                ref_end,
+                strand,
+                supporting_segments: 1,
+                unique_probes: support,
+                mean_probe_frequency: 1.0,
+                best_probe_frequency: 1,
+                diagonal_mean: 0.0,
+                diagonal_median: 0.0,
+                score: saturating_i32(q_end - q_start),
+                endpoint_support: EndpointSupport::InternalOnly,
+            });
+        }
+        Ok(found)
     }
 
     /// Align a whole read in one banded pass against a locked region.
@@ -1158,6 +1312,35 @@ fn near_exact_mapq(
     let uniqueness = if seed_frequency <= 1 { 1.0 } else { 0.85 };
 
     (60.0 * sequence * geometry * uniqueness).round().clamp(0.0, 60.0) as u8
+}
+
+/// Query spans of at least `minimum` bases that no placement explains.
+fn uncovered_query_intervals(
+    placements: &[ChainPlacement],
+    read_len: usize,
+    minimum: usize,
+) -> Vec<(usize, usize)> {
+    if placements.is_empty() || minimum == 0 {
+        return Vec::new();
+    }
+    let mut covered: Vec<(usize, usize)> = placements
+        .iter()
+        .map(|(_, chain, _)| (chain.q_start as usize, chain.q_end as usize))
+        .collect();
+    covered.sort_unstable();
+
+    let mut gaps = Vec::new();
+    let mut cursor = 0usize;
+    for (start, end) in covered {
+        if start > cursor && start - cursor >= minimum {
+            gaps.push((cursor, start));
+        }
+        cursor = cursor.max(end);
+    }
+    if read_len > cursor && read_len - cursor >= minimum {
+        gaps.push((cursor, read_len));
+    }
+    gaps
 }
 
 fn saturating_i32(value: usize) -> i32 {
