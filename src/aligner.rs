@@ -146,31 +146,15 @@ impl<'a> Aligner<'a> {
             .query_seeds_with_window(read.sequence, self.policy.probes.query_window);
         diagnostics.query_seed_nanos = phase_nanos(phase_started);
 
-        // Every downstream phase needs the same read-global seed hits, and
-        // `SeedIndex::lookup` and `SeedIndex::visit_hits` run the same table
-        // probe.  Resolve each query minimizer exactly once here so the
-        // fastpath, probe frequency selection, and anchor discovery all share
-        // one pass instead of binary-searching the index two or three times.
-        let phase_started = phase_timer(profiling);
-        let query_seed_hits = cache_query_seed_hits(&query_seeds, self.index);
-        diagnostics.seed_cache_nanos = phase_nanos(phase_started);
-
-        if profiling {
-            probe_near_exact_potential(
-                read.sequence.len(),
-                &query_seeds,
-                &query_seed_hits,
-                &self.policy.probes,
-                &mut diagnostics,
-            );
-        }
+        // The fastpath needs a handful of unique seeds, not the read's whole
+        // hit set, and on a short read it usually succeeds -- caching first
+        // resolves every minimizer to answer what three settle. Try it against
+        // the index directly and build the shared cache only for reads that
+        // fall through, where its cost is amortised over every later phase.
         diagnostics.exact_fastpath_attempts = 1;
-        if let Some((contig_id, chain)) = try_exact_unique_chain(
-            read.sequence,
-            &query_seeds,
-            &query_seed_hits,
-            self.reference,
-        ) {
+        if let Some((contig_id, chain)) =
+            try_exact_unique_chain(read.sequence, &query_seeds, self.reference, self.index)
+        {
             let contig = self.reference.contig(contig_id).ok_or(MapError::Anchor(
                 crate::AnchorError::MissingReference(contig_id),
             ))?;
@@ -206,6 +190,22 @@ impl<'a> Aligner<'a> {
                 },
             });
         }
+        // Every remaining phase needs the same read-global seed hits, and
+        // `lookup` and `visit_hits` run the same table probe, so resolve each
+        // query minimizer exactly once here.
+        let phase_started = phase_timer(profiling);
+        let query_seed_hits = cache_query_seed_hits(&query_seeds, self.index);
+        diagnostics.seed_cache_nanos = phase_nanos(phase_started);
+        if profiling {
+            probe_near_exact_potential(
+                read.sequence.len(),
+                &query_seeds,
+                &query_seed_hits,
+                &self.policy.probes,
+                &mut diagnostics,
+            );
+        }
+
         // A read whose two ends agree on one diagonal has already named its
         // locus. Taking it skips probe selection and clustering entirely; the
         // rest of the pipeline then runs against a given region instead of a
@@ -1046,30 +1046,40 @@ impl<'a> Aligner<'a> {
 fn try_exact_unique_chain(
     read: &[u8],
     query_seeds: &[crate::QuerySeed],
-    query_seed_hits: &CachedQuerySeedHits,
     reference: &dyn Reference,
+    index: &dyn SeedIndex,
 ) -> Option<(crate::ContigId, Chain)> {
-    let k = query_seed_hits.seed_span();
+    let k = index.seed_span();
     if k == 0 || read.len() < k || read.len() > u32::MAX as usize {
         return None;
     }
 
     let mut tested = 0usize;
-    for (seed_index, seed) in query_seeds.iter().enumerate() {
-        let Some(lookup) = query_seed_hits.lookup_at(seed_index) else {
-            continue;
-        };
+    for seed in query_seeds {
+        // Metadata first: a seed with anything but one complete hit cannot pin
+        // the read, and asking for its hits would decode a list this path has
+        // no use for.
+        let lookup = index.lookup(seed);
         if !matches!(lookup.completeness, crate::HitCompleteness::Complete)
             || lookup.reported_hits != 1
         {
             continue;
         }
         tested += 1;
-        let hits = query_seed_hits.hits_at(seed_index);
-        if query_seed_hits.callback_count_at(seed_index) != 1 || hits.len() != 1 {
+        let mut unique_hit = None;
+        let mut visited = 0usize;
+        let reported = index.visit_hits(seed, &mut |hit| {
+            visited = visited.saturating_add(1);
+            if unique_hit.is_none() {
+                unique_hit = Some(hit);
+            }
+        });
+        if !matches!(reported.completeness, crate::HitCompleteness::Complete) || visited != 1 {
             continue;
         }
-        let hit = hits[0];
+        let Some(hit) = unique_hit else {
+            continue;
+        };
         let strand = if seed.strand == hit.strand {
             crate::Strand::Forward
         } else {
