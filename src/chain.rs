@@ -145,6 +145,10 @@ pub(crate) fn chain_anchors_with_policy(
                     break;
                 }
 
+                if current_anchor.q_start == previous_anchor.q_start {
+                    continue;
+                }
+
                 iterations += 1;
                 if iterations > policy.max_iter {
                     break;
@@ -666,5 +670,29 @@ mod tests {
         assert_eq!(primary.left_terminal_gap, 0);
         assert_eq!(primary.right_terminal_gap, 1_900);
         assert!(!primary.internal_only_chain);
+    }
+
+    #[test]
+    fn chaining_connects_across_dense_tandem_repeats() {
+        let mut anchors = vec![anchor(0, 100, 0, 100, Strand::Forward, 100)];
+        // Generate 80 repeat anchors sharing q_start=200 (exceeding default max_iter of 64).
+        for ref_offset in 0..80 {
+            anchors.push(anchor(
+                200,
+                230,
+                200 + (ref_offset * 10) as u64,
+                230 + (ref_offset * 10) as u64,
+                Strand::Forward,
+                30,
+            ));
+        }
+        anchors.push(anchor(400, 500, 400, 500, Strand::Forward, 100));
+
+        let result = chain_anchors(anchors, 600, 0);
+        let primary = result.primary.expect("primary chain must exist");
+        // Primary chain must successfully connect the first anchor (q=0) and the last (q=400).
+        assert_eq!(primary.q_start, 0);
+        assert_eq!(primary.q_end, 500);
+        assert!(primary.anchors.len() >= 3);
     }
 }

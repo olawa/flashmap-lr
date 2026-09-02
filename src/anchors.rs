@@ -923,48 +923,63 @@ fn build_paired_staging(
 
             let mut compatible = false;
             for &left_ref in &left.ref_positions {
-                for &right_ref in &right.ref_positions {
-                    let direction_ok = match strand {
-                        Strand::Forward => right_ref >= left_ref,
-                        Strand::Reverse => left_ref >= right_ref,
-                    };
+                let (min_right, max_right) = match strand {
+                    Strand::Forward => (
+                        left_ref.saturating_add(
+                            query_distance
+                                .saturating_sub(policy.paired_distance_tolerance)
+                                as u64,
+                        ),
+                        left_ref.saturating_add(
+                            query_distance
+                                .saturating_add(policy.paired_distance_tolerance)
+                                as u64,
+                        ),
+                    ),
+                    Strand::Reverse => (
+                        left_ref.saturating_sub(
+                            query_distance
+                                .saturating_add(policy.paired_distance_tolerance)
+                                as u64,
+                        ),
+                        left_ref.saturating_sub(
+                            query_distance
+                                .saturating_sub(policy.paired_distance_tolerance)
+                                as u64,
+                        ),
+                    ),
+                };
+
+                let start_idx = right.ref_positions.partition_point(|&r| r < min_right);
+                for &right_ref in &right.ref_positions[start_idx..] {
+                    if right_ref > max_right {
+                        break;
+                    }
+                    compatible = true;
                     let ref_distance = left_ref.abs_diff(right_ref) as usize;
-                    if direction_ok
-                        && ref_distance.abs_diff(query_distance) <= policy.paired_distance_tolerance
-                    {
-                        compatible = true;
-                        if ref_distance == query_distance && emms_pairs.len() < 1024 {
-                            // Every pair on one diagonal describes the same
-                            // contiguous match, so enumerating all of them
-                            // yields nested anchors over identical bases.
-                            // Keep the widest span per diagonal instead.
-                            let diagonal = match strand {
-                                Strand::Forward => {
-                                    left_ref as i64 - left.query_pos as i64
-                                }
-                                Strand::Reverse => {
-                                    left_ref as i64 + left.query_pos as i64
-                                }
-                            };
-                            let pair = PairedMinimizerPair {
-                                q_left: left.query_pos,
-                                q_right: right.query_pos,
-                                r_left: left_ref,
-                                r_right: right_ref,
-                            };
-                            match emms_by_diagonal.entry(diagonal) {
-                                Entry::Vacant(slot) => {
-                                    slot.insert(emms_pairs.len());
-                                    emms_pairs.push(pair);
-                                }
-                                Entry::Occupied(slot) => {
-                                    let existing = &mut emms_pairs[*slot.get()];
-                                    let widest = existing
-                                        .q_right
-                                        .saturating_sub(existing.q_left);
-                                    if query_distance > widest {
-                                        *existing = pair;
-                                    }
+                    if ref_distance == query_distance && emms_pairs.len() < 1024 {
+                        let diagonal = match strand {
+                            Strand::Forward => left_ref as i64 - left.query_pos as i64,
+                            Strand::Reverse => left_ref as i64 + left.query_pos as i64,
+                        };
+                        let pair = PairedMinimizerPair {
+                            q_left: left.query_pos,
+                            q_right: right.query_pos,
+                            r_left: left_ref,
+                            r_right: right_ref,
+                        };
+                        match emms_by_diagonal.entry(diagonal) {
+                            Entry::Vacant(slot) => {
+                                slot.insert(emms_pairs.len());
+                                emms_pairs.push(pair);
+                            }
+                            Entry::Occupied(slot) => {
+                                let existing = &mut emms_pairs[*slot.get()];
+                                let widest = existing
+                                    .q_right
+                                    .saturating_sub(existing.q_left);
+                                if query_distance > widest {
+                                    *existing = pair;
                                 }
                             }
                         }

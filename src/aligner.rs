@@ -343,8 +343,24 @@ impl<'a> Aligner<'a> {
             SearchCompleteness::Complete
         };
 
+        let top_has_both_ends = candidates
+            .first()
+            .map(|c| c.endpoint_support == crate::EndpointSupport::BothEnds)
+            .unwrap_or(false);
+
         for (idx, candidate) in candidates.iter().take(candidate_budget).enumerate() {
             if idx > 0 && !placements.is_empty() {
+                // When the primary locus is anchored on both ends, internal-only
+                // repeat clusters cannot displace it unless they explain an
+                // uncovered split segment.
+                if top_has_both_ends
+                    && candidate.endpoint_support == crate::EndpointSupport::InternalOnly
+                    && !candidate_explains_new_query(candidate, &placements, &self.policy.structural)
+                {
+                    search_completeness = SearchCompleteness::Limited;
+                    continue;
+                }
+
                 if candidate.score < min_competitive_score {
                     // Score measures support across the whole read, so the
                     // shorter side of a split always loses to the longer one.
@@ -360,13 +376,25 @@ impl<'a> Aligner<'a> {
                         break;
                     }
                 }
-                // When an existing placement already has near-perfect anchor coverage (>=90%),
-                // weaker candidate regions (<50% of top seed score) cannot compete.
+                // When an existing placement already has high coverage (>=90% base coverage
+                // or >=85% read span with >=30% anchor density), weaker candidate regions
+                // (<50% of top seed score) cannot compete.
                 let best_covered_fraction = placements
                     .iter()
                     .map(|p: &ChainPlacement| p.1.query_covered_fraction)
                     .fold(0.0f64, f64::max);
-                if best_covered_fraction >= self.policy.work_budget.high_coverage_fraction
+                let best_span_fraction = placements
+                    .iter()
+                    .map(|p: &ChainPlacement| {
+                        p.1.q_end.saturating_sub(p.1.q_start) as f64
+                            / read.sequence.len().max(1) as f64
+                    })
+                    .fold(0.0f64, f64::max);
+                let high_coverage_satisfied = best_covered_fraction
+                    >= self.policy.work_budget.high_coverage_fraction
+                    || (best_span_fraction >= 0.85 && best_covered_fraction >= 0.30);
+
+                if high_coverage_satisfied
                     && candidate.score
                         < (top_candidate_score as f32
                             * self.policy.work_budget.weak_candidate_fraction)
@@ -434,7 +462,18 @@ impl<'a> Aligner<'a> {
                     .iter()
                     .map(|p: &ChainPlacement| p.1.query_covered_fraction)
                     .fold(0.0f64, f64::max);
-                if best_covered_fraction >= self.policy.work_budget.high_coverage_fraction {
+                let best_span_fraction = placements
+                    .iter()
+                    .map(|p: &ChainPlacement| {
+                        p.1.q_end.saturating_sub(p.1.q_start) as f64
+                            / read.sequence.len().max(1) as f64
+                    })
+                    .fold(0.0f64, f64::max);
+                let high_coverage_satisfied = best_covered_fraction
+                    >= self.policy.work_budget.high_coverage_fraction
+                    || (best_span_fraction >= 0.85 && best_covered_fraction >= 0.30);
+
+                if high_coverage_satisfied {
                     let total_anchor_span: usize = anchors
                         .iter()
                         .map(|a| a.q_end.saturating_sub(a.q_start) as usize)
@@ -982,17 +1021,36 @@ impl<'a> Aligner<'a> {
             return Ok(None);
         }
 
+        let mut ref_start_usize = start + aligned.ref_start;
+        let mut ops = aligned.cigar.clone().into_ops();
+        crate::alignment::normalize_banded_cigar(
+            &mut ops,
+            contig.sequence,
+            &oriented,
+            &mut ref_start_usize,
+            &self.policy.normalization,
+            &self.policy.scoring,
+        );
+        let cigar = crate::Cigar::new(ops).unwrap_or(aligned.cigar);
+        let ref_start = ref_start_usize as u64;
+        let ref_end = ref_start + cigar.reference_len() as u64;
+        let edit_distance = contig
+            .sequence
+            .get(ref_start as usize..ref_end as usize)
+            .and_then(|target| crate::types::cigar_edit_distance(&cigar, &oriented, target))
+            .unwrap_or(aligned.edit_distance);
+
         Ok(Some(crate::Alignment {
             contig: candidate.contig,
-            ref_start: (start + aligned.ref_start) as u64,
-            ref_end: (start + aligned.ref_end) as u64,
+            ref_start,
+            ref_end,
             query_start: 0,
             query_end: saturating_u32(query_len),
             strand: candidate.strand,
             score: aligned.score,
             mapq: near_exact_mapq(divergence, drift, locus.seed_frequency, policy),
-            cigar: aligned.cigar,
-            edit_distance: aligned.edit_distance,
+            cigar,
+            edit_distance,
         }))
     }
 
