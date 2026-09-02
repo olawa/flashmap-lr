@@ -760,7 +760,7 @@ fn find_anchors_with_seed_hits_depth(
         );
     }
 
-    if let Some(stats) = diagnostics.as_deref_mut() {
+    if let Some(stats) = diagnostics.as_mut() {
         stats.local_kmer_map_builds = stats
             .local_kmer_map_builds
             .saturating_add(map_builds.get());

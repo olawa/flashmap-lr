@@ -1459,7 +1459,6 @@ mod tests {
                 CigarOp::Match(n) | CigarOp::Ins(n) | CigarOp::Del(n) | CigarOp::SoftClip(n) => {
                     *n > 0
                 }
-                _ => true,
             }),
             "fallback emitted a zero-length operation: {ops:?}"
         );

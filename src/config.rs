@@ -838,9 +838,12 @@ mod tests {
             standard.probes.max_probes_per_segment
         );
         assert!(fast.candidates.max_regions < standard.candidates.max_regions);
+        assert!(standard.candidates.max_regions < sensitive.candidates.max_regions);
         assert!(fast.anchors.max_local_kmer_hits < standard.anchors.max_local_kmer_hits);
         assert!(fast.chaining.max_iter < standard.chaining.max_iter);
         assert!(fast.work_budget.max_candidates < standard.work_budget.max_candidates);
+        assert!(standard.gaps.medium_gap_dp_max <= sensitive.gaps.medium_gap_dp_max);
+        assert_eq!(sensitive.normalization, standard.normalization);
     }
 
     #[test]
