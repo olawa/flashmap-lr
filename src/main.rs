@@ -759,6 +759,8 @@ struct ProfileReporter {
     phase_repair_nanos: AtomicU64,
     approximate_gap_fallbacks: AtomicU64,
     adaptive_gap_escalations: AtomicU64,
+    local_kmer_map_builds: AtomicU64,
+    anchor_window_bases: AtomicU64,
     near_exact_dp_calls: AtomicU64,
     near_exact_dp_accepted: AtomicU64,
     near_exact_dp_nanos: AtomicU64,
@@ -866,6 +868,11 @@ impl DiagnosticsSink for ProfileReporter {
                 &self.adaptive_gap_escalations,
                 diagnostics.adaptive_gap_escalations as u64,
             ),
+            (
+                &self.local_kmer_map_builds,
+                u64::from(diagnostics.local_kmer_map_builds),
+            ),
+            (&self.anchor_window_bases, diagnostics.anchor_window_bases),
             (
                 &self.near_exact_dp_calls,
                 u64::from(diagnostics.near_exact_dp_calls),
@@ -1032,6 +1039,13 @@ impl ProfileReporter {
             "  Near-exact potential: {two_ended} two-ended ({:.1}%), of which {unique} unique ({:.1}%)",
             if reads > 0 { 100.0 * two_ended as f64 / reads as f64 } else { 0.0 },
             if two_ended > 0 { 100.0 * unique as f64 / two_ended as f64 } else { 0.0 },
+        );
+        eprintln!(
+            "  Local k-mer maps:      {} builds over {} reads ({:.2}/read); anchor window {:.0} bases/read",
+            self.local_kmer_map_builds.load(Ordering::Relaxed),
+            reads,
+            self.local_kmer_map_builds.load(Ordering::Relaxed) as f64 / reads.max(1) as f64,
+            self.anchor_window_bases.load(Ordering::Relaxed) as f64 / reads.max(1) as f64,
         );
         let dp_calls = self.near_exact_dp_calls.load(Ordering::Relaxed);
         if dp_calls > 0 {

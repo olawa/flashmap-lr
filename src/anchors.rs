@@ -482,12 +482,15 @@ fn find_anchors_with_seed_hits_depth(
         return Ok(Vec::new());
     }
 
-    let window_start = candidate
-        .ref_start
-        .saturating_sub(anchor_policy.reference_flank as u64) as usize;
+    // The flank absorbs the candidate's diagonal uncertainty and whatever
+    // query the probes did not span, so neither side needs more reference than
+    // the read is long. A fixed 1 KiB opens eleven times the read for a 200 bp
+    // query and the local k-mer map is then built over all of it.
+    let flank = anchor_policy.reference_flank.min(read.sequence.len()) as u64;
+    let window_start = candidate.ref_start.saturating_sub(flank) as usize;
     let window_end = candidate
         .ref_end
-        .saturating_add(anchor_policy.reference_flank as u64)
+        .saturating_add(flank)
         .min(reference_len) as usize;
     if window_start >= window_end || window_end > contig.sequence.len() {
         return Err(AnchorError::InvalidCandidateBounds);
@@ -562,6 +565,13 @@ fn find_anchors_with_seed_hits_depth(
 
     // Paired positions are scanned first. A paired hit list is authoritative
     // for its query position; other positions need the local reference map.
+    if let Some(stats) = diagnostics.as_deref_mut() {
+        stats.anchor_window_bases = stats
+            .anchor_window_bases
+            .saturating_add((window_end - window_start) as u64);
+    }
+    // Counted through a cell so the scan closure needs only shared access.
+    let map_builds = std::cell::Cell::new(0u32);
     let scan_positions = |positions: &[usize],
                           local_kmer_map: &mut Option<LocalKmerMap>,
                           raw_anchors: &mut Vec<Anchor>,
@@ -578,6 +588,7 @@ fn find_anchors_with_seed_hits_depth(
                 positions.as_slice()
             } else {
                 if local_kmer_map.is_none() {
+                    map_builds.set(map_builds.get().saturating_add(1));
                     *local_kmer_map = Some(LocalKmerMap::build(
                         &contig.sequence[window_start..window_end],
                         window_start,
@@ -693,6 +704,11 @@ fn find_anchors_with_seed_hits_depth(
         );
     }
 
+    if let Some(stats) = diagnostics.as_deref_mut() {
+        stats.local_kmer_map_builds = stats
+            .local_kmer_map_builds
+            .saturating_add(map_builds.get());
+    }
     Ok(deduplicate_anchors(
         raw_anchors,
         candidate,
