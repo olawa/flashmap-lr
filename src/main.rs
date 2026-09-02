@@ -339,10 +339,24 @@ impl std::fmt::Display for CliError {
             Self::ConflictingMode => {
                 f.write_str("conflicting alignment modes; choose --fast, --standard, or --sensitive")
             }
-            Self::UnknownOption(option) => write!(f, "unknown option {option}\n\n{}", usage()),
-            Self::UnexpectedArgument(value) => {
-                write!(f, "unexpected positional argument {value:?}\n\n{}", usage())
-            }
+            Self::UnknownOption(option) => match suggest_option(option) {
+                Some(suggestion) => write!(
+                    f,
+                    "unknown option {option}\n\n\
+                     Did you mean {suggestion}?\n\
+                     Try 'rs-lra --help' for the full list."
+                ),
+                None => write!(
+                    f,
+                    "unknown option {option}\n\nTry 'rs-lra --help' for the full list."
+                ),
+            },
+            Self::UnexpectedArgument(value) => write!(
+                f,
+                "unexpected positional argument {value:?}\n\n{}\n\n\
+                 Try 'rs-lra --help' for the full list.",
+                usage_lines()
+            ),
             Self::Reference(error) => write!(f, "reference: {error}"),
             Self::Index(error) => write!(f, "index: {error}"),
             Self::Reads(error) => write!(f, "reads: {error}"),
@@ -370,47 +384,148 @@ fn parse_positive(value: String, option: &'static str) -> Result<usize, CliError
         .ok_or(CliError::InvalidNumber { option, value })
 }
 
+/// The long options the parser accepts, for suggesting a near miss.
+const KNOWN_OPTIONS: &[&str] = &[
+    "--index",
+    "--ref",
+    "--reference",
+    "--query",
+    "--fastq",
+    "--fastx",
+    "--reads",
+    "--output",
+    "--threads",
+    "--workers",
+    "--chunk-size",
+    "--limit",
+    "--quiet",
+    "--profile",
+    "--decompress-with",
+    "--sort-memory",
+    "--reseed",
+    "--near-exact",
+    "--near-exact-dp",
+    "--query-window",
+    "--fast",
+    "--standard",
+    "--sensitive",
+    "--no-sensitive",
+    "--preset",
+    "--paired-emms",
+    "--emms",
+    "--emms-mismatch",
+    "--emms-relock",
+    "--tiered-candidates",
+    "--help",
+    "--version",
+];
+
+/// Levenshtein distance, for ranking how near a mistyped option came.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right_chars: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right_chars.len()).collect();
+    let mut current = vec![0usize; right_chars.len() + 1];
+    for (left_index, left_char) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            let substitution = usize::from(left_char != *right_char);
+            current[right_index + 1] = (previous[right_index] + substitution)
+                .min(previous[right_index + 1] + 1)
+                .min(current[right_index] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right_chars.len()]
+}
+
+/// The option a misspelling most likely meant, if one is close enough.
+///
+/// An unambiguous prefix is taken first: `--sort-mem` is a truncation rather
+/// than a typo, and no edit-distance threshold reads that as well as the
+/// prefix does.
+fn suggest_option(unknown: &str) -> Option<&'static str> {
+    if !unknown.starts_with("--") || unknown.len() < 3 {
+        return None;
+    }
+    let mut prefix_matches = KNOWN_OPTIONS
+        .iter()
+        .filter(|known| known.starts_with(unknown));
+    if let Some(only) = prefix_matches.next() {
+        if prefix_matches.next().is_none() {
+            return Some(only);
+        }
+    }
+    let body = unknown.trim_start_matches('-');
+    KNOWN_OPTIONS
+        .iter()
+        .map(|known| (edit_distance(body, known.trim_start_matches('-')), *known))
+        .filter(|(distance, _)| *distance <= 3 && *distance * 2 < body.len())
+        .min_by_key(|(distance, known)| (*distance, known.len()))
+        .map(|(_, known)| known)
+}
+
+fn usage_lines() -> &'static str {
+    concat!(
+        "Usage: rs-lra [options] -i INDEX.fmi -q READS.fq\n",
+        "       rs-lra [options] INDEX.fmi READS.fq"
+    )
+}
+
 fn usage() -> &'static str {
-    "Usage: rs-lra [options] -i INDEX.fmi -q READS.fq\n\
-     Usage: rs-lra [options] INDEX.fmi READS.fq\n\n\
-Options:\n\
-  -i, --index PATH       Legacy packed minimizer index (.fmi) [required unless positional or -r]\n\
-  -r, --ref, --reference PATH\n\
-                         Reference FASTA (small-fixture adapter)\n\
-  -q, -f, --query, --fastq, --reads PATH\n\
-                         FASTA or FASTQ reads [required unless positional]\n\
-  -o, --output PATH      SAM/BAM output path, or - for stdout (default: -)\n\
-                         (automatically sorted and indexed when ending in .bam)\n\
-  -t, --threads N        Total threads the mapper may use, including anything\n\
-                         it spawns (default: available CPUs)\n\
-  -w, --workers N        Mapper worker threads outright, ignoring the budget\n\
-                         (default: derived from -t)\n\
-  -c, --chunk-size N     Reads per worker batch (default: 10)\n\
-      --quiet            Suppress progress indicators and summary\n\
-      --profile          Print aggregate mapper phase timings\n\
-  -n, --limit N          Stop after mapping N reads (for benchmarking)\n\
-      --decompress-with CMD  Command to decompress gzip reads; the file path is\n\
-                         appended (default: pigz -dc when on PATH)\n\
-      --reseed           Search inside query intervals no placement explains
-                         (recovers the second side of a split read)
-      --near-exact       Lock the candidate region when both read ends agree\n\
-                         on one diagonal, skipping probe clustering\n\
-      --near-exact-dp    As --near-exact, and align the locked region in one\n\
-                         banded pass instead of finding anchors\n\
-      --query-window N   Minimizer window used to query the index, independent\n\
-                         of the window it was built with (clamped up to it)\n\
-      --sort-memory SIZE samtools sort memory PER THREAD for .bam output\n\
-                         (e.g. 768M, 2G); default is samtools' own 768M\n\
-      --fast             Bounded work budget for high throughput\n\
-      --standard         Deep DP gap bounds and full STR left-alignment (default)\n\
-      --sensitive        Standard plus a wider candidate and DP ceiling\n\
-  -x, --preset STR       Preset profile: standard, fast, or sensitive\n\
-      --paired-emms      Experimental mismatch-tolerant paired anchors\n\
-      --tiered-candidates Experimental cheap pass for weak candidates\n\
-  -h, --help             Show this help\n\
-  -v, --version          Show version\n\n\
-The index path uses the read-only legacy packed minimizer adapter.\n\
-The reference path builds a bounded in-memory k=15 index for small fixtures."
+    concat!(
+        "Usage: rs-lra [options] -i INDEX.fmi -q READS.fq\n",
+        "       rs-lra [options] INDEX.fmi READS.fq\n",
+        "\n",
+        "Input and output:\n",
+        "  -i, --index PATH          Packed minimizer index (.fmi)\n",
+        "  -r, --ref PATH            Reference FASTA, for small fixtures\n",
+        "  -q, --query PATH          FASTA or FASTQ reads\n",
+        "  -o, --output PATH         SAM/BAM path, or - for stdout (default: -)\n",
+        "                            A .bam name is sorted and indexed on the way out.\n",
+        "      --decompress-with CMD Command to decompress gzip reads; the path is\n",
+        "                            appended (default: pigz -dc when on PATH)\n",
+        "      --sort-memory SIZE    samtools sort memory PER THREAD for .bam output,\n",
+        "                            e.g. 768M or 2G (default: samtools' own 768M)\n",
+        "\n",
+        "Threads and batching:\n",
+        "  -t, --threads N           Total threads the mapper may use, including the\n",
+        "                            ones it spawns (default: available CPUs)\n",
+        "  -w, --workers N           Worker threads outright, ignoring the -t budget\n",
+        "  -c, --chunk-size N        Reads per worker batch (default: 10)\n",
+        "\n",
+        "Work profile:\n",
+        "      --fast                Bounded work budget for high throughput\n",
+        "      --standard            Deep DP gaps and full STR left-alignment (default)\n",
+        "      --sensitive           Standard plus a wider candidate and DP ceiling\n",
+        "  -x, --preset NAME         One of: standard, fast, sensitive\n",
+        "\n",
+        "Search strategy:\n",
+        "      --near-exact          Lock the candidate region when both read ends\n",
+        "                            agree on one diagonal, skipping probe clustering\n",
+        "      --near-exact-dp       As --near-exact, and align the locked region in\n",
+        "                            one banded pass instead of finding anchors\n",
+        "      --reseed              Search query intervals no placement explains,\n",
+        "                            recovering the second side of a split read\n",
+        "      --query-window N      Minimizer window used to query the index,\n",
+        "                            independent of the one it was built with\n",
+        "                            (clamped up to it)\n",
+        "\n",
+        "Reporting:\n",
+        "      --profile             Print aggregate mapper phase timings\n",
+        "      --quiet               Suppress progress indicators and summary\n",
+        "  -n, --limit N             Stop after mapping N reads, for benchmarking\n",
+        "\n",
+        "Experimental:\n",
+        "      --paired-emms         Mismatch-tolerant paired anchors\n",
+        "      --tiered-candidates   Cheap first pass for weak candidates\n",
+        "\n",
+        "  -h, --help                Show this help\n",
+        "  -v, --version             Show version\n",
+        "\n",
+        "-i and -q may also be given positionally, in that order. -r accepts an .fmi\n",
+        "index too; a FASTA there builds a bounded in-memory k=15 index for fixtures.\n",
+        "Long options also accept their older spellings (--fastq, --reads, --reference)."
+    )
 }
 
 fn run(options: Options) -> Result<(), CliError> {
@@ -1249,6 +1364,61 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_truncated_option_suggests_the_one_it_abbreviates() {
+        // The spelling that prompted this: a plausible short form, not a typo.
+        assert_eq!(suggest_option("--sort-mem"), Some("--sort-memory"));
+        assert_eq!(suggest_option("--thread"), Some("--threads"));
+        assert_eq!(suggest_option("--near-exact-d"), Some("--near-exact-dp"));
+    }
+
+    #[test]
+    fn a_misspelled_option_suggests_the_nearest_one() {
+        assert_eq!(suggest_option("--workres"), Some("--workers"));
+        assert_eq!(suggest_option("--profiel"), Some("--profile"));
+    }
+
+    #[test]
+    fn an_unrelated_option_suggests_nothing() {
+        assert_eq!(suggest_option("--xyzzy"), None);
+        assert_eq!(suggest_option("-z"), None);
+    }
+
+    #[test]
+    fn an_ambiguous_prefix_falls_back_to_the_nearest_option() {
+        // --emms-mismatch and --emms-relock both start this way, so the prefix
+        // rule declines and distance settles it on the trailing dash.
+        assert_eq!(suggest_option("--emms-"), Some("--emms"));
+        // Too little to go on: three options share it and none is near.
+        assert_eq!(suggest_option("--em"), None);
+    }
+
+    #[test]
+    fn every_help_line_fits_a_standard_terminal() {
+        for line in usage().lines() {
+            assert!(
+                line.len() <= 80,
+                "help line is {} columns: {line}",
+                line.len()
+            );
+        }
+    }
+
+    #[test]
+    fn every_documented_long_option_is_one_the_parser_knows() {
+        for line in usage().lines() {
+            for word in line.split_whitespace() {
+                let option = word.trim_end_matches(&[',', '.', ')', ':'][..]);
+                if option.starts_with("--") && option.len() > 2 {
+                    assert!(
+                        KNOWN_OPTIONS.contains(&option),
+                        "help documents {option}, which is not in KNOWN_OPTIONS"
+                    );
+                }
+            }
+        }
+    }
     use super::*;
 
     #[test]
