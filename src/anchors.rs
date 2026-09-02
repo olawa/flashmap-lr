@@ -1021,15 +1021,75 @@ fn build_paired_emms_anchor(
     if awaiting_relock || mismatches * 100 > span_len * MAX_MISMATCH_PERCENT {
         return None;
     }
+
+    // The pair confirms the diagonal the way a mate confirms a locus; it does
+    // not bound the match. Grow both ends exactly, as extend_exact_anchor
+    // does, so a confirmed anchor is not truncated at the seeds that vouched
+    // for it. Mismatch tolerance stays inside the confirmed span, where the
+    // pair carries exact support at both ends and the outward walk has none.
+    let mut q_start = pair.q_left;
+    let mut q_end = q_end;
+    let mut ref_start = ref_start;
+    let mut ref_end = ref_end;
+
+    while q_start > 0 {
+        let Some(previous_ref) = (match candidate.strand {
+            Strand::Forward => ref_start.checked_sub(1),
+            Strand::Reverse => Some(ref_end),
+        }) else {
+            break;
+        };
+        if previous_ref < window_start as u64 || previous_ref >= window_end as u64 {
+            break;
+        }
+        if !bases_match(
+            read[q_start - 1],
+            reference[previous_ref as usize],
+            candidate.strand,
+        ) {
+            break;
+        }
+        q_start -= 1;
+        match candidate.strand {
+            Strand::Forward => ref_start -= 1,
+            Strand::Reverse => ref_end += 1,
+        }
+    }
+
+    while q_end < read.len() {
+        let Some(next_ref) = (match candidate.strand {
+            Strand::Forward => Some(ref_end),
+            Strand::Reverse => ref_start.checked_sub(1),
+        }) else {
+            break;
+        };
+        if next_ref < window_start as u64 || next_ref >= window_end as u64 {
+            break;
+        }
+        if !bases_match(
+            read[q_end],
+            reference[next_ref as usize],
+            candidate.strand,
+        ) {
+            break;
+        }
+        q_end += 1;
+        match candidate.strand {
+            Strand::Forward => ref_end += 1,
+            Strand::Reverse => ref_start -= 1,
+        }
+    }
+
+    let length = q_end - q_start;
     Some((
         Anchor {
             ref_id: candidate.contig,
             ref_start,
             ref_end,
-            q_start: pair.q_left as u32,
+            q_start: q_start as u32,
             q_end: q_end as u32,
             strand: candidate.strand,
-            score: span_len.saturating_sub(mismatches).min(i32::MAX as usize) as i32,
+            score: length.saturating_sub(mismatches).min(i32::MAX as usize) as i32,
         },
         mismatches,
     ))
@@ -1468,10 +1528,43 @@ mod tests {
             24,
         )
         .expect("isolated SNP should retain the paired diagonal");
-        assert_eq!((anchor.q_start, anchor.q_end), (16, 136));
-        assert_eq!((anchor.ref_start, anchor.ref_end), (16, 136));
-        assert_eq!(anchor.score, 119);
+        // Everything outside the pair matches, so the confirmed diagonal grows
+        // to the whole read rather than stopping at the seeds that vouched.
+        assert_eq!((anchor.q_start, anchor.q_end), (0, 256));
+        assert_eq!((anchor.ref_start, anchor.ref_end), (0, 256));
+        assert_eq!(anchor.score, 255);
         assert_eq!(mismatches, 1);
+    }
+
+    #[test]
+    fn paired_emms_extends_past_the_seeds_and_stops_at_a_mismatch() {
+        let reference: Vec<u8> = (0..256).map(|index| b"ACGT"[index % 4]).collect();
+        let mut query = reference.clone();
+        query[8] = b'T';
+        query[200] = b'C';
+        let (anchor, mismatches) = build_paired_emms_anchor(
+            &query,
+            &reference,
+            &candidate(reference.len(), Strand::Forward),
+            PairedMinimizerPair {
+                q_left: 16,
+                q_right: 112,
+                r_left: 16,
+                r_right: 112,
+            },
+            24,
+            0,
+            reference.len(),
+            1,
+            24,
+        )
+        .expect("an exact paired span should be accepted");
+        // The pair spans [16, 136). Growing outward stops one base short of
+        // each flanking mismatch, in both directions.
+        assert_eq!((anchor.q_start, anchor.q_end), (9, 200));
+        assert_eq!((anchor.ref_start, anchor.ref_end), (9, 200));
+        assert_eq!(mismatches, 0);
+        assert_eq!(anchor.score, 191);
     }
 
     #[test]
@@ -1520,7 +1613,10 @@ mod tests {
             24,
         )
         .expect("reverse paired span should be accepted");
-        assert_eq!((anchor.ref_start, anchor.ref_end), (16, 136));
+        // Reverse geometry grows ref_end as the query start moves left and
+        // ref_start as it moves right, so the walk halts on the window edge.
+        assert_eq!((anchor.q_start, anchor.q_end), (0, 152));
+        assert_eq!((anchor.ref_start, anchor.ref_end), (0, 152));
         assert_eq!(anchor.strand, Strand::Reverse);
         assert_eq!(mismatches, 1);
     }
