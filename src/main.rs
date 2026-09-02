@@ -588,11 +588,87 @@ fn print_index_info(index: &MinimizerIndex) {
     );
 }
 
+/// What the seeds above the cap look like, and what keeping some would cost.
+///
+/// A `drop` policy stores nothing for them, so every query minimizer that
+/// lands on one is blind and the mapper has to rediscover the position from
+/// the reference window. Whether a sampling policy would help depends on the
+/// multiplicity distribution: keeping 16 of 20 copies answers most queries,
+/// keeping 16 of 20000 answers almost none. The index records the true counts,
+/// so both are answerable without building anything.
+fn print_cap_distribution(index: &MinimizerIndex) {
+    let summary = index.summary();
+    let cap = summary.max_freq.max(1) as u64;
+    let mut counts: Vec<u32> = index.capped_seed_multiplicities().collect();
+    if counts.is_empty() {
+        println!("  (no seed exceeded the cap, so the policy never applied)");
+        return;
+    }
+    counts.sort_unstable();
+
+    const BUCKETS: &[u32] = &[32, 64, 128, 256, 1024, 4096, 65536, u32::MAX];
+    println!();
+    println!("  Seeds above the cap, by true multiplicity:");
+    println!("    multiplicity        seeds      occurrences   kept by a spaced sample");
+    let mut low = summary.max_freq as u32 + 1;
+    for &high in BUCKETS {
+        let start = counts.partition_point(|count| *count < low);
+        let end = counts.partition_point(|count| *count <= high);
+        if start >= end {
+            low = high.saturating_add(1);
+            continue;
+        }
+        let group = &counts[start..end];
+        let occurrences: u64 = group.iter().map(|count| u64::from(*count)).sum();
+        // A spaced sample keeps `cap` of `count`, so this is the chance the
+        // copy a given read needs survives -- averaged over the bucket.
+        let retained: f64 = group
+            .iter()
+            .map(|count| cap as f64 / f64::from(*count))
+            .sum::<f64>()
+            / group.len() as f64;
+        let label = if high == u32::MAX {
+            format!("{low}+")
+        } else {
+            format!("{low}-{high}")
+        };
+        println!(
+            "    {label:<16} {:>10}   {:>14}   {:>6.1}%",
+            group.len(),
+            occurrences,
+            100.0 * retained
+        );
+        low = high.saturating_add(1);
+    }
+
+    println!();
+    println!("  What an adaptive policy would add, by its `high` threshold:");
+    println!("    high        seeds answerable    extra hits     index growth");
+    for &threshold in &[32u32, 64, 128, 256, 1024, 4096, u32::MAX] {
+        let answerable = counts.partition_point(|count| *count <= threshold);
+        // Spaced sampling stores `cap` positions for each of those seeds.
+        let extra_hits = answerable as u64 * cap;
+        let label = if threshold == u32::MAX {
+            "no limit".to_owned()
+        } else {
+            threshold.to_string()
+        };
+        println!(
+            "    {label:<12} {:>10} ({:>4.1}%)   {:>11}   {:>8.2} GB",
+            answerable,
+            100.0 * answerable as f64 / counts.len() as f64,
+            extra_hits,
+            extra_hits as f64 * 8.0 / 1e9
+        );
+    }
+}
+
 fn run(options: Options) -> Result<(), CliError> {
     if let Some(index_path) = &options.index {
         let index = MinimizerIndex::open(index_path).map_err(CliError::Index)?;
         if options.index_info {
             print_index_info(&index);
+            print_cap_distribution(&index);
             return Ok(());
         }
         let metadata = index.reference_metadata();

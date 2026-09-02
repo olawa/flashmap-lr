@@ -492,6 +492,16 @@ impl MinimizerIndex {
         })
     }
 
+    /// True multiplicity of every seed the frequency cap truncated.
+    ///
+    /// The build records these so a query can tell a repetitive seed from an
+    /// absent one. They are also the distribution a different cap policy would
+    /// act on, which is what makes the cost of changing it answerable from an
+    /// existing index rather than only by building another.
+    pub fn capped_seed_multiplicities(&self) -> impl Iterator<Item = u32> + '_ {
+        self.capped_metadata.iter().map(|entry| entry.raw_count)
+    }
+
     pub fn k(&self) -> usize {
         self.k
     }
