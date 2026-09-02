@@ -409,7 +409,35 @@ pub fn resolve_decompressor(
 
 pub(crate) const DEFAULT_DECOMPRESSOR: &str = "pigz -dc";
 
+/// Hold pigz to one inflate thread unless the caller asked for more.
+///
+/// Inflating a single gzip stream is serial, so pigz's extra threads go to
+/// CRC and output rather than to the inflate -- the measurement above has
+/// `-p1` at 1732 MB/s against 1384 MB/s for `-p8`. Left alone pigz sizes
+/// itself from the core count, so on a 48-core host it runs dozens of threads
+/// against the workers it exists to feed, to do worse than one thread would.
+fn with_thread_limit(command: &str) -> String {
+    let Some(program) = command.split_whitespace().next() else {
+        return command.to_owned();
+    };
+    let basename = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    if !matches!(basename, "pigz" | "unpigz") {
+        return command.to_owned();
+    }
+    let already_limited = command
+        .split_whitespace()
+        .any(|argument| argument == "-p" || argument.starts_with("--processes"));
+    if already_limited {
+        return command.to_owned();
+    }
+    format!("{command} -p 1")
+}
+
 fn spawn_decompressor(command: &str, path: &Path) -> Option<FastxSource> {
+    let command = with_thread_limit(command);
     let mut parts = command.split_whitespace();
     let program = parts.next()?;
     let mut child = Command::new(program)
@@ -1174,6 +1202,30 @@ fn write_sam_cigar<W: Write>(writer: &mut W, alignment: &Alignment) -> io::Resul
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pigz_is_held_to_one_inflate_thread() {
+        assert_eq!(with_thread_limit("pigz -dc"), "pigz -dc -p 1");
+        assert_eq!(with_thread_limit("unpigz -c"), "unpigz -c -p 1");
+        assert_eq!(with_thread_limit("/usr/bin/pigz -dc"), "/usr/bin/pigz -dc -p 1");
+    }
+
+    #[test]
+    fn an_explicit_thread_count_is_left_alone() {
+        assert_eq!(with_thread_limit("pigz -dc -p 8"), "pigz -dc -p 8");
+        assert_eq!(
+            with_thread_limit("pigz -dc --processes=8"),
+            "pigz -dc --processes=8"
+        );
+    }
+
+    #[test]
+    fn another_decompressor_is_not_given_pigz_flags() {
+        // -p means something else to igzip, and nothing to zcat.
+        assert_eq!(with_thread_limit("igzip -dc"), "igzip -dc");
+        assert_eq!(with_thread_limit("zcat"), "zcat");
+        assert_eq!(with_thread_limit("bgzip -dc"), "bgzip -dc");
+    }
     use super::*;
     use std::io::Cursor;
 

@@ -723,12 +723,15 @@ impl ProgressReporter {
 /// and gets only a proportional share of an oversubscribed run -- it then
 /// cannot feed the workers it is competing with. The reserve scales with the
 /// budget so a small run is not left with nothing to map with.
-fn decompressor_threads(workers: usize) -> usize {
-    if workers <= 4 {
-        0
-    } else {
-        (workers / 6).clamp(1, 8)
-    }
+/// Threads to hold back from the workers for an external decompressor.
+///
+/// One. Inflating a single gzip stream is serial, and io's own measurement
+/// has `pigz -dc -p1` beating `-p8`, so the decompressor needs a core rather
+/// than a share of the machine. Reserving a sixth of the budget shrank the
+/// worker pool for threads the decompressor could not use -- and, since the
+/// spawn passed no limit, did not stop it taking as many as it liked anyway.
+fn decompressor_threads(threads: usize) -> usize {
+    usize::from(threads > 4)
 }
 
 fn execute_mapping(
@@ -1624,8 +1627,8 @@ mod tests {
         assert_eq!(budget.workers, None);
         // Uncompressed input spends the whole budget on mapping.
         assert_eq!(budget.resolved_workers(false), 48);
-        // Compressed input holds a share back for the decompressor.
-        assert_eq!(budget.resolved_workers(true), 40);
+        // Compressed input holds one thread back for the decompressor.
+        assert_eq!(budget.resolved_workers(true), 47);
 
         let explicit = Options::parse(
             ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "-t", "48", "-w", "18"]
@@ -1642,17 +1645,16 @@ mod tests {
     }
 
     #[test]
-    fn decompressor_reserve_scales_and_never_starves_the_mapper() {
+    fn decompressor_reserve_is_one_thread_and_never_starves_the_mapper() {
         // Small budgets keep every thread: an external decompressor is only
         // spawned when there is enough parallelism for it to matter.
         assert_eq!(decompressor_threads(1), 0);
         assert_eq!(decompressor_threads(4), 0);
-        // Above that it scales with the budget, always leaving workers behind.
+        // Above that it is one thread whatever the budget, because a serial
+        // inflate cannot use a second one.
         assert_eq!(decompressor_threads(8), 1);
-        assert_eq!(decompressor_threads(24), 4);
-        assert_eq!(decompressor_threads(48), 8);
-        // And is capped, so a very large budget is not eaten by the reserve.
-        assert_eq!(decompressor_threads(256), 8);
+        assert_eq!(decompressor_threads(48), 1);
+        assert_eq!(decompressor_threads(256), 1);
         for workers in 1..=256 {
             assert!(
                 decompressor_threads(workers) < workers,
