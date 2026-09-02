@@ -9,6 +9,8 @@
 //! the cheap FlashMap path that can cross isolated HiFi substitutions before
 //! a per-candidate local k-mer table is needed.
 
+use std::collections::hash_map::Entry;
+
 use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt, FxHashSet as HashSet, FxHashSetExt};
 
 use crate::config::{AnchorPolicy, ResolvedMapperPolicy};
@@ -850,7 +852,8 @@ fn build_paired_staging(
     }
 
     let mut prioritized = HashSet::new();
-    let mut emms_pairs = Vec::new();
+    let mut emms_pairs: Vec<PairedMinimizerPair> = Vec::new();
+    let mut emms_by_diagonal: HashMap<i64, usize> = HashMap::new();
     let mut compatible_pairs = 0usize;
     for (left_index, left) in matching_seed_hits.iter().enumerate() {
         let mut right_examined = 0usize;
@@ -880,12 +883,39 @@ fn build_paired_staging(
                     {
                         compatible = true;
                         if ref_distance == query_distance && emms_pairs.len() < 1024 {
-                            emms_pairs.push(PairedMinimizerPair {
+                            // Every pair on one diagonal describes the same
+                            // contiguous match, so enumerating all of them
+                            // yields nested anchors over identical bases.
+                            // Keep the widest span per diagonal instead.
+                            let diagonal = match strand {
+                                Strand::Forward => {
+                                    left_ref as i64 - left.query_pos as i64
+                                }
+                                Strand::Reverse => {
+                                    left_ref as i64 + left.query_pos as i64
+                                }
+                            };
+                            let pair = PairedMinimizerPair {
                                 q_left: left.query_pos,
                                 q_right: right.query_pos,
                                 r_left: left_ref,
                                 r_right: right_ref,
-                            });
+                            };
+                            match emms_by_diagonal.entry(diagonal) {
+                                Entry::Vacant(slot) => {
+                                    slot.insert(emms_pairs.len());
+                                    emms_pairs.push(pair);
+                                }
+                                Entry::Occupied(slot) => {
+                                    let existing = &mut emms_pairs[*slot.get()];
+                                    let widest = existing
+                                        .q_right
+                                        .saturating_sub(existing.q_left);
+                                    if query_distance > widest {
+                                        *existing = pair;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1390,6 +1420,30 @@ mod tests {
         assert_eq!(anchors[0].ref_start, 0);
         assert_eq!(anchors[0].ref_end as usize, query.len());
         assert_eq!(anchors[0].strand, Strand::Reverse);
+    }
+
+    #[test]
+    fn collinear_minimizer_hits_stage_one_pair_per_diagonal() {
+        // Hits at 0, 40 and 80 on one diagonal describe a single contiguous
+        // match. Enumerating every combination would stage three nested pairs
+        // over the same bases, and each would then mark its diagonal covered
+        // and suppress the maximal extension the scan makes there.
+        let hits: Vec<MatchingSeedHits> = [0usize, 40, 80]
+            .into_iter()
+            .map(|query_pos| MatchingSeedHits {
+                query_pos,
+                ref_positions: vec![1000 + query_pos as u64],
+            })
+            .collect();
+        let mut policy = legacy_anchor_policy(&Config::default());
+        policy.paired_min_distance = 1;
+        policy.paired_max_distance = 1024;
+
+        let (_, _, pairs) = build_paired_staging(Strand::Forward, &hits, policy);
+
+        assert_eq!(pairs.len(), 1, "one diagonal must stage one pair");
+        let pair = pairs[0];
+        assert_eq!((pair.q_left, pair.q_right), (0, 80), "widest span wins");
     }
 
     #[test]
