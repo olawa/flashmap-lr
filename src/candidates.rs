@@ -8,6 +8,11 @@ use crate::{Config, ContigId, Probe, SeedHit, SeedIndex, Strand};
 #[derive(Clone, Debug, PartialEq)]
 pub struct CandidateRegion {
     pub contig: ContigId,
+    /// Query span the supporting probes cover. A candidate explaining query
+    /// that no accepted placement covers is a split segment rather than a
+    /// weaker rival, and ranking cannot tell the two apart from score alone.
+    pub q_start: u32,
+    pub q_end: u32,
     pub ref_start: u64,
     pub ref_end: u64,
     pub strand: Strand,
@@ -299,8 +304,17 @@ fn add_cluster(
         + cluster.len() as i32
         + endpoint_bonus;
 
+    let q_start = cluster.iter().map(|hit| hit.probe.read_pos).min().unwrap_or(0);
+    let q_end = cluster
+        .iter()
+        .map(|hit| hit.probe.read_pos)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(seed_span as u32);
     candidates.push(CandidateRegion {
         contig,
+        q_start,
+        q_end,
         ref_start,
         ref_end,
         strand,

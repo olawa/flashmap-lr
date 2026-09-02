@@ -346,8 +346,19 @@ impl<'a> Aligner<'a> {
         for (idx, candidate) in candidates.iter().take(candidate_budget).enumerate() {
             if idx > 0 && !placements.is_empty() {
                 if candidate.score < min_competitive_score {
-                    search_completeness = SearchCompleteness::Limited;
-                    break;
+                    // Score measures support across the whole read, so the
+                    // shorter side of a split always loses to the longer one.
+                    // A candidate covering query no placement explains is not
+                    // a weaker rival for the same sequence -- it is the rest
+                    // of the read, and the seeds for it were already found.
+                    if candidate_explains_new_query(candidate, &placements, &self.policy.structural)
+                    {
+                        diagnostics.split_candidates_kept =
+                            diagnostics.split_candidates_kept.saturating_add(1);
+                    } else {
+                        search_completeness = SearchCompleteness::Limited;
+                        break;
+                    }
                 }
                 // When an existing placement already has near-perfect anchor coverage (>=90%),
                 // weaker candidate regions (<50% of top seed score) cannot compete.
@@ -903,6 +914,8 @@ impl<'a> Aligner<'a> {
             }
             found.push(crate::CandidateRegion {
                 contig,
+                q_start: saturating_u32(q_start),
+                q_end: saturating_u32(q_end),
                 ref_start,
                 ref_end,
                 strand,
@@ -1002,6 +1015,8 @@ impl<'a> Aligner<'a> {
         }
         Some(crate::CandidateRegion {
             contig: locus.contig,
+            q_start: 0,
+            q_end: saturating_u32(read_len),
             ref_start,
             ref_end,
             strand: locus.strand,
@@ -1423,6 +1438,27 @@ fn mapping_quality(best_score: i32, second_score: Option<i32>, coverage: f64) ->
         .unwrap_or(1.0);
     let coverage_factor = (coverage.clamp(0.0, 1.0) / COVERAGE_KNEE).min(1.0);
     (60.0 * margin * coverage_factor).round().clamp(0.0, 60.0) as u8
+}
+
+/// Does this candidate cover query that no accepted placement explains?
+fn candidate_explains_new_query(
+    candidate: &crate::CandidateRegion,
+    placements: &[ChainPlacement],
+    policy: &StructuralPolicy,
+) -> bool {
+    let span = candidate.q_end.saturating_sub(candidate.q_start);
+    if span < policy.min_supplementary_bases {
+        return false;
+    }
+    let covered: u32 = placements
+        .iter()
+        .map(|(_, chain, _)| {
+            interval_overlap(candidate.q_start, candidate.q_end, chain.q_start, chain.q_end)
+        })
+        .sum();
+    // The same threshold the supplementary selector uses, so a candidate is
+    // only rescued when what it adds could actually be emitted.
+    span.saturating_sub(covered.min(span)) >= policy.min_supplementary_bases
 }
 
 /// How completely a chain's anchors explain the query span it claims.

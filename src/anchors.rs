@@ -1254,6 +1254,8 @@ mod tests {
 
     fn candidate(len: usize, strand: Strand) -> CandidateRegion {
         CandidateRegion {
+            q_start: 0,
+            q_end: u32::MAX,
             contig: ContigId(0),
             ref_start: 0,
             ref_end: len as u64,
