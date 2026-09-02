@@ -704,9 +704,31 @@ fn find_anchors_with_seed_hits_depth(
         &mut full_span_found,
     );
 
-    let stage_a = raw_anchors.len();
-    let sufficient = is_sufficient_anchors(&raw_anchors, read.sequence.len(), *anchor_policy);
+    let mut sufficient = is_sufficient_anchors(&raw_anchors, read.sequence.len(), *anchor_policy);
 
+    // Stage A2: remaining minimizers with pre-resolved index hits in the candidate window.
+    // Scanning these requires ZERO LocalKmerMap builds because paired_hits already contains
+    // their reference coordinates.
+    if !full_span_found && !sufficient {
+        let prioritized_set: HashSet<usize> = prioritized_positions.iter().copied().collect();
+        let remaining_resolved: Vec<usize> = raw_minimizer_positions
+            .iter()
+            .copied()
+            .filter(|pos| paired_hits.contains_key(pos) && !prioritized_set.contains(pos))
+            .collect();
+        scan_positions(
+            &remaining_resolved,
+            &mut local_kmer_map,
+            &mut raw_anchors,
+            &mut coverage,
+            &mut seen_seed_hits,
+            &mut kmer_hits,
+            &mut full_span_found,
+        );
+        sufficient = is_sufficient_anchors(&raw_anchors, read.sequence.len(), *anchor_policy);
+    }
+
+    let stage_a = raw_anchors.len();
     let mut entered_b = false;
     let mut entered_c = false;
     if allow_local_fallback && !full_span_found && !sufficient {
@@ -718,7 +740,7 @@ fn find_anchors_with_seed_hits_depth(
             .copied()
             .filter(|pos| !paired_hits.contains_key(pos))
             .collect();
-        if let Some(stats) = diagnostics.as_deref_mut() {
+        if let Some(stats) = diagnostics.as_mut() {
             // Positions the index answered in-window, against the minimizer
             // positions it had nothing for. Stage B exists only for the latter.
             stats.index_resolved_positions = stats
