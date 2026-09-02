@@ -1042,18 +1042,25 @@ impl<'a> Aligner<'a> {
             return Ok(None);
         }
 
-        let mut ref_start_usize = start + aligned.ref_start;
+        let banded_ref_start = start + aligned.ref_start;
+        let mut normalized_ref_start = banded_ref_start;
         let mut ops = aligned.cigar.clone().into_ops();
         crate::alignment::normalize_banded_cigar(
             &mut ops,
             contig.sequence,
             &oriented,
-            &mut ref_start_usize,
+            &mut normalized_ref_start,
             &self.policy.normalization,
             &self.policy.scoring,
         );
-        let cigar = crate::Cigar::new(ops).unwrap_or(aligned.cigar);
-        let ref_start = ref_start_usize as u64;
+        // Trimming the edges moves the start, so the operations and the start
+        // normalization produced are one result. Falling back to the banded
+        // CIGAR while keeping the moved start would place the alignment at
+        // coordinates it does not describe.
+        let (cigar, ref_start) = match crate::Cigar::new(ops) {
+            Ok(normalized) => (normalized, normalized_ref_start as u64),
+            Err(_) => (aligned.cigar, banded_ref_start as u64),
+        };
         let ref_end = ref_start + cigar.reference_len() as u64;
         let edit_distance = contig
             .sequence
