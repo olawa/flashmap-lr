@@ -136,11 +136,18 @@ impl<R> ReadBatch<R> {
 pub struct MappedBatch<T> {
     pub batch_id: u64,
     pub results: Vec<T>,
+    /// Bytes the worker already encoded for this batch, if an encoder was
+    /// given. The sink then only has to write them, in batch order.
+    pub encoded: Vec<u8>,
 }
 
 impl<T> MappedBatch<T> {
     pub fn new(batch_id: u64, results: Vec<T>) -> Self {
-        Self { batch_id, results }
+        Self {
+            batch_id,
+            results,
+            encoded: Vec::new(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -298,6 +305,32 @@ impl WorkerPool {
         &self,
         source: I,
         mapper: F,
+        sink: W,
+    ) -> Result<WorkerPoolStats, WorkerPoolError<SE, ME, WE>>
+    where
+        I: IntoIterator<Item = Result<R, SE>> + Send,
+        R: Send,
+        T: Send,
+        SE: Send,
+        ME: Send,
+        F: Fn(R) -> Result<T, ME> + Sync,
+        W: FnMut(MappedBatch<T>) -> Result<(), WE>,
+    {
+        self.run_with_encoder(source, mapper, |_, _| Ok(()), sink)
+    }
+
+    /// As [`run`], with a per-batch encoder that runs on the worker.
+    ///
+    /// The collector has to serialize batch order, so anything it does is
+    /// single-threaded no matter how many workers there are. Formatting a
+    /// whole-genome run there is hundreds of gigabytes of work on one core.
+    /// `encoder` moves that onto the worker that produced the batch, leaving
+    /// the collector with a write.
+    pub fn run_with_encoder<I, R, T, SE, ME, WE, F, G, W>(
+        &self,
+        source: I,
+        mapper: F,
+        encoder: G,
         mut sink: W,
     ) -> Result<WorkerPoolStats, WorkerPoolError<SE, ME, WE>>
     where
@@ -307,6 +340,7 @@ impl WorkerPool {
         SE: Send,
         ME: Send,
         F: Fn(R) -> Result<T, ME> + Sync,
+        G: Fn(&[T], &mut Vec<u8>) -> Result<(), ME> + Sync,
         W: FnMut(MappedBatch<T>) -> Result<(), WE>,
     {
         let cancellation = Arc::new(AtomicBool::new(false));
@@ -342,11 +376,13 @@ impl WorkerPool {
                 let worker_cancel = Arc::clone(&cancellation);
                 let workers_remaining = Arc::clone(&active_workers);
                 let mapper_ref = &mapper;
+                let encoder_ref = &encoder;
                 worker_handles.push(scope.spawn(move || {
                     worker_loop(
                         raw_q,
                         mapped_q,
                         mapper_ref,
+                        encoder_ref,
                         worker_cancel,
                         workers_remaining,
                     );
@@ -546,10 +582,11 @@ impl<T, SE, ME> Drop for WorkerGuard<T, SE, ME> {
     }
 }
 
-fn worker_loop<R, T, SE, ME, F>(
+fn worker_loop<R, T, SE, ME, F, G>(
     raw_queue: RawQueue<R, SE>,
     mapped_queue: MappedQueue<T, SE, ME>,
     mapper: &F,
+    encoder: &G,
     cancellation: Arc<AtomicBool>,
     active_workers: Arc<AtomicUsize>,
 ) where
@@ -558,6 +595,7 @@ fn worker_loop<R, T, SE, ME, F>(
     SE: Send,
     ME: Send,
     F: Fn(R) -> Result<T, ME> + Sync,
+    G: Fn(&[T], &mut Vec<u8>) -> Result<(), ME> + Sync,
 {
     let _guard = WorkerGuard {
         active: active_workers,
@@ -600,8 +638,23 @@ fn worker_loop<R, T, SE, ME, F>(
         if cancellation.load(Ordering::Acquire) {
             return;
         }
+        // Encode here, on the worker that mapped the batch, so the collector
+        // is left with an ordered write rather than the formatting too.
+        let mut encoded = Vec::new();
+        if let Err(error) = encoder(&results, &mut encoded) {
+            if !cancellation.swap(true, Ordering::AcqRel) {
+                raw_queue.close();
+                let _ = mapped_queue.push(Err(InternalFailure::Mapper(error)));
+            }
+            return;
+        }
+
         if mapped_queue
-            .push(Ok(MappedBatch::new(batch_id, results)))
+            .push(Ok(MappedBatch {
+                batch_id,
+                results,
+                encoded,
+            }))
             .is_err()
         {
             return;

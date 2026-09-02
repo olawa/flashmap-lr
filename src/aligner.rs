@@ -858,6 +858,33 @@ impl<'a> Aligner<'a> {
         )
     }
 
+    /// Map a source, encoding each batch on the worker that produced it.
+    ///
+    /// `encode` turns a finished batch into the bytes an output wants and runs
+    /// on the mapping worker; `sink` sees the batches in order and writes
+    /// those bytes. Splitting them this way keeps the serial part of the
+    /// pipeline to the write itself.
+    pub fn map_with_worker_pool_encoded<I, SourceError, SinkError, Encode, Sink>(
+        &self,
+        pool: &WorkerPool,
+        source: I,
+        encode: Encode,
+        mut sink: Sink,
+    ) -> Result<WorkerPoolStats, WorkerPoolError<SourceError, MapError, SinkError>>
+    where
+        I: IntoIterator<Item = Result<OwnedRead, SourceError>> + Send,
+        SourceError: Send,
+        Encode: Fn(&[MappedRead], &mut Vec<u8>) -> Result<(), MapError> + Sync,
+        Sink: FnMut(&crate::worker_pool::MappedBatch<MappedRead>) -> Result<(), SinkError>,
+    {
+        pool.run_with_encoder(
+            source,
+            |owned_read| self.map_owned_read(owned_read),
+            encode,
+            |batch| sink(&batch),
+        )
+    }
+
     fn map_owned_read(&self, owned_read: OwnedRead) -> Result<MappedRead, MapError> {
         let OwnedRead {
             name,

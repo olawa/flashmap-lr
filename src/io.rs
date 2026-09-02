@@ -574,8 +574,9 @@ impl From<FastxError> for ReferenceIoError {
 
 /// SAM text output for ordered [`crate::MappedRead`] values.
 pub struct SamWriter<W: Write> {
+    formatter: SamRecordFormatter,
     writer: W,
-    reference: Vec<SamContig>,
+    bytes_written: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -647,6 +648,184 @@ impl From<AlignmentError> for SamError {
     }
 }
 
+/// Formats alignment records as SAM text into any sink.
+///
+/// Split from the writer so a batch can be formatted by the worker that
+/// mapped it. Formatting a whole-genome run is hundreds of gigabytes of text,
+/// and doing it inside the sink put all of it on the single thread that
+/// serializes batch order -- the one part that genuinely has to be serial is
+/// the write, not the formatting.
+pub struct SamRecordFormatter {
+    reference: Vec<SamContig>,
+}
+
+impl SamRecordFormatter {
+    pub fn from_contigs<I, N>(contigs: I) -> Self
+    where
+        I: IntoIterator<Item = (ContigId, N, usize)>,
+        N: Into<String>,
+    {
+        let reference = contigs
+            .into_iter()
+            .map(|(id, name, length)| SamContig {
+                id,
+                name: name.into(),
+                length,
+            })
+            .collect();
+        Self { reference }
+    }
+
+    pub fn write_header<W: Write>(&self, out: &mut W) -> Result<(), SamError> {
+        writeln!(out, "@HD\tVN:1.6\tSO:unknown")?;
+        for contig in &self.reference {
+            ensure_sam_field(&contig.name, "reference name")?;
+            writeln!(out, "@SQ\tSN:{}\tLN:{}", contig.name, contig.length)?;
+        }
+        Ok(())
+    }
+
+    pub fn write_mapped_read<W: Write>(
+        &self,
+        out: &mut W,
+        mapped: &MappedRead,
+    ) -> Result<(), SamError> {
+        ensure_sam_field(&mapped.name, "QNAME")?;
+        Read::with_qualities_and_tags(
+            &mapped.name,
+            &mapped.sequence,
+            mapped.qualities.as_deref(),
+            mapped.tags.as_deref(),
+        )
+        .validate()?;
+        if let Some(primary) = mapped.mapping.primary.as_ref() {
+            // Validate the whole chimeric set before emitting the primary so
+            // an invalid supplementary cannot leave a partially written read.
+            primary.validate()?;
+            self.alignment_contig_name(primary)?;
+            for supplementary in &mapped.mapping.supplementary {
+                supplementary.validate()?;
+                self.alignment_contig_name(supplementary)?;
+            }
+            self.write_alignment(out, mapped, primary, false)?;
+        } else {
+            write!(out, "{}\t4\t*\t0\t0\t*\t*\t0\t0\t", mapped.name)?;
+            write_sam_sequence(out, &mapped.sequence, false)?;
+            out.write_all(b"\t")?;
+            write_sam_quality(out, mapped.qualities.as_deref(), false)?;
+            write_optional_fields(out, mapped.tags.as_deref(), &[])?;
+            out.write_all(b"\n")?;
+        }
+        for supplementary in &mapped.mapping.supplementary {
+            self.write_alignment(out, mapped, supplementary, true)?;
+        }
+        Ok(())
+    }
+
+    fn write_alignment<W: Write>(
+        &self,
+        out: &mut W,
+        mapped: &MappedRead,
+        alignment: &Alignment,
+        supplementary: bool,
+    ) -> Result<(), SamError> {
+        alignment.validate()?;
+        let name = self.alignment_contig_name(alignment)?;
+        let pos = alignment
+            .ref_start
+            .checked_add(1)
+            .ok_or(SamError::CoordinateOverflow)?;
+        let mut flag = if alignment.strand == Strand::Reverse {
+            16
+        } else {
+            0
+        };
+        if supplementary {
+            flag |= 0x800;
+        }
+        ensure_sam_field(name, "reference name")?;
+        let reverse = alignment.strand == Strand::Reverse;
+
+        write!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t",
+            mapped.name, flag, name, pos, alignment.mapq
+        )?;
+        write_sam_cigar(out, alignment)?;
+        out.write_all(b"\t*\t0\t0\t")?;
+        write_sam_sequence(out, &mapped.sequence, reverse)?;
+        out.write_all(b"\t")?;
+        write_sam_quality(out, mapped.qualities.as_deref(), reverse)?;
+        write!(
+            out,
+            "\tNM:i:{}\tAS:i:{}",
+            alignment.edit_distance, alignment.score
+        )?;
+        write_optional_fields(out, mapped.tags.as_deref(), &["NM", "AS", "SA"])?;
+        self.write_sa_tag(out, mapped, alignment)?;
+        writeln!(out)?;
+        Ok(())
+    }
+
+    fn alignment_contig_name(&self, alignment: &Alignment) -> Result<&str, SamError> {
+        self.reference
+            .iter()
+            .find(|contig| contig.id == alignment.contig)
+            .map(|contig| contig.name.as_str())
+            .ok_or(SamError::MissingContig(alignment.contig))
+    }
+
+    fn write_sa_tag<W: Write>(
+        &self,
+        out: &mut W,
+        mapped: &MappedRead,
+        current: &Alignment,
+    ) -> Result<(), SamError> {
+        let record_count = usize::from(mapped.mapping.primary.is_some())
+            .saturating_add(mapped.mapping.supplementary.len());
+        if record_count <= 1 {
+            return Ok(());
+        }
+
+        out.write_all(b"\tSA:Z:")?;
+        if let Some(primary) = mapped.mapping.primary.as_ref() {
+            if !std::ptr::eq(primary, current) {
+                self.write_sa_entry(out, primary)?;
+            }
+        }
+        for supplementary in &mapped.mapping.supplementary {
+            if !std::ptr::eq(supplementary, current) {
+                self.write_sa_entry(out, supplementary)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_sa_entry<W: Write>(
+        &self,
+        out: &mut W,
+        alignment: &Alignment,
+    ) -> Result<(), SamError> {
+        let name = self.alignment_contig_name(alignment)?;
+        let pos = alignment
+            .ref_start
+            .checked_add(1)
+            .ok_or(SamError::CoordinateOverflow)?;
+        write!(
+            out,
+            "{name},{pos},{},",
+            if alignment.strand == Strand::Reverse {
+                '-'
+            } else {
+                '+'
+            }
+        )?;
+        write_sam_cigar(out, alignment)?;
+        write!(out, ",{},{};", alignment.mapq, alignment.edit_distance)?;
+        Ok(())
+    }
+}
+
 impl<W: Write> SamWriter<W> {
     pub fn new(writer: W, reference: &InMemoryReference) -> Result<Self, SamError> {
         Self::from_contigs(
@@ -667,53 +846,33 @@ impl<W: Write> SamWriter<W> {
         I: IntoIterator<Item = (ContigId, N, usize)>,
         N: Into<String>,
     {
-        let reference: Vec<SamContig> = contigs
-            .into_iter()
-            .map(|(id, name, length)| SamContig {
-                id,
-                name: name.into(),
-                length,
-            })
-            .collect();
-        writeln!(writer, "@HD\tVN:1.6\tSO:unknown")?;
-        for contig in &reference {
-            ensure_sam_field(&contig.name, "reference name")?;
-            writeln!(writer, "@SQ\tSN:{}\tLN:{}", contig.name, contig.length)?;
-        }
-        Ok(Self { writer, reference })
+        let formatter = SamRecordFormatter::from_contigs(contigs);
+        formatter.write_header(&mut writer)?;
+        Ok(Self {
+            formatter,
+            writer,
+            bytes_written: 0,
+        })
+    }
+
+    /// The formatter this writer uses, for encoding batches off-thread.
+    pub fn formatter(&self) -> &SamRecordFormatter {
+        &self.formatter
     }
 
     pub fn write_mapped_read(&mut self, mapped: &MappedRead) -> Result<(), SamError> {
-        ensure_sam_field(&mapped.name, "QNAME")?;
-        Read::with_qualities_and_tags(
-            &mapped.name,
-            &mapped.sequence,
-            mapped.qualities.as_deref(),
-            mapped.tags.as_deref(),
-        )
-        .validate()?;
-        if let Some(primary) = mapped.mapping.primary.as_ref() {
-            // Validate the whole chimeric set before emitting the primary so
-            // an invalid supplementary cannot leave a partially written read.
-            primary.validate()?;
-            self.alignment_contig_name(primary)?;
-            for supplementary in &mapped.mapping.supplementary {
-                supplementary.validate()?;
-                self.alignment_contig_name(supplementary)?;
-            }
-            self.write_alignment(mapped, primary, false)?;
-        } else {
-            write!(self.writer, "{}\t4\t*\t0\t0\t*\t*\t0\t0\t", mapped.name)?;
-            write_sam_sequence(&mut self.writer, &mapped.sequence, false)?;
-            self.writer.write_all(b"\t")?;
-            write_sam_quality(&mut self.writer, mapped.qualities.as_deref(), false)?;
-            write_optional_fields(&mut self.writer, mapped.tags.as_deref(), &[])?;
-            self.writer.write_all(b"\n")?;
-        }
-        for supplementary in &mapped.mapping.supplementary {
-            self.write_alignment(mapped, supplementary, true)?;
-        }
-        Ok(())
+        self.formatter.write_mapped_read(&mut self.writer, mapped)
+    }
+
+    /// Write bytes a formatter already produced.
+    pub fn write_encoded(&mut self, encoded: &[u8]) -> Result<(), SamError> {
+        self.bytes_written = self.bytes_written.saturating_add(encoded.len() as u64);
+        self.writer.write_all(encoded).map_err(Into::into)
+    }
+
+    /// Record bytes handed to the sink, excluding the header.
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
     }
 
     pub fn flush(&mut self) -> Result<(), SamError> {
@@ -727,108 +886,8 @@ impl<W: Write> SamWriter<W> {
     pub fn into_inner(self) -> W {
         self.writer
     }
-
-    fn write_alignment(
-        &mut self,
-        mapped: &MappedRead,
-        alignment: &Alignment,
-        supplementary: bool,
-    ) -> Result<(), SamError> {
-        alignment.validate()?;
-        let name = self.alignment_contig_name(alignment)?.to_owned();
-        let pos = alignment
-            .ref_start
-            .checked_add(1)
-            .ok_or(SamError::CoordinateOverflow)?;
-        let mut flag = if alignment.strand == Strand::Reverse {
-            16
-        } else {
-            0
-        };
-        if supplementary {
-            flag |= 0x800;
-        }
-        ensure_sam_field(&name, "reference name")?;
-        let reverse = alignment.strand == Strand::Reverse;
-
-        write!(
-            self.writer,
-            "{}\t{}\t{}\t{}\t{}\t",
-            mapped.name, flag, name, pos, alignment.mapq
-        )?;
-        write_sam_cigar(&mut self.writer, alignment)?;
-        self.writer.write_all(b"\t*\t0\t0\t")?;
-        write_sam_sequence(&mut self.writer, &mapped.sequence, reverse)?;
-        self.writer.write_all(b"\t")?;
-        write_sam_quality(&mut self.writer, mapped.qualities.as_deref(), reverse)?;
-        write!(
-            self.writer,
-            "\tNM:i:{}\tAS:i:{}",
-            alignment.edit_distance, alignment.score
-        )?;
-        write_optional_fields(
-            &mut self.writer,
-            mapped.tags.as_deref(),
-            &["NM", "AS", "SA"],
-        )?;
-        self.write_sa_tag(mapped, alignment)?;
-        writeln!(self.writer)?;
-        Ok(())
-    }
-
-    fn alignment_contig_name(&self, alignment: &Alignment) -> Result<&str, SamError> {
-        self.reference
-            .iter()
-            .find(|contig| contig.id == alignment.contig)
-            .map(|contig| contig.name.as_str())
-            .ok_or(SamError::MissingContig(alignment.contig))
-    }
-
-    fn write_sa_tag(&mut self, mapped: &MappedRead, current: &Alignment) -> Result<(), SamError> {
-        let record_count = usize::from(mapped.mapping.primary.is_some())
-            .saturating_add(mapped.mapping.supplementary.len());
-        if record_count <= 1 {
-            return Ok(());
-        }
-
-        self.writer.write_all(b"\tSA:Z:")?;
-        if let Some(primary) = mapped.mapping.primary.as_ref() {
-            if !std::ptr::eq(primary, current) {
-                self.write_sa_entry(primary)?;
-            }
-        }
-        for supplementary in &mapped.mapping.supplementary {
-            if !std::ptr::eq(supplementary, current) {
-                self.write_sa_entry(supplementary)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn write_sa_entry(&mut self, alignment: &Alignment) -> Result<(), SamError> {
-        let name = self.alignment_contig_name(alignment)?.to_owned();
-        let pos = alignment
-            .ref_start
-            .checked_add(1)
-            .ok_or(SamError::CoordinateOverflow)?;
-        write!(
-            self.writer,
-            "{name},{pos},{},",
-            if alignment.strand == Strand::Reverse {
-                '-'
-            } else {
-                '+'
-            }
-        )?;
-        write_sam_cigar(&mut self.writer, alignment)?;
-        write!(
-            self.writer,
-            ",{},{};",
-            alignment.mapq, alignment.edit_distance
-        )?;
-        Ok(())
-    }
 }
+
 
 fn write_optional_fields<W: Write>(
     writer: &mut W,

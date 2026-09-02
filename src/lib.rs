@@ -52,7 +52,7 @@ pub use io::{
     resolve_decompressor, FastxError,
     FastxFormat, FastxReader,
     FastxSource,
-    ReferenceIoError, SamError, SamWriter,
+    ReferenceIoError, SamError, SamRecordFormatter, SamWriter,
 };
 pub use probes::{extract_backbone_probes, extract_read_probes, Probe};
 pub use segment::{segment_read, Segment};

@@ -687,6 +687,13 @@ fn print_cap_distribution(index: &MinimizerIndex) {
     }
 }
 
+/// Rough SAM bytes per read, to size the per-batch encode buffer once.
+///
+/// A HiFi read is about 15 kb and its record carries sequence and qualities,
+/// so this is deliberately generous: one over-large reservation per batch
+/// costs less than the handful of reallocations a small one causes.
+const ENCODED_BYTES_PER_READ_HINT: usize = 40 * 1024;
+
 fn run(options: Options) -> Result<(), CliError> {
     if let Some(index_path) = &options.index {
         let index = MinimizerIndex::open(index_path).map_err(CliError::Index)?;
@@ -1020,6 +1027,10 @@ fn execute_mapping(
         AlignerConfig::Mapper(mapper_config)
     };
 
+    // Encoding moved onto the workers; time it so the point where it would
+    // have saturated the single collector thread is a measurement rather than
+    // an argument.
+    let encode_nanos = AtomicU64::new(0);
     let profile = ProfileReporter::default();
     let aligner = Aligner::new(reference, index, aligner_config)
         .map_err(|error| CliError::Pool(format!("invalid mapper configuration: {error}")))?;
@@ -1055,16 +1066,43 @@ fn execute_mapping(
         per_thread.as_deref(),
     )
     .map_err(CliError::Output)?;
+    // The writer owns its own copy for the header; the encoder needs one it
+    // can share across workers.
+    let formatter = rs_lra::SamRecordFormatter::from_contigs(metadata.iter().cloned());
     let mut writer = SamWriter::from_contigs(output, metadata)
         .map_err(|error| CliError::Pool(error.to_string()))?;
     let mut progress = ProgressReporter::new(options.quiet);
     let stats = aligner
-        .map_with_worker_pool_sink(&pool, reads, |mapped| {
-            progress.update(&mapped);
-            writer
-                .write_mapped_read(&mapped)
-                .map_err(|error| error.to_string())
-        })
+        .map_with_worker_pool_encoded(
+            &pool,
+            reads,
+            |batch, out| {
+                let encode_started = std::time::Instant::now();
+                // Runs on the mapping worker. A whole-genome run formats
+                // hundreds of gigabytes of SAM text, which used to happen in
+                // the sink -- on the one thread that has to serialize batch
+                // order, and so could not use the other workers at all.
+                out.reserve(batch.len() * ENCODED_BYTES_PER_READ_HINT);
+                for mapped in batch {
+                    formatter
+                        .write_mapped_read(out, mapped)
+                        .map_err(|error| rs_lra::MapError::Output(error.to_string()))?;
+                }
+                encode_nanos.fetch_add(
+                    encode_started.elapsed().as_nanos() as u64,
+                    Ordering::Relaxed,
+                );
+                Ok(())
+            },
+            |batch| {
+                for mapped in &batch.results {
+                    progress.update(mapped);
+                }
+                writer
+                    .write_encoded(&batch.encoded)
+                    .map_err(|error| error.to_string())
+            },
+        )
         .map_err(pool_error_to_cli)?;
     writer
         .finish()
@@ -1072,6 +1110,12 @@ fn execute_mapping(
     progress.finish(&stats);
     if options.profile {
         profile.print();
+        let seconds = encode_nanos.load(Ordering::Relaxed) as f64 / 1e9;
+        eprintln!(
+            "  Record encoding:       {:.3} worker-s ({:.0} MB/s of SAM text per core)",
+            seconds,
+            writer.bytes_written() as f64 / 1e6 / seconds.max(1e-9),
+        );
     }
     Ok(())
 }
