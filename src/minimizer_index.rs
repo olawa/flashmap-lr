@@ -259,6 +259,32 @@ pub struct MinimizerContigInfo {
     pub length: usize,
 }
 
+/// What an index records about how it was built.
+///
+/// The frequency cap and the policy that applied it decide which reference
+/// positions a query can ever see, so a mapper's blind spots are a property
+/// of the index rather than of the search. Reading them back is the only way
+/// to tell a seed the index dropped from one the reference does not contain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexSummary {
+    pub format_version: u32,
+    pub built_by: String,
+    pub created_at: String,
+    pub k: usize,
+    pub w: usize,
+    pub contigs: usize,
+    pub total_reference_length: u64,
+    pub max_freq: usize,
+    pub cap_policy: String,
+    pub medium_freq: Option<usize>,
+    pub high_freq: Option<usize>,
+    pub entries_before_capping: u64,
+    pub entries_retained: u64,
+    pub capped_skipped_hits: u64,
+    pub seed_entries: usize,
+    pub hit_entries: usize,
+}
+
 /// A read-only FlashMap v13 packed minimizer index.
 pub struct MinimizerIndex {
     mmap: Arc<Mmap>,
@@ -275,6 +301,7 @@ pub struct MinimizerIndex {
     /// owned lookup vector because FlashMap's on-disk order is by residual
     /// hash/group and is not guaranteed to be sorted by full hash.
     capped_metadata: Vec<CappedEntry>,
+    summary: IndexSummary,
 }
 
 impl std::fmt::Debug for MinimizerIndex {
@@ -330,6 +357,25 @@ impl MinimizerIndex {
                 ))
             })?;
         validate_metadata(&metadata)?;
+
+        let mut summary = IndexSummary {
+            format_version: metadata.index_format_version,
+            built_by: metadata.flashmap_version.clone(),
+            created_at: metadata.created_at.clone(),
+            k: metadata.k,
+            w: metadata.w,
+            contigs: metadata.ref_names.len(),
+            total_reference_length: metadata.total_reference_length,
+            max_freq: metadata.max_freq,
+            cap_policy: metadata.cap_policy.clone(),
+            medium_freq: metadata.medium_freq,
+            high_freq: metadata.high_freq,
+            entries_before_capping: metadata.entries_before_capping,
+            entries_retained: metadata.entries_retained,
+            capped_skipped_hits: metadata.capped_skipped_hits,
+            seed_entries: 0,
+            hit_entries: 0,
+        };
 
         let ref_names = metadata.ref_names;
         let ref_lengths = metadata.ref_lengths;
@@ -427,6 +473,8 @@ impl MinimizerIndex {
             ));
         }
         validate_ranges(ranges.as_slice(), hits.len())?;
+        summary.seed_entries = hashes.len();
+        summary.hit_entries = hits.len();
 
         Ok(Self {
             mmap,
@@ -440,6 +488,7 @@ impl MinimizerIndex {
             hits,
             prefix_table: OnceLock::new(),
             capped_metadata,
+            summary,
         })
     }
 
@@ -465,6 +514,12 @@ impl MinimizerIndex {
     }
 
     /// Return owned metadata suitable for an output header.
+    /// How this index was built, including the cap that bounds what it can
+    /// answer.
+    pub fn summary(&self) -> &IndexSummary {
+        &self.summary
+    }
+
     pub fn reference_metadata(&self) -> Vec<(ContigId, String, usize)> {
         self.contigs()
             .into_iter()

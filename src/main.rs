@@ -23,6 +23,7 @@ struct Options {
     chunk_size: usize,
     quiet: bool,
     profile: bool,
+    index_info: bool,
     paired_emms: bool,
     emms_max_mismatch_run: usize,
     emms_relock_span: usize,
@@ -91,6 +92,7 @@ impl Options {
         let mut decompress_with: Option<String> = None;
         let mut explicit_mode = None;
 
+        let mut index_info = false;
         let mut positional = Vec::new();
 
         while let Some(argument) = args.next() {
@@ -145,6 +147,9 @@ impl Options {
                 }
                 "--profile" => {
                     profile = true;
+                }
+                "--index-info" => {
+                    index_info = true;
                 }
                 "--paired-emms" => {
                     paired_emms = true;
@@ -254,13 +259,20 @@ impl Options {
         Ok(Self {
             reference,
             index,
-            reads: reads.ok_or(CliError::MissingOption("-q/--query/--reads"))?,
+            // Reporting how an index was built reads no query, so requiring
+            // one would only be a hoop.
+            reads: match reads {
+                Some(reads) => reads,
+                None if index_info => PathBuf::new(),
+                None => return Err(CliError::MissingOption("-q/--query/--reads")),
+            },
             output,
             threads,
             workers,
             chunk_size,
             quiet,
             profile,
+            index_info,
             paired_emms,
             emms_max_mismatch_run,
             emms_relock_span,
@@ -400,6 +412,7 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--limit",
     "--quiet",
     "--profile",
+    "--index-info",
     "--decompress-with",
     "--sort-memory",
     "--reseed",
@@ -512,6 +525,7 @@ fn usage() -> &'static str {
         "\n",
         "Reporting:\n",
         "      --profile             Print aggregate mapper phase timings\n",
+        "      --index-info          Report how the index was built, then exit\n",
         "      --quiet               Suppress progress indicators and summary\n",
         "  -n, --limit N             Stop after mapping N reads, for benchmarking\n",
         "\n",
@@ -528,9 +542,59 @@ fn usage() -> &'static str {
     )
 }
 
+/// Print how an index was built, without mapping anything.
+///
+/// The frequency cap and the policy that applied it decide which reference
+/// positions a query can ever reach, so a run's blind spots are a property of
+/// the file. Nothing else reports them, which made "the mapper missed this"
+/// and "the index does not contain it" indistinguishable.
+fn print_index_info(index: &MinimizerIndex) {
+    let summary = index.summary();
+    let dropped = summary.capped_skipped_hits as f64
+        / summary.entries_before_capping.max(1) as f64;
+    println!("  format:            v{}", summary.format_version);
+    println!(
+        "  built by:          flashmap {} on {}",
+        summary.built_by, summary.created_at
+    );
+    println!("  k / w:             {} / {}", summary.k, summary.w);
+    println!(
+        "  reference:         {} contigs, {:.2} Gb",
+        summary.contigs,
+        summary.total_reference_length as f64 / 1e9
+    );
+    let thresholds = match (summary.medium_freq, summary.high_freq) {
+        (Some(medium), Some(high)) => format!(" (medium {medium}, high {high})"),
+        (Some(medium), None) => format!(" (medium {medium})"),
+        (None, Some(high)) => format!(" (high {high})"),
+        (None, None) => String::new(),
+    };
+    println!(
+        "  frequency cap:     {}, policy {}{}",
+        summary.max_freq, summary.cap_policy, thresholds
+    );
+    println!(
+        "  occurrences:       {} before capping, {} retained",
+        summary.entries_before_capping, summary.entries_retained
+    );
+    println!(
+        "  dropped to the cap: {} ({:.1}% of all occurrences)",
+        summary.capped_skipped_hits,
+        100.0 * dropped
+    );
+    println!(
+        "  tables:            {} seeds, {} hits",
+        summary.seed_entries, summary.hit_entries
+    );
+}
+
 fn run(options: Options) -> Result<(), CliError> {
     if let Some(index_path) = &options.index {
         let index = MinimizerIndex::open(index_path).map_err(CliError::Index)?;
+        if options.index_info {
+            print_index_info(&index);
+            return Ok(());
+        }
         let metadata = index.reference_metadata();
         return execute_mapping(&index, &index, metadata, &options);
     }
