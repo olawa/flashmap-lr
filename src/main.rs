@@ -764,6 +764,13 @@ struct ProfileReporter {
     stage_a_anchors: AtomicU64,
     stage_bc_anchors: AtomicU64,
     stage_a_query_bases: AtomicU64,
+    stage_b_added_query_bases: AtomicU64,
+    stage_c_added_query_bases: AtomicU64,
+    index_resolved_positions: AtomicU64,
+    index_blind_positions: AtomicU64,
+    stage_b_entered: AtomicU64,
+    stage_c_entered: AtomicU64,
+    candidates_anchored: AtomicU64,
     stage_bc_added_query_bases: AtomicU64,
     read_bases_scanned: AtomicU64,
     anchor_window_bases: AtomicU64,
@@ -883,6 +890,28 @@ impl DiagnosticsSink for ProfileReporter {
             (&self.stage_a_anchors, u64::from(diagnostics.stage_a_anchors)),
             (&self.stage_bc_anchors, u64::from(diagnostics.stage_bc_anchors)),
             (&self.stage_a_query_bases, diagnostics.stage_a_query_bases),
+            (
+                &self.stage_b_added_query_bases,
+                diagnostics.stage_b_added_query_bases,
+            ),
+            (
+                &self.stage_c_added_query_bases,
+                diagnostics.stage_c_added_query_bases,
+            ),
+            (
+                &self.index_resolved_positions,
+                u64::from(diagnostics.index_resolved_positions),
+            ),
+            (
+                &self.index_blind_positions,
+                u64::from(diagnostics.index_blind_positions),
+            ),
+            (&self.stage_b_entered, u64::from(diagnostics.stage_b_entered)),
+            (&self.stage_c_entered, u64::from(diagnostics.stage_c_entered)),
+            (
+                &self.candidates_anchored,
+                u64::from(diagnostics.candidates_anchored),
+            ),
             (
                 &self.stage_bc_added_query_bases,
                 diagnostics.stage_bc_added_query_bases,
@@ -1081,6 +1110,24 @@ impl ProfileReporter {
             "                         query coverage: {:.1}% of scanned read bases from stage A, {:.1}% added by stage B/C",
             100.0 * stage_a_bases as f64 / scanned as f64,
             100.0 * added_bases as f64 / scanned as f64,
+        );
+        let anchored = self.candidates_anchored.load(Ordering::Relaxed).max(1);
+        eprintln!(
+            "                         stage B entered {:.1}% of candidates, adds {:.1}%; stage C {:.1}%, adds {:.1}%",
+            100.0 * self.stage_b_entered.load(Ordering::Relaxed) as f64 / anchored as f64,
+            100.0 * self.stage_b_added_query_bases.load(Ordering::Relaxed) as f64
+                / scanned as f64,
+            100.0 * self.stage_c_entered.load(Ordering::Relaxed) as f64 / anchored as f64,
+            100.0 * self.stage_c_added_query_bases.load(Ordering::Relaxed) as f64
+                / scanned as f64,
+        );
+        let resolved = self.index_resolved_positions.load(Ordering::Relaxed);
+        let blind = self.index_blind_positions.load(Ordering::Relaxed);
+        eprintln!(
+            "                         minimizer positions: {} answered by the index, {} blind ({:.1}%)",
+            resolved,
+            blind,
+            100.0 * blind as f64 / (resolved + blind).max(1) as f64,
         );
         let dp_calls = self.near_exact_dp_calls.load(Ordering::Relaxed);
         if dp_calls > 0 {

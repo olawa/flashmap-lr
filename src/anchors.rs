@@ -707,7 +707,10 @@ fn find_anchors_with_seed_hits_depth(
     let stage_a = raw_anchors.len();
     let sufficient = is_sufficient_anchors(&raw_anchors, read.sequence.len(), *anchor_policy);
 
+    let mut entered_b = false;
+    let mut entered_c = false;
     if allow_local_fallback && !full_span_found && !sufficient {
+        entered_b = true;
         // Stage B: remaining minimizer positions. The map is built lazily and
         // is shared by the final dense fallback.
         let stage_b: Vec<usize> = raw_minimizer_positions
@@ -715,6 +718,16 @@ fn find_anchors_with_seed_hits_depth(
             .copied()
             .filter(|pos| !paired_hits.contains_key(pos))
             .collect();
+        if let Some(stats) = diagnostics.as_deref_mut() {
+            // Positions the index answered in-window, against the minimizer
+            // positions it had nothing for. Stage B exists only for the latter.
+            stats.index_resolved_positions = stats
+                .index_resolved_positions
+                .saturating_add(paired_hits.len() as u32);
+            stats.index_blind_positions = stats
+                .index_blind_positions
+                .saturating_add(stage_b.len() as u32);
+        }
         scan_positions(
             &stage_b,
             &mut local_kmer_map,
@@ -726,10 +739,12 @@ fn find_anchors_with_seed_hits_depth(
         );
     }
 
+    let stage_b_end = raw_anchors.len();
     if allow_local_fallback
         && !full_span_found
         && !is_sufficient_anchors(&raw_anchors, read.sequence.len(), *anchor_policy)
     {
+        entered_c = true;
         // Stage C: dense positions not already visited as minimizers.
         let dense: Vec<usize> = (0..=scan_end)
             .filter(|pos| raw_minimizer_positions.binary_search(pos).is_err())
@@ -758,11 +773,25 @@ fn find_anchors_with_seed_hits_depth(
         // reference diagonals emits one anchor per diagonal while covering the
         // read once. Union the query intervals to see what each stage explains.
         let stage_a_covered = union_query_bases(&raw_anchors[..stage_a]);
+        let through_b = union_query_bases(&raw_anchors[..stage_b_end]);
         let all_covered = union_query_bases(&raw_anchors);
         stats.stage_a_query_bases = stats.stage_a_query_bases.saturating_add(stage_a_covered);
         stats.stage_bc_added_query_bases = stats
             .stage_bc_added_query_bases
             .saturating_add(all_covered.saturating_sub(stage_a_covered));
+        stats.stage_b_added_query_bases = stats
+            .stage_b_added_query_bases
+            .saturating_add(through_b.saturating_sub(stage_a_covered));
+        stats.stage_c_added_query_bases = stats
+            .stage_c_added_query_bases
+            .saturating_add(all_covered.saturating_sub(through_b));
+        stats.candidates_anchored = stats.candidates_anchored.saturating_add(1);
+        if entered_b {
+            stats.stage_b_entered = stats.stage_b_entered.saturating_add(1);
+        }
+        if entered_c {
+            stats.stage_c_entered = stats.stage_c_entered.saturating_add(1);
+        }
         stats.read_bases_scanned = stats
             .read_bases_scanned
             .saturating_add(read.sequence.len() as u64);
