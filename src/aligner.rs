@@ -622,23 +622,31 @@ impl<'a> Aligner<'a> {
 
         let best_rank_score =
             endpoint_rank_score(chain.score, *endpoint_support, read.sequence.len());
-        let second_score = placements.iter().skip(1).find_map(|placement| {
-            chains_compete_for_query(
-                chain,
-                &placement.1,
-                self.policy
-                    .structural
-                    .max_supplementary_query_overlap_fraction,
-            )
-            .then(|| endpoint_rank_score(placement.1.score, placement.2, read.sequence.len()))
-        });
-        let mut mapq = mapping_quality(best_rank_score, second_score, chain.query_covered_fraction);
-        if matches!(search_completeness, SearchCompleteness::Limited) {
-            mapq = mapq.min(self.policy.work_budget.limited_mapq_cap);
-        }
-        if ambiguity_limited {
-            mapq = mapq.min(self.policy.work_budget.ambiguity_mapq_cap);
-        }
+        let second_score = competing_rank_score(
+            chain,
+            &placements,
+            read.sequence.len(),
+            self.policy
+                .structural
+                .max_supplementary_query_overlap_fraction,
+        );
+        // Search completeness is a property of the read's whole search, so it
+        // bounds every record the read produces, not only the primary.
+        let confidence_cap = |mapq: u8| {
+            let mut mapq = mapq;
+            if matches!(search_completeness, SearchCompleteness::Limited) {
+                mapq = mapq.min(self.policy.work_budget.limited_mapq_cap);
+            }
+            if ambiguity_limited {
+                mapq = mapq.min(self.policy.work_budget.ambiguity_mapq_cap);
+            }
+            mapq
+        };
+        let mapq = confidence_cap(mapping_quality(
+            best_rank_score,
+            second_score,
+            chain.query_covered_fraction,
+        ));
         let contig = self.reference.contig(*contig_id).ok_or(MapError::Anchor(
             crate::AnchorError::MissingReference(*contig_id),
         ))?;
@@ -656,7 +664,7 @@ impl<'a> Aligner<'a> {
         )
         .map_err(MapError::Cigar)?;
         let mut supplementary = Vec::new();
-        for (supplementary_contig, supplementary_chain, _) in
+        for (supplementary_contig, supplementary_chain, supplementary_support) in
             select_supplementary_chains(chain, placements.iter().skip(1), &self.policy.structural)
         {
             let contig = self
@@ -665,11 +673,37 @@ impl<'a> Aligner<'a> {
                 .ok_or(MapError::Anchor(crate::AnchorError::MissingReference(
                     supplementary_contig,
                 )))?;
+            // Each record carries its own confidence. A supplementary is a
+            // separate placement of a different part of the read: whether the
+            // primary was unambiguous says nothing about whether this segment
+            // is, and copying the value hides a segment that had a competitor.
+            let supplementary_mapq = confidence_cap(mapping_quality(
+                endpoint_rank_score(
+                    supplementary_chain.score,
+                    supplementary_support,
+                    read.sequence.len(),
+                ),
+                competing_rank_score(
+                    supplementary_chain,
+                    &placements,
+                    read.sequence.len(),
+                    self.policy
+                        .structural
+                        .max_supplementary_query_overlap_fraction,
+                ),
+                // Measure coverage against the segment's own span, not the
+                // whole read. The factor exists to distrust a chain built from
+                // sparse anchors; a supplementary explaining little of its
+                // read is the normal case for a split, not a warning sign, and
+                // scaling by the whole read caps every split segment low
+                // however unambiguous its locus is.
+                chain_span_coverage(supplementary_chain),
+            ));
             let alignment = crate::alignment::build_chain_alignment_with_policy(
                 read,
                 contig,
                 supplementary_chain,
-                mapq,
+                supplementary_mapq,
                 &self.policy.gaps,
                 &self.policy.terminal,
                 &self.policy.normalization,
@@ -1389,6 +1423,34 @@ fn mapping_quality(best_score: i32, second_score: Option<i32>, coverage: f64) ->
         .unwrap_or(1.0);
     let coverage_factor = (coverage.clamp(0.0, 1.0) / COVERAGE_KNEE).min(1.0);
     (60.0 * margin * coverage_factor).round().clamp(0.0, 60.0) as u8
+}
+
+/// How completely a chain's anchors explain the query span it claims.
+fn chain_span_coverage(chain: &Chain) -> f64 {
+    let span = chain.q_end.saturating_sub(chain.q_start);
+    if span == 0 {
+        return 0.0;
+    }
+    (chain.query_covered_bases as f64 / span as f64).clamp(0.0, 1.0)
+}
+
+/// Best rank score among placements competing for the same query span.
+///
+/// Two placements of different parts of a read are not rivals -- that is what
+/// makes them a split rather than an ambiguity -- so only the ones overlapping
+/// this chain's query bound its confidence.
+fn competing_rank_score(
+    chain: &Chain,
+    placements: &[ChainPlacement],
+    read_len: usize,
+    max_overlap: f64,
+) -> Option<i32> {
+    placements
+        .iter()
+        .filter(|(_, other, _)| !std::ptr::eq(other, chain))
+        .filter(|(_, other, _)| chains_compete_for_query(chain, other, max_overlap))
+        .map(|(_, other, support)| endpoint_rank_score(other.score, *support, read_len))
+        .max()
 }
 
 fn endpoint_rank_score(score: i32, support: EndpointSupport, read_len: usize) -> i32 {
