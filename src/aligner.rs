@@ -394,11 +394,22 @@ impl<'a> Aligner<'a> {
                     >= self.policy.work_budget.high_coverage_fraction
                     || (best_span_fraction >= 0.85 && best_covered_fraction >= 0.30);
 
+                // The span reaches across internal gaps, so a split read's
+                // primary chain spans most of the query while explaining only
+                // part of it. Breaking here on span alone abandons the second
+                // locus and the supplementary alignment with it, so a
+                // candidate that still explains new query keeps the search
+                // open -- the same guard the internal-only pruning uses.
                 if high_coverage_satisfied
                     && candidate.score
                         < (top_candidate_score as f32
                             * self.policy.work_budget.weak_candidate_fraction)
                             as i32
+                    && !candidate_explains_new_query(
+                        candidate,
+                        &placements,
+                        &self.policy.structural,
+                    )
                 {
                     search_completeness = SearchCompleteness::Limited;
                     break;
@@ -473,7 +484,17 @@ impl<'a> Aligner<'a> {
                     >= self.policy.work_budget.high_coverage_fraction
                     || (best_span_fraction >= 0.85 && best_covered_fraction >= 0.30);
 
-                if high_coverage_satisfied {
+                // Span-based satisfaction opens this gate on split reads,
+                // whose second locus is legitimately thin. Skip it only when
+                // the candidate adds nothing the placements do not already
+                // explain.
+                if high_coverage_satisfied
+                    && !candidate_explains_new_query(
+                        candidate,
+                        &placements,
+                        &self.policy.structural,
+                    )
+                {
                     let total_anchor_span: usize = anchors
                         .iter()
                         .map(|a| a.q_end.saturating_sub(a.q_start) as usize)
