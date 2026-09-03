@@ -55,6 +55,78 @@ pub struct Aligner<'a> {
 
 type ChainPlacement = (crate::ContigId, Chain, EndpointSupport);
 
+
+/// Query holes a chain left, with the reference span each should be filled
+/// from.
+///
+/// A hole between two chained anchors is bounded on both sides, so its
+/// reference span follows from theirs. The two ends are open, and take the
+/// candidate's own bounds -- with the read's remaining length as the reach,
+/// since that is the most the alignment can still consume.
+fn chain_gap_scopes(
+    chain: Option<&crate::chain::Chain>,
+    read_len: usize,
+    candidate: &crate::CandidateRegion,
+    min_anchor_length: usize,
+) -> Vec<crate::anchors::GapScope> {
+    // On the reverse strand the anchors advance in query while their reference
+    // coordinates descend, so a gap's reference bounds arrive the wrong way
+    // round. Order them here rather than at every use.
+    fn span(a: u64, b: u64) -> (usize, usize) {
+        (a.min(b) as usize, a.max(b) as usize)
+    }
+    let Some(chain) = chain else {
+        // Nothing chained: the hole is the whole read, which is the dense
+        // case and costs what it costed before.
+        return vec![crate::anchors::GapScope {
+            query: (0, read_len),
+            reference: (candidate.ref_start as usize, candidate.ref_end as usize),
+        }];
+    };
+    let mut scopes = Vec::new();
+    let mut previous: Option<&crate::Anchor> = None;
+    for anchor in &chain.anchors {
+        match previous {
+            Some(previous_anchor) => {
+                let q_lo = previous_anchor.q_end as usize;
+                let q_hi = anchor.q_start as usize;
+                if q_hi.saturating_sub(q_lo) >= min_anchor_length {
+                    scopes.push(crate::anchors::GapScope {
+                        query: (q_lo, q_hi),
+                        reference: span(previous_anchor.ref_end, anchor.ref_start),
+                    });
+                }
+            }
+            None => {
+                let q_hi = anchor.q_start as usize;
+                if q_hi >= min_anchor_length {
+                    scopes.push(crate::anchors::GapScope {
+                        query: (0, q_hi),
+                        reference: span(
+                            anchor.ref_start.saturating_sub(q_hi as u64),
+                            anchor.ref_end,
+                        ),
+                    });
+                }
+            }
+        }
+        previous = Some(anchor);
+    }
+    if let Some(last) = previous {
+        let q_lo = last.q_end as usize;
+        if read_len.saturating_sub(q_lo) >= min_anchor_length {
+            scopes.push(crate::anchors::GapScope {
+                query: (q_lo, read_len),
+                reference: span(
+                    last.ref_start.saturating_sub((read_len - q_lo) as u64),
+                    last.ref_end.saturating_add((read_len - q_lo) as u64),
+                ),
+            });
+        }
+    }
+    scopes
+}
+
 impl<'a> Aligner<'a> {
     pub fn new<C>(
         reference: &'a dyn Reference,
@@ -436,7 +508,7 @@ impl<'a> Aligner<'a> {
                     diagnostics.sparse_anchor_searches.saturating_add(1);
             }
             let phase_started = phase_timer(profiling);
-            let mut anchors = if full_search {
+            let mut anchors = if full_search && !self.policy.anchors.chain_first {
                 find_anchors_with_seed_hits_with_policy_and_diagnostics(
                     read,
                     candidate,
@@ -508,6 +580,45 @@ impl<'a> Aligner<'a> {
                         continue;
                     }
                 }
+            }
+
+            // Chain-first: the sparse pass costs no local map, and what it
+            // chains says where a map is actually needed. Filling only those
+            // holes replaces one 17.5 kb window per read with the gaps the
+            // chain could not close.
+            if self.policy.anchors.chain_first && full_search {
+                let phase_started = phase_timer(profiling);
+                let probe = crate::chain::chain_anchors_with_policy(
+                    anchors.clone(),
+                    read.sequence.len(),
+                    &self.policy.chaining,
+                );
+                diagnostics.chain_nanos = diagnostics
+                    .chain_nanos
+                    .saturating_add(phase_nanos(phase_started));
+                let phase_started = phase_timer(profiling);
+                for scope in chain_gap_scopes(
+                    probe.primary.as_ref(),
+                    read.sequence.len(),
+                    candidate,
+                    self.policy.anchors.min_anchor_length,
+                ) {
+                    match crate::anchors::find_anchors_in_gap(
+                        read,
+                        candidate,
+                        self.reference,
+                        &self.policy.anchors,
+                        &query_seed_hits,
+                        scope,
+                        &mut diagnostics,
+                    ) {
+                        Ok(found) => anchors.extend(found),
+                        Err(error) => return Err(MapError::Anchor(error)),
+                    }
+                }
+                diagnostics.anchor_nanos = diagnostics
+                    .anchor_nanos
+                    .saturating_add(phase_nanos(phase_started));
             }
 
             let phase_started = phase_timer(profiling);

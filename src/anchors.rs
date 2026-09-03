@@ -523,6 +523,39 @@ pub(crate) fn find_sparse_anchors_with_seed_hits_with_policy(
     )
 }
 
+/// One hole a chain left, and the reference span it should be filled from.
+///
+/// Scanning the whole candidate window builds a local map over about 17.5 kb
+/// per read whether or not the chain already explains most of it. A scope
+/// restricts both halves of the scan to what is actually missing.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GapScope {
+    pub(crate) query: (usize, usize),
+    pub(crate) reference: (usize, usize),
+}
+
+/// Anchor discovery restricted to one gap.
+pub(crate) fn find_anchors_in_gap(
+    read: Read<'_>,
+    candidate: &CandidateRegion,
+    reference: &dyn Reference,
+    anchor_policy: &AnchorPolicy,
+    query_seed_hits: &CachedQuerySeedHits,
+    scope: GapScope,
+    diagnostics: &mut crate::ReadDiagnostics,
+) -> Result<Vec<Anchor>, AnchorError> {
+    find_anchors_scoped(
+        read,
+        candidate,
+        reference,
+        anchor_policy,
+        query_seed_hits,
+        true,
+        Some(scope),
+        Some(diagnostics),
+    )
+}
+
 pub(crate) fn find_sparse_anchors_with_seed_hits_with_policy_and_diagnostics(
     read: Read<'_>,
     candidate: &CandidateRegion,
@@ -531,13 +564,14 @@ pub(crate) fn find_sparse_anchors_with_seed_hits_with_policy_and_diagnostics(
     query_seed_hits: &CachedQuerySeedHits,
     diagnostics: &mut crate::ReadDiagnostics,
 ) -> Result<Vec<Anchor>, AnchorError> {
-    find_anchors_with_seed_hits_depth(
+    find_anchors_scoped(
         read,
         candidate,
         reference,
         anchor_policy,
         query_seed_hits,
         false,
+        None,
         Some(diagnostics),
     )
 }
@@ -549,6 +583,29 @@ fn find_anchors_with_seed_hits_depth(
     anchor_policy: &AnchorPolicy,
     query_seed_hits: &CachedQuerySeedHits,
     allow_local_fallback: bool,
+    diagnostics: Option<&mut crate::ReadDiagnostics>,
+) -> Result<Vec<Anchor>, AnchorError> {
+    find_anchors_scoped(
+        read,
+        candidate,
+        reference,
+        anchor_policy,
+        query_seed_hits,
+        allow_local_fallback,
+        None,
+        diagnostics,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_anchors_scoped(
+    read: Read<'_>,
+    candidate: &CandidateRegion,
+    reference: &dyn Reference,
+    anchor_policy: &AnchorPolicy,
+    query_seed_hits: &CachedQuerySeedHits,
+    allow_local_fallback: bool,
+    scope: Option<GapScope>,
     mut diagnostics: Option<&mut crate::ReadDiagnostics>,
 ) -> Result<Vec<Anchor>, AnchorError> {
     read.validate().map_err(AnchorError::InvalidRead)?;
@@ -581,11 +638,30 @@ fn find_anchors_with_seed_hits_depth(
     // the read is long. A fixed 1 KiB opens eleven times the read for a 200 bp
     // query and the local k-mer map is then built over all of it.
     let flank = anchor_policy.reference_flank.min(read.sequence.len()) as u64;
-    let window_start = candidate.ref_start.saturating_sub(flank) as usize;
-    let window_end = candidate
-        .ref_end
-        .saturating_add(flank)
-        .min(reference_len) as usize;
+    let (window_start, window_end) = match scope {
+        // A gap's own reference span, padded enough to hold an anchor that
+        // starts just outside it.
+        Some(scope) => {
+            let pad = anchor_policy.min_anchor_length;
+            let lo = scope.reference.0.min(scope.reference.1).saturating_sub(pad);
+            let hi = scope
+                .reference
+                .0
+                .max(scope.reference.1)
+                .saturating_add(pad)
+                .min(reference_len as usize);
+            // A gap whose span collapses has nothing to search; returning
+            // no anchors is right where an error would abort the read.
+            if lo >= hi {
+                return Ok(Vec::new());
+            }
+            (lo, hi)
+        }
+        None => (
+            candidate.ref_start.saturating_sub(flank) as usize,
+            candidate.ref_end.saturating_add(flank).min(reference_len) as usize,
+        ),
+    };
     if window_start >= window_end || window_end > contig.sequence.len() {
         return Err(AnchorError::InvalidCandidateBounds);
     }
@@ -609,7 +685,11 @@ fn find_anchors_with_seed_hits_depth(
     let (prioritized_positions, paired_hits, paired_emms_pairs) =
         build_paired_staging(candidate.strand, &matching_seed_hits, *anchor_policy);
 
-    let scan_end = read.sequence.len() - k;
+    let scan_end = match scope {
+        Some(scope) => scope.query.1.min(read.sequence.len() - k),
+        None => read.sequence.len() - k,
+    };
+    let scan_start = scope.map_or(0, |scope| scope.query.0);
     let mut local_kmer_map = None;
     let mut raw_anchors = Vec::new();
     let mut coverage = AnchorCoverage::default();
@@ -699,6 +779,9 @@ fn find_anchors_with_seed_hits_depth(
         for &q_start in positions {
             if q_start > scan_end || *kmer_hits >= max_kmer_hits || *full_span_found {
                 break;
+            }
+            if q_start < scan_start {
+                continue;
             }
 
             // A local-map hit compared equal on the whole k-mer code, so its

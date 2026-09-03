@@ -120,6 +120,8 @@ pub struct SeedingConfig {
     pub sampled_anchors: bool,
     /// Window for the local map's minimizer selection. `0` or `1` stores all.
     pub map_window: usize,
+    /// Chain first, then fill only the holes the chain leaves.
+    pub chain_first: bool,
     /// Minimizer window used to query the index, independent of the window the
     /// index was built with. `0` uses the index's own window.
     ///
@@ -174,6 +176,7 @@ impl Default for Config {
                 near_exact_dp: false,
                 sampled_anchors: false,
                 map_window: 1,
+                chain_first: false,
                 query_window: 0,
                 segment_size: 2048,
                 segment_overlap: 512,
@@ -375,6 +378,9 @@ pub(crate) struct AnchorPolicy {
     pub(crate) max_seed_hits: usize,
     /// Window for the local map's minimizer selection. `1` stores all.
     pub(crate) map_window: usize,
+    /// Chain the index-resolved anchors first, and build the local map only
+    /// over the holes that chain leaves.
+    pub(crate) chain_first: bool,
 }
 
 /// Startup-resolved Minimap-DP chaining policy.
@@ -557,6 +563,7 @@ impl ResolvedMapperPolicy {
             allow_sampled_anchors: config.seeding.sampled_anchors,
             max_seed_hits: if config.seeding.sampled_anchors { 512 } else { 128 },
             map_window: config.seeding.map_window.max(1),
+            chain_first: config.seeding.chain_first,
             ..policy.anchors
         };
         policy.work_budget.max_candidates = config.candidates.max_regions.min(8);
@@ -645,6 +652,7 @@ impl ResolvedMapperPolicy {
             allow_sampled_anchors: false,
             max_seed_hits: 128,
             map_window: 1,
+            chain_first: false,
         };
         let chaining = ChainPolicy {
             diagonal_tolerance: candidates.diagonal_tolerance,
@@ -769,6 +777,7 @@ impl ResolvedMapperPolicy {
                 max_probe_frequency: self.probes.max_probe_frequency,
                 sampled_anchors: self.probes.sampled_anchors,
                 map_window: self.probes.map_window,
+                chain_first: self.anchors.chain_first,
             },
             candidates: CandidateConfig {
                 max_regions: self.candidates.max_regions,

@@ -35,6 +35,7 @@ struct Options {
     sampled_anchors: bool,
     anchor_k: Option<usize>,
     map_window: usize,
+    chain_first: bool,
     near_exact: bool,
     near_exact_dp: bool,
     limit: Option<usize>,
@@ -101,6 +102,7 @@ impl Options {
         let mut sampled_anchors = false;
         let mut anchor_k: Option<usize> = None;
         let mut map_window = 1usize;
+        let mut chain_first = false;
         let mut near_exact_dp = false;
         let mut limit: Option<usize> = None;
         let mut decompress_with: Option<String> = None;
@@ -151,6 +153,9 @@ impl Options {
                 }
                 "--map-window" => {
                     map_window = parse_positive(next_value(&mut args, &argument)?, "map-window")?;
+                }
+                "--chain-first" => {
+                    chain_first = true;
                 }
                 "--sampled-anchors" => {
                     sampled_anchors = true;
@@ -322,6 +327,7 @@ impl Options {
             sampled_anchors,
             anchor_k,
             map_window,
+            chain_first,
             near_exact,
             near_exact_dp,
             limit,
@@ -461,6 +467,7 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--sampled-anchors",
     "--anchor-k",
     "--map-window",
+    "--chain-first",
     "--near-exact",
     "--near-exact-dp",
     "--query-window",
@@ -568,6 +575,8 @@ fn usage() -> &'static str {
         "      --anchor-k N          Seed length for the local anchor scan. A shorter\n",
         "                            seed than the anchor it must reach spends most of\n",
         "                            its extensions on matches that cannot (default: 15)\n",
+        "      --chain-first         Chain the index-resolved anchors first, and build\n",
+        "                            the local map only over the holes it leaves\n",
         "      --map-window N        Window for the local map's minimizer selection.\n",
         "                            A wider window stores fewer positions (default: 1)\n",
         "      --sampled-anchors     Let a sampled hit list seed anchors inside a\n",
@@ -1173,6 +1182,7 @@ fn execute_mapping(
         || options.sampled_anchors
         || options.anchor_k.is_some()
         || options.map_window > 1
+        || options.chain_first
     {
         let defaults = Config::default();
         let legacy = Config {
@@ -1180,6 +1190,7 @@ fn execute_mapping(
                 reseed_uncovered: options.reseed,
                 sampled_anchors: options.sampled_anchors,
                 map_window: options.map_window,
+                chain_first: options.chain_first,
                 near_exact_candidate: options.near_exact,
                 near_exact_dp: options.near_exact_dp,
                 query_window: options.query_window,
