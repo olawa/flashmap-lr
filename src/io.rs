@@ -916,7 +916,7 @@ pub enum AlignmentSink {
 
 impl AlignmentSink {
     pub fn open(path: &Path, threads: usize) -> io::Result<Self> {
-        Self::open_with_sort_memory(path, threads, None)
+        Self::open_with_sort_memory(path, threads, None, None)
     }
 
     /// Open an output sink, optionally bounding `samtools sort` memory.
@@ -928,6 +928,7 @@ impl AlignmentSink {
         path: &Path,
         threads: usize,
         sort_memory: Option<&str>,
+        compression: Option<u8>,
     ) -> io::Result<Self> {
         if path == Path::new("-") {
             Ok(Self::Stdout(io::BufWriter::new(io::stdout())))
@@ -941,6 +942,7 @@ impl AlignmentSink {
                 path,
                 threads,
                 sort_memory,
+                compression,
             )?))
         } else {
             let file = File::create(path)?;
@@ -992,6 +994,7 @@ impl SamtoolsSortSink {
         output_path: &Path,
         threads: usize,
         sort_memory: Option<&str>,
+        compression: Option<u8>,
     ) -> io::Result<Self> {
         let threads = threads.max(1);
         let mut command = Command::new("samtools");
@@ -1002,6 +1005,13 @@ impl SamtoolsSortSink {
         if let Some(memory) = sort_memory {
             // samtools applies -m per sort thread.
             command.arg("-m").arg(memory);
+        }
+        if let Some(level) = compression {
+            // The merge that ends a sort compresses one output stream, which
+            // is what pins it well below the machine's thread count however
+            // many runs it is merging. A cheaper level trades file size for
+            // that tail directly.
+            command.arg("-l").arg(level.to_string());
         }
         // Give the sort its own spill prefix. Without `-T` samtools derives one
         // from the output name, so a stale spill from an earlier run with the

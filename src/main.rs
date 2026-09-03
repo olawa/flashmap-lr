@@ -29,6 +29,7 @@ struct Options {
     tiered_candidates: bool,
     mode: AlignmentMode,
     sort_memory: Option<String>,
+    bam_compression: Option<u8>,
     query_window: usize,
     reseed: bool,
     sampled_anchors: bool,
@@ -91,6 +92,7 @@ impl Options {
         let mut tiered_candidates = false;
         let mut mode = AlignmentMode::default();
         let mut sort_memory: Option<String> = None;
+        let mut bam_compression: Option<u8> = None;
         let mut query_window = 0usize;
         let mut near_exact = false;
         let mut reseed = false;
@@ -152,6 +154,17 @@ impl Options {
                 }
                 "--query-window" => {
                     query_window = parse_positive(next_value(&mut args, &argument)?, "query-window")?;
+                }
+                "--bam-compression" => {
+                    let value = next_value(&mut args, &argument)?;
+                    let level = parse_positive(value.clone(), "bam-compression")?;
+                    if level > 9 {
+                        return Err(CliError::InvalidNumber {
+                            option: "--bam-compression",
+                            value,
+                        });
+                    }
+                    bam_compression = Some(level as u8);
                 }
                 "--sort-memory" => {
                     sort_memory = Some(next_value(&mut args, &argument)?);
@@ -290,6 +303,7 @@ impl Options {
             tiered_candidates,
             mode,
             sort_memory,
+            bam_compression,
             query_window,
             reseed,
             sampled_anchors,
@@ -427,6 +441,7 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--index-info",
     "--decompress-with",
     "--sort-memory",
+    "--bam-compression",
     "--reseed",
     "--sampled-anchors",
     "--near-exact",
@@ -510,6 +525,9 @@ fn usage() -> &'static str {
         "                            A .bam name is sorted and indexed on the way out.\n",
         "      --decompress-with CMD Command to decompress gzip reads; the path is\n",
         "                            appended (default: pigz -dc when on PATH)\n",
+        "      --bam-compression N   BGZF level 0-9 for .bam output. The sort's final\n",
+        "                            merge compresses one stream, which is what pins\n",
+        "                            it below the thread count (default: samtools')\n",
         "      --sort-memory SIZE    Total memory the BAM sort may use, e.g. 8G.\n",
         "                            Divided across its threads (default: samtools')\n",
         "\n",
@@ -1197,6 +1215,7 @@ fn execute_mapping(
         &options.output,
         sort_threads,
         per_thread.as_deref(),
+        options.bam_compression,
     )
     .map_err(CliError::Output)?;
     // The writer owns its own copy for the header; the encoder needs one it
