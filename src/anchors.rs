@@ -540,7 +540,8 @@ fn find_anchors_with_seed_hits_depth(
         return Err(AnchorError::InvalidCandidateBounds);
     }
 
-    let (mut raw_minimizer_positions, mut matching_seed_hits) = collect_matching_seed_hits(
+    let (mut raw_minimizer_positions, mut matching_seed_hits, sampled_admitted) =
+        collect_matching_seed_hits(
         query_seed_hits,
         read.sequence.len(),
         candidate,
@@ -743,6 +744,9 @@ fn find_anchors_with_seed_hits_depth(
     }
 
     if let Some(stats) = diagnostics.as_mut() {
+        stats.sampled_lookups_admitted = stats
+            .sampled_lookups_admitted
+            .saturating_add(sampled_admitted);
         // Positions the index answered inside this window, against the
         // minimizer positions it had nothing for. Counted for every candidate,
         // not only those that go on to enter stage B: gating it there made the
@@ -845,6 +849,9 @@ fn find_anchors_with_seed_hits_depth(
     ))
 }
 
+/// Longest hit list a complete lookup will walk.
+const DEFAULT_MAX_SEED_HITS: usize = 128;
+
 /// What an anchor lookup will accept from the index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SeedHitLimits {
@@ -854,6 +861,7 @@ struct SeedHitLimits {
     max_seed_hits: usize,
 }
 
+#[allow(clippy::type_complexity)]
 fn collect_matching_seed_hits(
     query_seed_hits: &CachedQuerySeedHits,
     read_len: usize,
@@ -861,7 +869,7 @@ fn collect_matching_seed_hits(
     _k: usize,
     window: (usize, usize),
     limits: SeedHitLimits,
-) -> (Vec<usize>, Vec<MatchingSeedHits>) {
+) -> (Vec<usize>, Vec<MatchingSeedHits>, u32) {
     let (window_start, window_end) = window;
     let SeedHitLimits {
         allow_sampled,
@@ -870,6 +878,7 @@ fn collect_matching_seed_hits(
     let seed_span = query_seed_hits.seed_span;
     let mut raw_minimizer_positions = Vec::new();
     let mut matching_seed_hits = Vec::new();
+    let mut sampled_admitted = 0u32;
     // A hit is inside the window when it ends at or before `window_end`.  A
     // window shorter than one seed span can hold none, and the subtraction
     // below would wrap.
@@ -889,6 +898,16 @@ fn collect_matching_seed_hits(
         // anchor. It can remain in `raw_minimizer_positions`, so staging still
         // falls through to the verified local k-mer map.  Testing this before
         // the hit list is walked only skips work whose result was discarded.
+        // The longer list bound belongs to sampled lists alone. A drop index
+        // marks its over-cap seeds sampled too, with nothing stored, so
+        // applying the bound to every lookup would change results on an index
+        // the flag is meant to leave alone.
+        let sampled = matches!(lookup.completeness, crate::HitCompleteness::Sampled { .. });
+        let hit_bound = if sampled && allow_sampled {
+            max_seed_hits
+        } else {
+            DEFAULT_MAX_SEED_HITS
+        };
         let usable = match lookup.completeness {
             crate::HitCompleteness::Complete => true,
             // A sampled list cannot establish a placement, which is the
@@ -899,10 +918,7 @@ fn collect_matching_seed_hits(
             crate::HitCompleteness::Sampled { .. } => allow_sampled,
             crate::HitCompleteness::Absent => false,
         };
-        if !usable
-            || callback_count > max_seed_hits
-            || lookup.reported_hits as usize > max_seed_hits
-        {
+        if !usable || callback_count > hit_bound || lookup.reported_hits as usize > hit_bound {
             continue;
         }
         let Some(max_ref_pos) = max_ref_pos else {
@@ -934,6 +950,12 @@ fn collect_matching_seed_hits(
         // The run was walked in ascending `ref_pos`, so this is a duplicate
         // pass only; `build_paired_staging` binary-searches these positions.
         ref_positions.dedup();
+        if sampled && !ref_positions.is_empty() {
+            // Only a lookup that yielded an in-window position counts: an
+            // empty sampled list is admitted but contributes nothing, and
+            // counting those would report work that never happened.
+            sampled_admitted = sampled_admitted.saturating_add(1);
+        }
         if !ref_positions.is_empty() {
             matching_seed_hits.push(MatchingSeedHits {
                 query_pos,
@@ -941,7 +963,7 @@ fn collect_matching_seed_hits(
             });
         }
     }
-    (raw_minimizer_positions, matching_seed_hits)
+    (raw_minimizer_positions, matching_seed_hits, sampled_admitted)
 }
 
 fn build_paired_staging(
@@ -1668,7 +1690,7 @@ mod tests {
                 for (window_start, window_end) in windows {
                     let mut region = candidate(48, strand);
                     region.contig = ContigId(contig);
-                    let (_, matched) = collect_matching_seed_hits(
+                    let (_, matched, _) = collect_matching_seed_hits(
                         &cached,
                         read_len,
                         &region,

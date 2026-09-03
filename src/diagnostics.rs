@@ -51,6 +51,10 @@ pub struct ReadDiagnostics {
     pub stage_a_query_bases: u64,
     pub stage_b_added_query_bases: u64,
     pub stage_c_added_query_bases: u64,
+    /// Lookups the anchor path used only because sampled lists were allowed.
+    ///
+    /// Zero means --sampled-anchors changed nothing, whatever else moved.
+    pub sampled_lookups_admitted: u32,
     pub index_resolved_positions: u32,
     pub index_blind_positions: u32,
     pub stage_b_entered: u32,

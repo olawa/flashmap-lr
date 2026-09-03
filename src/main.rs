@@ -1178,6 +1178,7 @@ struct ProfileReporter {
     stage_a_query_bases: AtomicU64,
     stage_b_added_query_bases: AtomicU64,
     stage_c_added_query_bases: AtomicU64,
+    sampled_lookups_admitted: AtomicU64,
     index_resolved_positions: AtomicU64,
     index_blind_positions: AtomicU64,
     stage_b_entered: AtomicU64,
@@ -1309,6 +1310,10 @@ impl DiagnosticsSink for ProfileReporter {
             (
                 &self.stage_c_added_query_bases,
                 diagnostics.stage_c_added_query_bases,
+            ),
+            (
+                &self.sampled_lookups_admitted,
+                u64::from(diagnostics.sampled_lookups_admitted),
             ),
             (
                 &self.index_resolved_positions,
@@ -1533,6 +1538,12 @@ impl ProfileReporter {
             100.0 * self.stage_c_added_query_bases.load(Ordering::Relaxed) as f64
                 / scanned as f64,
         );
+        let sampled = self.sampled_lookups_admitted.load(Ordering::Relaxed);
+        if sampled > 0 {
+            eprintln!(
+                "                         {sampled} lookups admitted only because sampled lists were allowed"
+            );
+        }
         let resolved = self.index_resolved_positions.load(Ordering::Relaxed);
         let blind = self.index_blind_positions.load(Ordering::Relaxed);
         eprintln!(
