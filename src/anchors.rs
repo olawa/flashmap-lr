@@ -739,6 +739,22 @@ fn find_anchors_with_seed_hits_depth(
         sufficient = is_sufficient_anchors(&raw_anchors, read.sequence.len(), *anchor_policy);
     }
 
+    if let Some(stats) = diagnostics.as_mut() {
+        // Positions the index answered inside this window, against the
+        // minimizer positions it had nothing for. Counted for every candidate,
+        // not only those that go on to enter stage B: gating it there made the
+        // denominator the stage B entry rate, so the ratio moved when that
+        // rate did and could not be compared between configurations.
+        let blind = raw_minimizer_positions
+            .iter()
+            .filter(|pos| !paired_hits.contains_key(pos))
+            .count();
+        stats.index_resolved_positions = stats
+            .index_resolved_positions
+            .saturating_add(paired_hits.len() as u32);
+        stats.index_blind_positions = stats.index_blind_positions.saturating_add(blind as u32);
+    }
+
     let stage_a = raw_anchors.len();
     let mut entered_b = false;
     let mut entered_c = false;
@@ -751,16 +767,6 @@ fn find_anchors_with_seed_hits_depth(
             .copied()
             .filter(|pos| !paired_hits.contains_key(pos))
             .collect();
-        if let Some(stats) = diagnostics.as_mut() {
-            // Positions the index answered in-window, against the minimizer
-            // positions it had nothing for. Stage B exists only for the latter.
-            stats.index_resolved_positions = stats
-                .index_resolved_positions
-                .saturating_add(paired_hits.len() as u32);
-            stats.index_blind_positions = stats
-                .index_blind_positions
-                .saturating_add(stage_b.len() as u32);
-        }
         scan_positions(
             &stage_b,
             &mut local_kmer_map,
