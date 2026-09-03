@@ -794,6 +794,7 @@ fn try_append_exact_island_chain(
         reference_slice,
         gap_policy.recursive_split_k,
         max_gap,
+        diagnostics.as_ref().is_some_and(|stats| stats.profiling),
     );
     if let Some(stats) = reborrow_diagnostics(diagnostics) {
         stats.exact_island_calls = stats.exact_island_calls.saturating_add(1);
@@ -864,6 +865,7 @@ fn find_exact_island_chain(
     r_gap_seq: &[u8],
     k: usize,
     max_gap: usize,
+    collect_stats: bool,
 ) -> ExactIslandSearch {
     let q_gap_len = q_gap_seq.len();
     let r_gap_len = r_gap_seq.len();
@@ -915,23 +917,29 @@ fn find_exact_island_chain(
         &r_kmers[start..end]
     };
 
-    let mut longest_bucket = 0usize;
-    let mut rejected = 0usize;
-    let mut index = 0usize;
-    while index < r_kmers.len() {
-        let value = r_kmers[index].0;
-        let end = index + r_kmers[index..].partition_point(|&(entry, _)| entry == value);
-        let len = end - index;
-        // The previous map stored at most 17 positions per code and treated a
-        // full bucket as the rejection marker; preserve both counts exactly.
-        longest_bucket = longest_bucket.max(len.min(17));
-        if len >= 17 {
-            rejected += 1;
+    // Walking every bucket costs a binary search per distinct code, which on a
+    // mostly-unique table is another n log n on top of the sort just done --
+    // and it only fills two counters that --profile prints. Nothing in the
+    // search reads them, so a run that is not profiling skips the pass.
+    if collect_stats {
+        let mut longest_bucket = 0usize;
+        let mut rejected = 0usize;
+        let mut index = 0usize;
+        while index < r_kmers.len() {
+            let value = r_kmers[index].0;
+            let end = index + r_kmers[index..].partition_point(|&(entry, _)| entry == value);
+            let len = end - index;
+            // The previous map stored at most 17 positions per code and treated
+            // a full bucket as the rejection marker; preserve both counts.
+            longest_bucket = longest_bucket.max(len.min(17));
+            if len >= 17 {
+                rejected += 1;
+            }
+            index = end;
         }
-        index = end;
+        search.max_bucket = longest_bucket;
+        search.rejected_buckets = rejected;
     }
-    search.max_bucket = longest_bucket;
-    search.rejected_buckets = rejected;
 
     let mut matches = Vec::new();
     let query_step = (max_gap / 512).max(1);

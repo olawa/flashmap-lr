@@ -2,6 +2,13 @@
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReadDiagnostics {
+    /// Whether this run reports a profile.
+    ///
+    /// The structure is filled for every read either way, because most of its
+    /// counters are increments. A few are not: the exact-island bucket
+    /// statistics cost a second pass over the gap's k-mer table, which nothing
+    /// in the search reads. This says whether that pass is worth making.
+    pub profiling: bool,
     pub seeds_seen: u32,
     pub seeds_used: u32,
     pub candidates: u32,

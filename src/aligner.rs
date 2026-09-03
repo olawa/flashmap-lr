@@ -137,6 +137,7 @@ impl<'a> Aligner<'a> {
         read.validate().map_err(MapError::InvalidRead)?;
 
         let mut diagnostics = ReadDiagnostics {
+            profiling,
             query_bases: saturating_u32(read.sequence.len()),
             ..ReadDiagnostics::default()
         };
