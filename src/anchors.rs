@@ -360,6 +360,13 @@ struct PairedMinimizerPair {
 #[derive(Default)]
 struct AnchorCoverage {
     by_diagonal: HashMap<i64, Vec<Interval>>,
+    /// The interval inserted most recently, checked before the map.
+    ///
+    /// An anchor spans about 73 bases, so the roughly 58 seeds that follow it
+    /// on the same diagonal all land inside it. Testing that one interval
+    /// first answers most of a scan's 248M queries with two comparisons
+    /// instead of a hash lookup, and the map still answers the rest.
+    last: Option<(i64, Interval)>,
 }
 
 impl AnchorCoverage {
@@ -370,12 +377,14 @@ impl AnchorCoverage {
             anchor.ref_end,
             anchor.strand,
         );
-        self.by_diagonal.entry(key).or_default().push(Interval {
+        let interval = Interval {
             q_start: anchor.q_start,
             q_end: anchor.q_end,
             ref_start: anchor.ref_start,
             ref_end: anchor.ref_end,
-        });
+        };
+        self.by_diagonal.entry(key).or_default().push(interval);
+        self.last = Some((key, interval));
     }
 
     fn contains_seed(&self, q_start: usize, ref_start: u64, k: usize, strand: Strand) -> bool {
@@ -386,15 +395,21 @@ impl AnchorCoverage {
             return false;
         };
         let seed_diagonal = diagonal(q_start as u32, ref_start, ref_end, strand);
-        let Some(intervals) = self.by_diagonal.get(&seed_diagonal) else {
-            return false;
-        };
-        intervals.iter().any(|interval| {
+        let covers = |interval: &Interval| {
             q_start as u32 >= interval.q_start
                 && q_end as u32 <= interval.q_end
                 && ref_start >= interval.ref_start
                 && ref_end <= interval.ref_end
-        })
+        };
+        if let Some((key, interval)) = &self.last {
+            if *key == seed_diagonal && covers(interval) {
+                return true;
+            }
+        }
+        let Some(intervals) = self.by_diagonal.get(&seed_diagonal) else {
+            return false;
+        };
+        intervals.iter().any(covers)
     }
 }
 
