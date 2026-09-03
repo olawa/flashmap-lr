@@ -32,6 +32,7 @@ struct Options {
     sort_memory: Option<String>,
     query_window: usize,
     reseed: bool,
+    sampled_anchors: bool,
     near_exact: bool,
     near_exact_dp: bool,
     limit: Option<usize>,
@@ -94,6 +95,7 @@ impl Options {
         let mut query_window = 0usize;
         let mut near_exact = false;
         let mut reseed = false;
+        let mut sampled_anchors = false;
         let mut near_exact_dp = false;
         let mut limit: Option<usize> = None;
         let mut decompress_with: Option<String> = None;
@@ -135,6 +137,9 @@ impl Options {
                 }
                 "-n" | "--limit" => {
                     limit = Some(parse_positive(next_value(&mut args, &argument)?, "limit")?);
+                }
+                "--sampled-anchors" => {
+                    sampled_anchors = true;
                 }
                 "--reseed" => {
                     reseed = true;
@@ -288,6 +293,7 @@ impl Options {
             sort_memory,
             query_window,
             reseed,
+            sampled_anchors,
             near_exact,
             near_exact_dp,
             limit,
@@ -423,6 +429,7 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--decompress-with",
     "--sort-memory",
     "--reseed",
+    "--sampled-anchors",
     "--near-exact",
     "--near-exact-dp",
     "--query-window",
@@ -524,6 +531,8 @@ fn usage() -> &'static str {
         "                            agree on one diagonal, skipping probe clustering\n",
         "      --near-exact-dp       As --near-exact, and align the locked region in\n",
         "                            one banded pass instead of finding anchors\n",
+        "      --sampled-anchors     Let a sampled hit list seed anchors inside a\n",
+        "                            chosen candidate (for a sampling cap index)\n",
         "      --reseed              Search query intervals no placement explains,\n",
         "                            recovering the second side of a split read\n",
         "      --query-window N      Minimizer window used to query the index,\n",
@@ -1005,11 +1014,13 @@ fn execute_mapping(
         || options.query_window > 0
         || options.near_exact
         || options.reseed
+        || options.sampled_anchors
     {
         let defaults = Config::default();
         let legacy = Config {
             seeding: rs_lra::SeedingConfig {
                 reseed_uncovered: options.reseed,
+                sampled_anchors: options.sampled_anchors,
                 near_exact_candidate: options.near_exact,
                 near_exact_dp: options.near_exact_dp,
                 query_window: options.query_window,

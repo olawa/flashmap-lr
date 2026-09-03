@@ -116,6 +116,8 @@ pub struct SeedingConfig {
     pub near_exact_candidate: bool,
     /// Align a locked region in one banded pass instead of finding anchors.
     pub near_exact_dp: bool,
+    /// Let a sampled hit list seed anchors inside a chosen candidate region.
+    pub sampled_anchors: bool,
     /// Minimizer window used to query the index, independent of the window the
     /// index was built with. `0` uses the index's own window.
     ///
@@ -168,6 +170,7 @@ impl Default for Config {
                 reseed_uncovered: false,
                 near_exact_candidate: false,
                 near_exact_dp: false,
+                sampled_anchors: false,
                 query_window: 0,
                 segment_size: 2048,
                 segment_overlap: 512,
@@ -312,6 +315,7 @@ pub(crate) struct ProbePolicy {
     pub(crate) reseed_min_hits: u32,
     pub(crate) near_exact_candidate: bool,
     pub(crate) near_exact_dp: bool,
+    pub(crate) sampled_anchors: bool,
     pub(crate) near_exact_dp_max_drift: usize,
     pub(crate) near_exact_dp_band_slack: usize,
     pub(crate) near_exact_dp_max_divergence: f64,
@@ -354,6 +358,17 @@ pub(crate) struct AnchorPolicy {
     pub(crate) sufficient_anchor_count: usize,
     pub(crate) sufficient_span_permille: usize,
     pub(crate) sufficient_coverage_permille: usize,
+    /// Let a sampled hit list seed anchors inside an already-chosen candidate.
+    ///
+    /// A sampled list must not establish a placement on its own -- that is the
+    /// candidate stage's rule and it stays there. By the time anchors are
+    /// found the region is settled by other evidence, so a sampled position
+    /// that falls inside the window is a lead like any other. Without this an
+    /// index built with a sampling cap policy stores positions the mapper then
+    /// refuses to read, which is measurable as no change at all.
+    pub(crate) allow_sampled_anchors: bool,
+    /// Longest hit list an anchor lookup will walk.
+    pub(crate) max_seed_hits: usize,
 }
 
 /// Startup-resolved Minimap-DP chaining policy.
@@ -506,6 +521,7 @@ impl ResolvedMapperPolicy {
             reseed_min_hits: policy.probes.reseed_min_hits,
             near_exact_candidate: config.seeding.near_exact_candidate,
             near_exact_dp: config.seeding.near_exact_dp,
+            sampled_anchors: config.seeding.sampled_anchors,
             near_exact_dp_max_drift: policy.probes.near_exact_dp_max_drift,
             near_exact_dp_band_slack: policy.probes.near_exact_dp_band_slack,
             near_exact_dp_max_divergence: policy.probes.near_exact_dp_max_divergence,
@@ -531,6 +547,8 @@ impl ResolvedMapperPolicy {
             paired_emms: config.candidates.paired_emms,
             emms_max_mismatch_run: config.candidates.emms_max_mismatch_run,
             emms_relock_span: config.candidates.emms_relock_span,
+            allow_sampled_anchors: config.seeding.sampled_anchors,
+            max_seed_hits: if config.seeding.sampled_anchors { 512 } else { 128 },
             ..policy.anchors
         };
         policy.work_budget.max_candidates = config.candidates.max_regions.min(8);
@@ -548,6 +566,7 @@ impl ResolvedMapperPolicy {
 
     fn for_mode(mode: AlignmentMode, runtime: RuntimeConfig) -> Self {
         let probes = ProbePolicy {
+            sampled_anchors: false,
             // Default to the index's own window so a decoupled query is an
             // explicit choice, measured per index, rather than a silent change
             // in which seeds every existing caller sees.
@@ -614,6 +633,8 @@ impl ResolvedMapperPolicy {
             sufficient_anchor_count: 6,
             sufficient_span_permille: 750,
             sufficient_coverage_permille: 350,
+            allow_sampled_anchors: false,
+            max_seed_hits: 128,
         };
         let chaining = ChainPolicy {
             diagonal_tolerance: candidates.diagonal_tolerance,
@@ -736,6 +757,7 @@ impl ResolvedMapperPolicy {
                 max_probes_per_segment: self.probes.max_probes_per_segment,
                 max_total_hits_scanned: self.probes.max_total_hits_scanned,
                 max_probe_frequency: self.probes.max_probe_frequency,
+                sampled_anchors: self.probes.sampled_anchors,
             },
             candidates: CandidateConfig {
                 max_regions: self.candidates.max_regions,

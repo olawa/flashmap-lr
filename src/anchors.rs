@@ -547,6 +547,8 @@ fn find_anchors_with_seed_hits_depth(
         k,
         window_start,
         window_end,
+        anchor_policy.allow_sampled_anchors,
+        anchor_policy.max_seed_hits,
     );
     raw_minimizer_positions.sort_unstable();
     raw_minimizer_positions.dedup();
@@ -849,6 +851,8 @@ fn collect_matching_seed_hits(
     _k: usize,
     window_start: usize,
     window_end: usize,
+    allow_sampled: bool,
+    max_seed_hits: usize,
 ) -> (Vec<usize>, Vec<MatchingSeedHits>) {
     let seed_span = query_seed_hits.seed_span;
     let mut raw_minimizer_positions = Vec::new();
@@ -872,9 +876,19 @@ fn collect_matching_seed_hits(
         // anchor. It can remain in `raw_minimizer_positions`, so staging still
         // falls through to the verified local k-mer map.  Testing this before
         // the hit list is walked only skips work whose result was discarded.
-        if !matches!(lookup.completeness, crate::HitCompleteness::Complete)
-            || callback_count > 128
-            || lookup.reported_hits > 128
+        let usable = match lookup.completeness {
+            crate::HitCompleteness::Complete => true,
+            // A sampled list cannot establish a placement, which is the
+            // candidate stage's rule and stays there. Here the region is
+            // already settled, so a sampled position inside the window is a
+            // lead like any other -- and refusing it is why an index built
+            // with a sampling cap policy changes nothing at all.
+            crate::HitCompleteness::Sampled { .. } => allow_sampled,
+            crate::HitCompleteness::Absent => false,
+        };
+        if !usable
+            || callback_count > max_seed_hits
+            || lookup.reported_hits as usize > max_seed_hits
         {
             continue;
         }
@@ -1648,6 +1662,8 @@ mod tests {
                         24,
                         window_start,
                         window_end,
+                        false,
+                        128,
                     );
                     let observed: Vec<(usize, Vec<u64>)> = matched
                         .into_iter()
