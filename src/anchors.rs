@@ -806,6 +806,17 @@ fn find_anchors_with_seed_hits_depth(
     };
 
     // Stage A: paired minimizer positions.
+    //
+    // Ordering them by how many places the index put them keeps the rarest
+    // first. A seed with one reference position is the most likely to extend
+    // across the read, and a full-span anchor stops the scan outright -- so
+    // trying it before the ambiguous ones decides sooner rather than after
+    // the same work in a different order.
+    let mut prioritized_positions = prioritized_positions;
+    if anchor_policy.rarest_first {
+        prioritized_positions
+            .sort_by_key(|pos| paired_hits.get(pos).map_or(usize::MAX, |hits| hits.len()));
+    }
     scan_positions(
         &prioritized_positions,
         &mut local_kmer_map,
@@ -822,11 +833,15 @@ fn find_anchors_with_seed_hits_depth(
     // their reference coordinates.
     if !full_span_found && !sufficient {
         let prioritized_set: HashSet<usize> = prioritized_positions.iter().copied().collect();
-        let remaining_resolved: Vec<usize> = raw_minimizer_positions
+        let mut remaining_resolved: Vec<usize> = raw_minimizer_positions
             .iter()
             .copied()
             .filter(|pos| paired_hits.contains_key(pos) && !prioritized_set.contains(pos))
             .collect();
+        if anchor_policy.rarest_first {
+            remaining_resolved
+                .sort_by_key(|pos| paired_hits.get(pos).map_or(usize::MAX, |hits| hits.len()));
+        }
         scan_positions(
             &remaining_resolved,
             &mut local_kmer_map,

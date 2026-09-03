@@ -531,7 +531,7 @@ impl MinimizerIndex {
                 continue;
             };
             for &hit in hits {
-                let ref_id = ((hit >> 48) & 0xffff) as u64;
+                let ref_id = (hit >> 48) & 0xffff;
                 let ref_pos = (hit >> 16) & 0xffff_ffff;
                 packed.push((ref_id << 32) | ref_pos);
             }
