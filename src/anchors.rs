@@ -627,6 +627,18 @@ fn find_anchors_with_seed_hits_depth(
     let positions_visited = std::cell::Cell::new(0u64);
     let hits_examined = std::cell::Cell::new(0u64);
     let extensions = std::cell::Cell::new(0u64);
+    let on_diagonal = std::cell::Cell::new(0u64);
+    let anchors_on_diagonal = std::cell::Cell::new(0u64);
+    // The clustering already found this: `diagonal_mean` is the mean of
+    // `query - ref` over the probes that formed the region, so it is the
+    // alignment's diagonal rather than the region's corner.
+    let candidate_diagonal = candidate.diagonal_mean as f64;
+    let seed_diagonal = |q: usize, r: u64| -> f64 {
+        match candidate.strand {
+            Strand::Forward => q as f64 - r as f64,
+            Strand::Reverse => q as f64 + r as f64 + k as f64 - 1.0,
+        }
+    };
     let scan_positions = |positions: &[usize],
                           local_kmer_map: &mut Option<LocalKmerMap>,
                           raw_anchors: &mut Vec<Anchor>,
@@ -691,6 +703,9 @@ fn find_anchors_with_seed_hits_depth(
                 }
 
                 extensions.set(extensions.get().saturating_add(1));
+                if (seed_diagonal(q_start, ref_start) - candidate_diagonal).abs() <= 50.0 {
+                    on_diagonal.set(on_diagonal.get().saturating_add(1));
+                }
                 let Some(anchor) = extend_exact_anchor(ExactAnchorRequest {
                     read: read.sequence,
                     reference: contig.sequence,
@@ -713,6 +728,12 @@ fn find_anchors_with_seed_hits_depth(
                     read.sequence.len(),
                     anchor.score,
                 );
+                if (seed_diagonal(anchor.q_start as usize, anchor.ref_start) - candidate_diagonal)
+                    .abs()
+                    <= 50.0
+                {
+                    anchors_on_diagonal.set(anchors_on_diagonal.get().saturating_add(1));
+                }
                 coverage.insert(anchor);
                 raw_anchors.push(anchor);
                 if full_span {
@@ -831,6 +852,10 @@ fn find_anchors_with_seed_hits_depth(
             .saturating_add(positions_visited.get());
         stats.scan_hits_examined = stats.scan_hits_examined.saturating_add(hits_examined.get());
         stats.scan_extensions = stats.scan_extensions.saturating_add(extensions.get());
+        stats.scan_on_diagonal_50 = stats.scan_on_diagonal_50.saturating_add(on_diagonal.get());
+        stats.anchors_on_diagonal_50 = stats
+            .anchors_on_diagonal_50
+            .saturating_add(anchors_on_diagonal.get());
         stats.stage_a_anchors = stats.stage_a_anchors.saturating_add(stage_a as u32);
         stats.stage_bc_anchors = stats
             .stage_bc_anchors

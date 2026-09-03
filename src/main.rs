@@ -1343,6 +1343,8 @@ struct ProfileReporter {
     scan_positions_visited: AtomicU64,
     scan_hits_examined: AtomicU64,
     scan_extensions: AtomicU64,
+    scan_on_diagonal_50: AtomicU64,
+    anchors_on_diagonal_50: AtomicU64,
     stage_a_anchors: AtomicU64,
     stage_bc_anchors: AtomicU64,
     stage_a_query_bases: AtomicU64,
@@ -1476,6 +1478,11 @@ impl DiagnosticsSink for ProfileReporter {
             ),
             (&self.scan_hits_examined, diagnostics.scan_hits_examined),
             (&self.scan_extensions, diagnostics.scan_extensions),
+            (&self.scan_on_diagonal_50, diagnostics.scan_on_diagonal_50),
+            (
+                &self.anchors_on_diagonal_50,
+                diagnostics.anchors_on_diagonal_50,
+            ),
             (&self.stage_a_anchors, u64::from(diagnostics.stage_a_anchors)),
             (&self.stage_bc_anchors, u64::from(diagnostics.stage_bc_anchors)),
             (&self.stage_a_query_bases, diagnostics.stage_a_query_bases),
@@ -1724,6 +1731,13 @@ impl ProfileReporter {
             examined as f64 / visited.max(1) as f64,
             extended,
             100.0 * extended as f64 / examined.max(1) as f64,
+        );
+        let near = self.scan_on_diagonal_50.load(Ordering::Relaxed);
+        let kept_near = self.anchors_on_diagonal_50.load(Ordering::Relaxed);
+        eprintln!(
+            "                         within 50 of the candidate's diagonal: {:.1}% of extensions, {:.1}% of anchors kept",
+            100.0 * near as f64 / extended.max(1) as f64,
+            100.0 * kept_near as f64 / (sa + sbc).max(1) as f64,
         );
         let sampled = self.sampled_lookups_admitted.load(Ordering::Relaxed);
         if sampled > 0 {

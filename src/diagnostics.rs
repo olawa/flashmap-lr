@@ -52,6 +52,12 @@ pub struct ReadDiagnostics {
     pub scan_hits_examined: u64,
     /// Hits that survived to an extension attempt.
     pub scan_extensions: u64,
+    /// Extensions whose seed lay within 50 bases of the candidate's own
+    /// diagonal, and the anchors kept that did. A hit far from it belongs to
+    /// another copy of the region and chaining discards it later, so the two
+    /// together say whether filtering before extending would pay.
+    pub scan_on_diagonal_50: u64,
+    pub anchors_on_diagonal_50: u64,
     pub stage_a_anchors: u32,
     pub stage_bc_anchors: u32,
     pub stage_a_query_bases: u64,
