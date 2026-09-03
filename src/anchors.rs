@@ -621,6 +621,12 @@ fn find_anchors_with_seed_hits_depth(
     // Counted through a cell so the scan closure needs only shared access.
     let map_builds = std::cell::Cell::new(0u32);
     let map_nanos = std::cell::Cell::new(0u64);
+    // Where the scan's time goes is a question of shape: many positions with
+    // few hits each is an encode-and-lookup cost, few positions with many hits
+    // is an extension cost, and the two want opposite fixes.
+    let positions_visited = std::cell::Cell::new(0u64);
+    let hits_examined = std::cell::Cell::new(0u64);
+    let extensions = std::cell::Cell::new(0u64);
     let scan_positions = |positions: &[usize],
                           local_kmer_map: &mut Option<LocalKmerMap>,
                           raw_anchors: &mut Vec<Anchor>,
@@ -633,7 +639,12 @@ fn find_anchors_with_seed_hits_depth(
                 break;
             }
 
+            // A local-map hit compared equal on the whole k-mer code, so its
+            // first k bases are known to match. An index hit compared equal on
+            // a hash and can still be a collision, so that one is verified.
+            let mut verified = true;
             let ref_positions: &[u64] = if let Some(positions) = paired_hits.get(&q_start) {
+                verified = false;
                 positions.as_slice()
             } else {
                 if local_kmer_map.is_none() {
@@ -650,6 +661,7 @@ fn find_anchors_with_seed_hits_depth(
                             .saturating_add(build_started.elapsed().as_nanos() as u64),
                     );
                 }
+                positions_visited.set(positions_visited.get().saturating_add(1));
                 let Some(code) = encode_kmer(&read.sequence[q_start..q_start + k]) else {
                     continue;
                 };
@@ -669,6 +681,7 @@ fn find_anchors_with_seed_hits_depth(
                     break;
                 }
                 *kmer_hits += 1;
+                hits_examined.set(hits_examined.get().saturating_add(1));
                 let key = (q_start, ref_start);
                 if !seen_seed_hits.insert(key) {
                     continue;
@@ -677,6 +690,7 @@ fn find_anchors_with_seed_hits_depth(
                     continue;
                 }
 
+                extensions.set(extensions.get().saturating_add(1));
                 let Some(anchor) = extend_exact_anchor(ExactAnchorRequest {
                     read: read.sequence,
                     reference: contig.sequence,
@@ -688,6 +702,7 @@ fn find_anchors_with_seed_hits_depth(
                     window_start,
                     window_end,
                     min_length: anchor_policy.min_anchor_length,
+                    seed_verified: verified,
                 }) else {
                     continue;
                 };
@@ -811,6 +826,11 @@ fn find_anchors_with_seed_hits_depth(
             .local_kmer_map_builds
             .saturating_add(map_builds.get());
         stats.local_kmer_map_nanos = stats.local_kmer_map_nanos.saturating_add(map_nanos.get());
+        stats.scan_positions_visited = stats
+            .scan_positions_visited
+            .saturating_add(positions_visited.get());
+        stats.scan_hits_examined = stats.scan_hits_examined.saturating_add(hits_examined.get());
+        stats.scan_extensions = stats.scan_extensions.saturating_add(extensions.get());
         stats.stage_a_anchors = stats.stage_a_anchors.saturating_add(stage_a as u32);
         stats.stage_bc_anchors = stats
             .stage_bc_anchors
@@ -1257,6 +1277,8 @@ struct ExactAnchorRequest<'a> {
     window_start: usize,
     window_end: usize,
     min_length: usize,
+    /// Whether the caller already established that the seed's k bases match.
+    seed_verified: bool,
 }
 
 fn extend_exact_anchor(request: ExactAnchorRequest<'_>) -> Option<Anchor> {
@@ -1271,6 +1293,7 @@ fn extend_exact_anchor(request: ExactAnchorRequest<'_>) -> Option<Anchor> {
         window_start,
         window_end,
         min_length,
+        seed_verified,
     } = request;
     let ref_seed_end = ref_seed_start.checked_add(k as u64)?;
     if ref_seed_start < window_start as u64
@@ -1281,17 +1304,19 @@ fn extend_exact_anchor(request: ExactAnchorRequest<'_>) -> Option<Anchor> {
     }
 
     let ref_seed_start_usize = ref_seed_start as usize;
-    if !(0..k).all(|offset| {
+    if !seed_verified
+        && !(0..k).all(|offset| {
         let ref_offset = match strand {
             Strand::Forward => offset,
             Strand::Reverse => k - 1 - offset,
         };
-        bases_match(
-            read[q_seed_start + offset],
-            reference[ref_seed_start_usize + ref_offset],
-            strand,
-        )
-    }) {
+            bases_match(
+                read[q_seed_start + offset],
+                reference[ref_seed_start_usize + ref_offset],
+                strand,
+            )
+        })
+    {
         return None;
     }
 
