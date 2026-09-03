@@ -33,6 +33,7 @@ struct Options {
     query_window: usize,
     reseed: bool,
     sampled_anchors: bool,
+    anchor_k: Option<usize>,
     near_exact: bool,
     near_exact_dp: bool,
     limit: Option<usize>,
@@ -97,6 +98,7 @@ impl Options {
         let mut near_exact = false;
         let mut reseed = false;
         let mut sampled_anchors = false;
+        let mut anchor_k: Option<usize> = None;
         let mut near_exact_dp = false;
         let mut limit: Option<usize> = None;
         let mut decompress_with: Option<String> = None;
@@ -138,6 +140,12 @@ impl Options {
                 }
                 "-n" | "--limit" => {
                     limit = Some(parse_positive(next_value(&mut args, &argument)?, "limit")?);
+                }
+                "--anchor-k" => {
+                    anchor_k = Some(parse_positive(
+                        next_value(&mut args, &argument)?,
+                        "anchor-k",
+                    )?);
                 }
                 "--sampled-anchors" => {
                     sampled_anchors = true;
@@ -307,6 +315,7 @@ impl Options {
             query_window,
             reseed,
             sampled_anchors,
+            anchor_k,
             near_exact,
             near_exact_dp,
             limit,
@@ -444,6 +453,7 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--bam-compression",
     "--reseed",
     "--sampled-anchors",
+    "--anchor-k",
     "--near-exact",
     "--near-exact-dp",
     "--query-window",
@@ -548,6 +558,9 @@ fn usage() -> &'static str {
         "                            agree on one diagonal, skipping probe clustering\n",
         "      --near-exact-dp       As --near-exact, and align the locked region in\n",
         "                            one banded pass instead of finding anchors\n",
+        "      --anchor-k N          Seed length for the local anchor scan. A shorter\n",
+        "                            seed than the anchor it must reach spends most of\n",
+        "                            its extensions on matches that cannot (default: 15)\n",
         "      --sampled-anchors     Let a sampled hit list seed anchors inside a\n",
         "                            chosen candidate (for a sampling cap index)\n",
         "      --reseed              Search query intervals no placement explains,\n",
@@ -1149,6 +1162,7 @@ fn execute_mapping(
         || options.near_exact
         || options.reseed
         || options.sampled_anchors
+        || options.anchor_k.is_some()
     {
         let defaults = Config::default();
         let legacy = Config {
@@ -1161,6 +1175,7 @@ fn execute_mapping(
                 ..defaults.seeding
             },
             candidates: rs_lra::CandidateConfig {
+                anchor_k: options.anchor_k.unwrap_or(defaults.candidates.anchor_k),
                 paired_emms: options.paired_emms,
                 emms_max_mismatch_run: options.emms_max_mismatch_run,
                 emms_relock_span: options.emms_relock_span,
@@ -1325,6 +1340,9 @@ struct ProfileReporter {
     adaptive_gap_escalations: AtomicU64,
     local_kmer_map_builds: AtomicU64,
     local_kmer_map_nanos: AtomicU64,
+    scan_positions_visited: AtomicU64,
+    scan_hits_examined: AtomicU64,
+    scan_extensions: AtomicU64,
     stage_a_anchors: AtomicU64,
     stage_bc_anchors: AtomicU64,
     stage_a_query_bases: AtomicU64,
@@ -1452,6 +1470,12 @@ impl DiagnosticsSink for ProfileReporter {
             ),
             (&self.anchor_window_bases, diagnostics.anchor_window_bases),
             (&self.local_kmer_map_nanos, diagnostics.local_kmer_map_nanos),
+            (
+                &self.scan_positions_visited,
+                diagnostics.scan_positions_visited,
+            ),
+            (&self.scan_hits_examined, diagnostics.scan_hits_examined),
+            (&self.scan_extensions, diagnostics.scan_extensions),
             (&self.stage_a_anchors, u64::from(diagnostics.stage_a_anchors)),
             (&self.stage_bc_anchors, u64::from(diagnostics.stage_bc_anchors)),
             (&self.stage_a_query_bases, diagnostics.stage_a_query_bases),
@@ -1689,6 +1713,17 @@ impl ProfileReporter {
             100.0 * self.stage_c_entered.load(Ordering::Relaxed) as f64 / anchored as f64,
             100.0 * self.stage_c_added_query_bases.load(Ordering::Relaxed) as f64
                 / scanned as f64,
+        );
+        let visited = self.scan_positions_visited.load(Ordering::Relaxed);
+        let examined = self.scan_hits_examined.load(Ordering::Relaxed);
+        let extended = self.scan_extensions.load(Ordering::Relaxed);
+        eprintln!(
+            "                         scan: {} positions, {} hits ({:.1}/position), {} extended ({:.1}%)",
+            visited,
+            examined,
+            examined as f64 / visited.max(1) as f64,
+            extended,
+            100.0 * extended as f64 / examined.max(1) as f64,
         );
         let sampled = self.sampled_lookups_admitted.load(Ordering::Relaxed);
         if sampled > 0 {

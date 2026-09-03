@@ -46,6 +46,12 @@ pub struct ReadDiagnostics {
     /// Diagonal drift of an unambiguous locus: the band a whole-read DP needs.
     pub local_kmer_map_builds: u32,
     pub local_kmer_map_nanos: u64,
+    /// Query positions the anchor scan encoded and looked up.
+    pub scan_positions_visited: u64,
+    /// Reference hits those lookups returned and the scan considered.
+    pub scan_hits_examined: u64,
+    /// Hits that survived to an extension attempt.
+    pub scan_extensions: u64,
     pub stage_a_anchors: u32,
     pub stage_bc_anchors: u32,
     pub stage_a_query_bases: u64,
