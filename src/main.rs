@@ -858,12 +858,41 @@ impl<W: Write> Write for ByteCountingSink<W> {
 /// costs less than the handful of reallocations a small one causes.
 const ENCODED_BYTES_PER_READ_HINT: usize = 40 * 1024;
 
+/// How far apart the index's own positions are.
+///
+/// The frequency cap decides which positions exist; this says where they are.
+/// A stretch with nothing stored is what a locality-aware cap policy would
+/// aim at -- keeping a repetitive minimizer only where no unique one is near
+/// -- and the distribution says whether such stretches exist at all.
+fn print_position_gaps(index: &MinimizerIndex) {
+    let cap = index.summary().max_freq;
+    println!();
+    println!("  Gaps between stored minimizer positions (frequency <= {cap}):");
+    let buckets = index.stored_position_gaps(cap);
+    let total: u64 = buckets.iter().map(|(_, count)| *count).sum();
+    let mut low = 1u64;
+    for (edge, count) in buckets {
+        let label = if edge == u64::MAX {
+            format!("{low}+")
+        } else {
+            format!("{low}-{edge}")
+        };
+        println!(
+            "    {label:<12} {:>12} ({:>5.2}%)",
+            count,
+            100.0 * count as f64 / total.max(1) as f64
+        );
+        low = edge.saturating_add(1);
+    }
+}
+
 fn run(options: Options) -> Result<(), CliError> {
     if let Some(index_path) = &options.index {
         let index = MinimizerIndex::open(index_path).map_err(CliError::Index)?;
         if options.index_info {
             print_index_info(&index);
             print_cap_distribution(&index);
+            print_position_gaps(&index);
             return Ok(());
         }
         if !options.quiet {

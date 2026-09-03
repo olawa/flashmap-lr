@@ -502,6 +502,59 @@ impl MinimizerIndex {
         self.capped_metadata.iter().map(|entry| entry.raw_count)
     }
 
+    /// Distance between consecutive stored minimizer positions, per contig.
+    ///
+    /// A seed the frequency cap dropped leaves no position behind, so where
+    /// the index is blind cannot be read off directly. The complement can: a
+    /// long run with nothing stored is a stretch the index cannot answer for,
+    /// and that is where keeping a high-frequency minimizer would buy
+    /// something. Where the stored positions are already a few bases apart it
+    /// would not.
+    ///
+    /// `max_frequency` keeps only seeds at or below that many occurrences, so
+    /// the gaps are between positions a query can actually be placed by.
+    pub fn stored_position_gaps(&self, max_frequency: usize) -> Vec<(u64, u64)> {
+        let mut packed: Vec<u64> = Vec::new();
+        for &range in self.ranges.as_slice() {
+            if range & INLINE_BIT != 0 {
+                if let Some(hit) = self.inline_hit(range) {
+                    packed.push(((hit.contig.0 as u64) << 32) | hit.ref_pos);
+                }
+                continue;
+            }
+            let start = (range & 0xffff) as usize;
+            let len = ((range >> 32) & 0xffff) as usize;
+            if len == 0 || len > max_frequency {
+                continue;
+            }
+            let Some(hits) = self.hits.as_slice().get(start..start + len) else {
+                continue;
+            };
+            for &hit in hits {
+                let ref_id = ((hit >> 48) & 0xffff) as u64;
+                let ref_pos = (hit >> 16) & 0xffff_ffff;
+                packed.push((ref_id << 32) | ref_pos);
+            }
+        }
+        packed.sort_unstable();
+        packed.dedup();
+
+        // Log-spaced buckets: the question is whether a gap is tens of bases
+        // or thousands, not its exact size.
+        const EDGES: [u64; 8] = [16, 32, 64, 128, 512, 2048, 16384, u64::MAX];
+        let mut counts = [0u64; 8];
+        for pair in packed.windows(2) {
+            let (previous, current) = (pair[0], pair[1]);
+            if previous >> 32 != current >> 32 {
+                continue;
+            }
+            let gap = (current & 0xffff_ffff) - (previous & 0xffff_ffff);
+            let bucket = EDGES.iter().position(|&edge| gap <= edge).unwrap_or(7);
+            counts[bucket] += 1;
+        }
+        EDGES.iter().copied().zip(counts).collect()
+    }
+
     pub fn k(&self) -> usize {
         self.k
     }
