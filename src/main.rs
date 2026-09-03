@@ -1133,6 +1133,16 @@ fn execute_mapping(
             seconds,
             writer.bytes_written() as f64 / 1e6 / seconds.max(1e-9),
         );
+        // The collector is the only serial stage. Its wall time splits into
+        // waiting for workers and pushing bytes at whatever consumes them, so
+        // which half dominates says which side is the constraint.
+        let wall = stats.collector_wall_nanos.max(1) as f64;
+        eprintln!(
+            "  Output collector:      {:.1}s wall -- {:.1}% waiting for workers, {:.1}% in the sink",
+            wall / 1e9,
+            100.0 * stats.collector_wait_nanos as f64 / wall,
+            100.0 * stats.collector_sink_nanos as f64 / wall,
+        );
     }
     Ok(())
 }

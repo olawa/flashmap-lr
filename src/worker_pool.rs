@@ -176,6 +176,17 @@ pub struct WorkerPoolStats {
     pub batches_written: usize,
     /// Number of mapped results delivered to the ordered sink.
     pub reads_written: usize,
+    /// Nanoseconds the collector spent waiting for a batch to arrive.
+    ///
+    /// The collector is the one serial stage, so where its wall time goes says
+    /// which side of it is the constraint: waiting here means the workers are
+    /// behind, while time spent in the sink means whatever consumes the output
+    /// is.
+    pub collector_wait_nanos: u64,
+    /// Nanoseconds the collector spent inside the sink.
+    pub collector_sink_nanos: u64,
+    /// Wall nanoseconds the collector loop ran for.
+    pub collector_wall_nanos: u64,
 }
 
 /// Invalid execution settings detected before a pool is started.
@@ -400,7 +411,14 @@ impl WorkerPool {
 
             let mut sink_result = Ok(());
             let mut pool_error = None;
-            while let Some(message) = mapped_queue.pop() {
+            let collector_started = std::time::Instant::now();
+            loop {
+                let wait_started = std::time::Instant::now();
+                let popped = mapped_queue.pop();
+                stats.collector_wait_nanos = stats
+                    .collector_wait_nanos
+                    .saturating_add(wait_started.elapsed().as_nanos() as u64);
+                let Some(message) = popped else { break };
                 match message {
                     Ok(batch) => {
                         let batch_id = batch.batch_id;
@@ -415,7 +433,12 @@ impl WorkerPool {
                         while let Some(batch) = pending.remove(&next_batch_id) {
                             stats.batches_written += 1;
                             stats.reads_written += batch.results.len();
-                            if let Err(error) = sink(batch) {
+                            let sink_started = std::time::Instant::now();
+                            let outcome = sink(batch);
+                            stats.collector_sink_nanos = stats
+                                .collector_sink_nanos
+                                .saturating_add(sink_started.elapsed().as_nanos() as u64);
+                            if let Err(error) = outcome {
                                 cancellation.store(true, Ordering::Release);
                                 raw_queue.close();
                                 mapped_queue.close();
@@ -438,6 +461,7 @@ impl WorkerPool {
                 }
             }
 
+            stats.collector_wall_nanos = collector_started.elapsed().as_nanos() as u64;
             raw_queue.close();
             mapped_queue.close();
 
