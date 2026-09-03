@@ -604,6 +604,37 @@ fn print_index_info(index: &MinimizerIndex) {
     );
 }
 
+/// Name the index a run is actually using, and the cap that bounds it.
+///
+/// A run's results depend on the file as much as on the flags, and a log that
+/// records only the flags cannot be told apart from one built against another
+/// index. That is not hypothetical: two whole-genome runs were compared as a
+/// cap-policy experiment when both had read the same file.
+fn print_index_banner(path: &std::path::Path, index: &MinimizerIndex) {
+    let summary = index.summary();
+    let thresholds = match (summary.medium_freq, summary.high_freq) {
+        (Some(medium), Some(high)) => format!(" (medium {medium}, high {high})"),
+        (Some(medium), None) => format!(" (medium {medium})"),
+        (None, Some(high)) => format!(" (high {high})"),
+        (None, None) => String::new(),
+    };
+    eprintln!(
+        "[rs-lra] index {}: k={} w={}, cap {} {}{}, {} contigs, {:.2} Gb, {} seeds / {} hits",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("?"),
+        summary.k,
+        summary.w,
+        summary.max_freq,
+        summary.cap_policy,
+        thresholds,
+        summary.contigs,
+        summary.total_reference_length as f64 / 1e9,
+        summary.seed_entries,
+        summary.hit_entries,
+    );
+}
+
 /// What the seeds above the cap look like, and what keeping some would cost.
 ///
 /// A `drop` policy stores nothing for them, so every query minimizer that
@@ -712,6 +743,9 @@ fn run(options: Options) -> Result<(), CliError> {
             print_index_info(&index);
             print_cap_distribution(&index);
             return Ok(());
+        }
+        if !options.quiet {
+            print_index_banner(index_path, &index);
         }
         let metadata = index.reference_metadata();
         return execute_mapping(&index, &index, metadata, &options);
