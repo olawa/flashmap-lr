@@ -632,11 +632,11 @@ fn find_anchors_with_seed_hits_depth(
     // The clustering already found this: `diagonal_mean` is the mean of
     // `query - ref` over the probes that formed the region, so it is the
     // alignment's diagonal rather than the region's corner.
-    let candidate_diagonal = candidate.diagonal_mean as f64;
-    let seed_diagonal = |q: usize, r: u64| -> f64 {
+    let candidate_diagonal = candidate.diagonal_mean;
+    let seed_diagonal = |q: usize, r: u64| -> i64 {
         match candidate.strand {
-            Strand::Forward => q as f64 - r as f64,
-            Strand::Reverse => q as f64 + r as f64 + k as f64 - 1.0,
+            Strand::Forward => q as i64 - r as i64,
+            Strand::Reverse => q as i64 + r as i64 + k as i64 - 1,
         }
     };
     let scan_positions = |positions: &[usize],
@@ -703,7 +703,7 @@ fn find_anchors_with_seed_hits_depth(
                 }
 
                 extensions.set(extensions.get().saturating_add(1));
-                if (seed_diagonal(q_start, ref_start) - candidate_diagonal).abs() <= 50.0 {
+                if (seed_diagonal(q_start, ref_start) - candidate_diagonal).abs() <= 50 {
                     on_diagonal.set(on_diagonal.get().saturating_add(1));
                 }
                 let Some(anchor) = extend_exact_anchor(ExactAnchorRequest {
@@ -730,7 +730,7 @@ fn find_anchors_with_seed_hits_depth(
                 );
                 if (seed_diagonal(anchor.q_start as usize, anchor.ref_start) - candidate_diagonal)
                     .abs()
-                    <= 50.0
+                    <= 50
                 {
                     anchors_on_diagonal.set(anchors_on_diagonal.get().saturating_add(1));
                 }
@@ -1505,7 +1505,7 @@ fn is_full_span_anchor(q_start: u32, q_end: u32, read_len: usize, length: i32) -
 }
 
 fn anchor_diagonal_delta(anchor: &Anchor, candidate: &CandidateRegion) -> i64 {
-    (anchor_diagonal(anchor) - candidate.diagonal_mean as i64).abs()
+    (anchor_diagonal(anchor) - candidate.diagonal_mean).abs()
 }
 
 fn anchor_diagonal(anchor: &Anchor) -> i64 {
@@ -1791,7 +1791,7 @@ mod tests {
             unique_probes: 2,
             mean_probe_frequency: 1.0,
             best_probe_frequency: 1,
-            diagonal_mean: 0.0,
+            diagonal_mean: 0,
             diagonal_median: 0.0,
             score: 1,
             endpoint_support: crate::EndpointSupport::None,

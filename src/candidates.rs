@@ -20,7 +20,13 @@ pub struct CandidateRegion {
     pub unique_probes: u32,
     pub mean_probe_frequency: f32,
     pub best_probe_frequency: u32,
-    pub diagonal_mean: f32,
+    /// Mean `query - ref` over the probes that formed this region.
+    ///
+    /// Held as an integer: a genome coordinate reaches 2.5e8, where an f32's
+    /// 24-bit mantissa resolves to 16-32 bases. That is wider than the bands
+    /// this value is compared against, so the rounding was larger than the
+    /// distances it was being used to measure.
+    pub diagonal_mean: i64,
     pub diagonal_median: f32,
     pub score: i32,
     pub endpoint_support: EndpointSupport,
@@ -257,7 +263,7 @@ fn add_cluster(
         .collect();
     let frequencies: Vec<u32> = cluster.iter().map(|hit| hit.probe.frequency).collect();
     let diagonals: Vec<i64> = cluster.iter().map(|hit| hit.diagonal).collect();
-    let diagonal_mean = diagonals.iter().sum::<i64>() as f32 / diagonals.len() as f32;
+    let diagonal_mean = diagonals.iter().sum::<i64>() / diagonals.len() as i64;
     let diagonal_median = median(&diagonals) as f32;
     let endpoint_key = |hit: &&ProbeHit| {
         if !matches!(
@@ -266,7 +272,7 @@ fn add_cluster(
         ) {
             return false;
         }
-        let delta_mean = (hit.diagonal - diagonal_mean as i64).unsigned_abs();
+        let delta_mean = (hit.diagonal - diagonal_mean).unsigned_abs();
         let delta_median = (hit.diagonal - diagonal_median as i64).unsigned_abs();
         delta_mean.min(delta_median) <= policy.diagonal_tolerance.max(0) as u64
     };
