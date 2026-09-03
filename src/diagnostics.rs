@@ -70,7 +70,27 @@ pub struct ReadDiagnostics {
     /// another copy of the region and chaining discards it later, so the two
     /// together say whether filtering before extending would pay.
     pub scan_on_diagonal_50: u64,
+    /// The same at a band wide enough to hold the indels chains carry: 13.8%
+    /// of them span a kilobase or more, and both sides of such an event sit
+    /// off a probe cluster's mean diagonal by roughly the event's size.
+    pub scan_on_diagonal_5000: u64,
     pub anchors_on_diagonal_50: u64,
+    /// Anchors the primary chain actually used, and how many of those lay
+    /// near the candidate's diagonal.
+    ///
+    /// The scan keeps up to a few hundred anchors per region and chaining
+    /// picks a subset, so "kept" and "used" are different populations. If the
+    /// used ones are the near-diagonal ones, filtering before extension would
+    /// save the rest; if they are not, the distance is telling us something
+    /// about the alignment rather than about noise.
+    pub chained_anchors: u64,
+    pub chained_on_diagonal_50: u64,
+    /// Largest reference-side gap inside a primary chain, bucketed. This is
+    /// the biggest deletion the chain represents, so it says what size of
+    /// event the mapper is already carrying rather than clipping.
+    pub chain_ref_gap_buckets: [u64; 7],
+    /// The same for the query side, which is the biggest insertion.
+    pub chain_query_gap_buckets: [u64; 7],
     pub stage_a_anchors: u32,
     pub stage_bc_anchors: u32,
     pub stage_a_query_bases: u64,

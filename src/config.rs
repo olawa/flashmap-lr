@@ -122,6 +122,8 @@ pub struct SeedingConfig {
     pub map_window: usize,
     /// Scan the index-resolved positions rarest first.
     pub rarest_first: bool,
+    /// Largest distance from the candidate's diagonal an anchor may start at.
+    pub diagonal_band: i64,
     /// Minimizer window used to query the index, independent of the window the
     /// index was built with. `0` uses the index's own window.
     ///
@@ -180,6 +182,7 @@ impl Default for Config {
                 sampled_anchors: false,
                 map_window: 1,
                 rarest_first: false,
+                diagonal_band: i64::MAX,
                 query_window: 0,
                 segment_size: 2048,
                 segment_overlap: 512,
@@ -382,6 +385,9 @@ pub(crate) struct AnchorPolicy {
     pub(crate) max_seed_hits: usize,
     /// Scan the index-resolved positions rarest first.
     pub(crate) rarest_first: bool,
+    /// Largest distance from the candidate's diagonal an anchor may start at.
+    /// `i64::MAX` extends every hit, which is the historical behaviour.
+    pub(crate) diagonal_band: i64,
     /// Window for the local map's minimizer selection. `1` stores all.
     pub(crate) map_window: usize,
 }
@@ -575,6 +581,7 @@ impl ResolvedMapperPolicy {
             max_seed_hits: if config.seeding.sampled_anchors { 512 } else { 128 },
             map_window: config.seeding.map_window.max(1),
             rarest_first: config.seeding.rarest_first,
+            diagonal_band: config.seeding.diagonal_band,
             ..policy.anchors
         };
         policy.work_budget.max_candidates = config.candidates.max_regions.min(8);
@@ -664,6 +671,7 @@ impl ResolvedMapperPolicy {
             max_seed_hits: 128,
             map_window: 1,
             rarest_first: false,
+            diagonal_band: i64::MAX,
         };
         let chaining = ChainPolicy {
             diagonal_tolerance: candidates.diagonal_tolerance,
@@ -790,6 +798,7 @@ impl ResolvedMapperPolicy {
                 sampled_anchors: self.probes.sampled_anchors,
                 map_window: self.probes.map_window,
                 rarest_first: self.anchors.rarest_first,
+                diagonal_band: self.anchors.diagonal_band,
             },
             candidates: CandidateConfig {
                 max_regions: self.candidates.max_regions,

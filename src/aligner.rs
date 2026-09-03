@@ -523,6 +523,47 @@ impl<'a> Aligner<'a> {
             diagnostics.chains = diagnostics.chains.saturating_add(saturating_u32(
                 usize::from(chain_set.primary.is_some()) + chain_set.alternatives.len(),
             ));
+            if let Some(chain) = chain_set.primary.as_ref() {
+                // Chaining picks a subset of what the scan kept, so measure the
+                // subset: these are the anchors the alignment is built from.
+                let candidate_diagonal = candidate.diagonal_mean;
+                let near = chain
+                    .anchors
+                    .iter()
+                    .filter(|anchor| {
+                        let anchor_diagonal = match candidate.strand {
+                            crate::Strand::Forward => {
+                                anchor.q_start as i64 - anchor.ref_start as i64
+                            }
+                            crate::Strand::Reverse => {
+                                anchor.q_start as i64 + anchor.ref_start as i64
+                            }
+                        };
+                        (anchor_diagonal - candidate_diagonal).abs() <= 50
+                    })
+                    .count();
+                diagnostics.chained_anchors = diagnostics
+                    .chained_anchors
+                    .saturating_add(chain.anchors.len() as u64);
+                diagnostics.chained_on_diagonal_50 = diagnostics
+                    .chained_on_diagonal_50
+                    .saturating_add(near as u64);
+                // The largest gap inside a chain is the largest event it
+                // carries rather than clips.
+                const EDGES: [u64; 7] = [16, 128, 1_000, 5_000, 20_000, 100_000, u64::MAX];
+                let ref_bucket = EDGES
+                    .iter()
+                    .position(|&edge| chain.max_ref_gap <= edge)
+                    .unwrap_or(6);
+                let query_bucket = EDGES
+                    .iter()
+                    .position(|&edge| u64::from(chain.max_query_gap) <= edge)
+                    .unwrap_or(6);
+                diagnostics.chain_ref_gap_buckets[ref_bucket] =
+                    diagnostics.chain_ref_gap_buckets[ref_bucket].saturating_add(1);
+                diagnostics.chain_query_gap_buckets[query_bucket] =
+                    diagnostics.chain_query_gap_buckets[query_bucket].saturating_add(1);
+            }
             if let Some(mut chain) = chain_set.primary.take() {
                 // Match FlashMap's fixed LR validity floor: a chain must
                 // explain at least one fifth of the read or 300 query bases.

@@ -692,11 +692,13 @@ fn find_anchors_with_seed_hits_depth(
     let hits_examined = std::cell::Cell::new(0u64);
     let extensions = std::cell::Cell::new(0u64);
     let on_diagonal = std::cell::Cell::new(0u64);
+    let on_wide_diagonal = std::cell::Cell::new(0u64);
     let anchors_on_diagonal = std::cell::Cell::new(0u64);
     // The clustering already found this: `diagonal_mean` is the mean of
     // `query - ref` over the probes that formed the region, so it is the
     // alignment's diagonal rather than the region's corner.
     let candidate_diagonal = candidate.diagonal_mean;
+    let diagonal_band = anchor_policy.diagonal_band;
     let seed_diagonal = |q: usize, r: u64| -> i64 {
         match candidate.strand {
             Strand::Forward => q as i64 - r as i64,
@@ -764,8 +766,22 @@ fn find_anchors_with_seed_hits_depth(
                 }
 
                 extensions.set(extensions.get().saturating_add(1));
-                if (seed_diagonal(q_start, ref_start) - candidate_diagonal).abs() <= 50 {
+                let drift = (seed_diagonal(q_start, ref_start) - candidate_diagonal).abs();
+                // A seed far from the diagonal the candidate was clustered on
+                // belongs to another copy of the region: chaining discards it
+                // after the extension is paid for. The band has to be wide
+                // enough to hold the events a chain legitimately carries --
+                // 13.8% span a kilobase, and both sides of one sit off a probe
+                // cluster's mean by about its size -- so this is not a
+                // tolerance but an indel ceiling.
+                if drift > diagonal_band {
+                    continue;
+                }
+                if drift <= 50 {
                     on_diagonal.set(on_diagonal.get().saturating_add(1));
+                }
+                if drift <= 5_000 {
+                    on_wide_diagonal.set(on_wide_diagonal.get().saturating_add(1));
                 }
                 let Some(anchor) = extend_exact_anchor(ExactAnchorRequest {
                     read: read.sequence,
@@ -936,6 +952,9 @@ fn find_anchors_with_seed_hits_depth(
         stats.scan_hits_examined = stats.scan_hits_examined.saturating_add(hits_examined.get());
         stats.scan_extensions = stats.scan_extensions.saturating_add(extensions.get());
         stats.scan_on_diagonal_50 = stats.scan_on_diagonal_50.saturating_add(on_diagonal.get());
+        stats.scan_on_diagonal_5000 = stats
+            .scan_on_diagonal_5000
+            .saturating_add(on_wide_diagonal.get());
         stats.anchors_on_diagonal_50 = stats
             .anchors_on_diagonal_50
             .saturating_add(anchors_on_diagonal.get());

@@ -37,6 +37,7 @@ struct Options {
     map_window: usize,
     island_lookback: Option<usize>,
     rarest_first: bool,
+    diagonal_band: Option<i64>,
     near_exact: bool,
     near_exact_dp: bool,
     limit: Option<usize>,
@@ -105,6 +106,7 @@ impl Options {
         let mut map_window = 1usize;
         let mut island_lookback: Option<usize> = None;
         let mut rarest_first = false;
+        let mut diagonal_band: Option<i64> = None;
         let mut near_exact_dp = false;
         let mut limit: Option<usize> = None;
         let mut decompress_with: Option<String> = None;
@@ -155,6 +157,12 @@ impl Options {
                 }
                 "--map-window" => {
                     map_window = parse_positive(next_value(&mut args, &argument)?, "map-window")?;
+                }
+                "--diagonal-band" => {
+                    diagonal_band = Some(parse_positive(
+                        next_value(&mut args, &argument)?,
+                        "diagonal-band",
+                    )? as i64);
                 }
                 "--rarest-first" => {
                     rarest_first = true;
@@ -337,6 +345,7 @@ impl Options {
             map_window,
             island_lookback,
             rarest_first,
+            diagonal_band,
             near_exact,
             near_exact_dp,
             limit,
@@ -478,6 +487,7 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--map-window",
     "--island-lookback",
     "--rarest-first",
+    "--diagonal-band",
     "--near-exact",
     "--near-exact-dp",
     "--query-window",
@@ -585,6 +595,9 @@ fn usage() -> &'static str {
         "      --anchor-k N          Seed length for the local anchor scan. A shorter\n",
         "                            seed than the anchor it must reach spends most of\n",
         "                            its extensions on matches that cannot (default: 15)\n",
+        "      --diagonal-band N     Skip a seed more than N bases from the candidate's\n",
+        "                            diagonal. Must exceed the indels a chain carries:\n",
+        "                            13.8% span a kilobase (default: no limit)\n",
         "      --rarest-first        Scan the index-resolved positions rarest first, so\n",
         "                            a full-span anchor can stop the scan sooner\n",
         "      --island-lookback N   Predecessors the gap island chain DP examines per\n",
@@ -1226,6 +1239,7 @@ fn execute_mapping(
         || options.map_window > 1
         || options.island_lookback.is_some()
         || options.rarest_first
+        || options.diagonal_band.is_some()
     {
         let defaults = Config::default();
         let legacy = Config {
@@ -1234,6 +1248,7 @@ fn execute_mapping(
                 sampled_anchors: options.sampled_anchors,
                 map_window: options.map_window,
                 rarest_first: options.rarest_first,
+                diagonal_band: options.diagonal_band.unwrap_or(i64::MAX),
                 near_exact_candidate: options.near_exact,
                 near_exact_dp: options.near_exact_dp,
                 query_window: options.query_window,
@@ -1415,7 +1430,12 @@ struct ProfileReporter {
     scan_hits_examined: AtomicU64,
     scan_extensions: AtomicU64,
     scan_on_diagonal_50: AtomicU64,
+    scan_on_diagonal_5000: AtomicU64,
     anchors_on_diagonal_50: AtomicU64,
+    chained_anchors: AtomicU64,
+    chained_on_diagonal_50: AtomicU64,
+    chain_ref_gap_buckets: [AtomicU64; 7],
+    chain_query_gap_buckets: [AtomicU64; 7],
     stage_a_anchors: AtomicU64,
     stage_bc_anchors: AtomicU64,
     stage_a_query_bases: AtomicU64,
@@ -1556,8 +1576,17 @@ impl DiagnosticsSink for ProfileReporter {
             (&self.scan_extensions, diagnostics.scan_extensions),
             (&self.scan_on_diagonal_50, diagnostics.scan_on_diagonal_50),
             (
+                &self.scan_on_diagonal_5000,
+                diagnostics.scan_on_diagonal_5000,
+            ),
+            (
                 &self.anchors_on_diagonal_50,
                 diagnostics.anchors_on_diagonal_50,
+            ),
+            (&self.chained_anchors, diagnostics.chained_anchors),
+            (
+                &self.chained_on_diagonal_50,
+                diagnostics.chained_on_diagonal_50,
             ),
             (&self.stage_a_anchors, u64::from(diagnostics.stage_a_anchors)),
             (&self.stage_bc_anchors, u64::from(diagnostics.stage_bc_anchors)),
@@ -1625,6 +1654,20 @@ impl DiagnosticsSink for ProfileReporter {
             ),
         ] {
             target.fetch_add(value, Ordering::Relaxed);
+        }
+        for (slot, value) in self
+            .chain_ref_gap_buckets
+            .iter()
+            .zip(diagnostics.chain_ref_gap_buckets)
+        {
+            slot.fetch_add(value, Ordering::Relaxed);
+        }
+        for (slot, value) in self
+            .chain_query_gap_buckets
+            .iter()
+            .zip(diagnostics.chain_query_gap_buckets)
+        {
+            slot.fetch_add(value, Ordering::Relaxed);
         }
         let mut observed_max_intervals = self.island_max_intervals.load(Ordering::Relaxed);
         while observed_max_intervals < u64::from(diagnostics.island_max_intervals) {
@@ -1832,10 +1875,30 @@ impl ProfileReporter {
         let near = self.scan_on_diagonal_50.load(Ordering::Relaxed);
         let kept_near = self.anchors_on_diagonal_50.load(Ordering::Relaxed);
         eprintln!(
-            "                         within 50 of the candidate's diagonal: {:.1}% of extensions, {:.1}% of anchors kept",
+            "                         within 50 of the candidate's diagonal: {:.1}% of extensions ({:.1}% within 5000), {:.1}% of anchors kept",
             100.0 * near as f64 / extended.max(1) as f64,
+            100.0 * self.scan_on_diagonal_5000.load(Ordering::Relaxed) as f64
+                / extended.max(1) as f64,
             100.0 * kept_near as f64 / (sa + sbc).max(1) as f64,
         );
+        let chained = self.chained_anchors.load(Ordering::Relaxed);
+        let chained_near = self.chained_on_diagonal_50.load(Ordering::Relaxed);
+        eprintln!(
+            "                         of the anchors a chain used, {:.1}% were within 50 of it",
+            100.0 * chained_near as f64 / chained.max(1) as f64,
+        );
+        eprintln!("  Largest event per chain: reference side / query side");
+        const GAP_LABELS: [&str; 7] = [
+            "<=16", "17-128", "129-1k", "1k-5k", "5k-20k", "20k-100k", "100k+",
+        ];
+        for (index, label) in GAP_LABELS.iter().enumerate() {
+            let refs = self.chain_ref_gap_buckets[index].load(Ordering::Relaxed);
+            let queries = self.chain_query_gap_buckets[index].load(Ordering::Relaxed);
+            if refs == 0 && queries == 0 {
+                continue;
+            }
+            eprintln!("    {label:<10} {refs:>12} deletions   {queries:>12} insertions");
+        }
         let sampled = self.sampled_lookups_admitted.load(Ordering::Relaxed);
         if sampled > 0 {
             eprintln!(
