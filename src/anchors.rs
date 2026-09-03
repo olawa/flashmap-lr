@@ -545,10 +545,11 @@ fn find_anchors_with_seed_hits_depth(
         read.sequence.len(),
         candidate,
         k,
-        window_start,
-        window_end,
-        anchor_policy.allow_sampled_anchors,
-        anchor_policy.max_seed_hits,
+        (window_start, window_end),
+        SeedHitLimits {
+            allow_sampled: anchor_policy.allow_sampled_anchors,
+            max_seed_hits: anchor_policy.max_seed_hits,
+        },
     );
     raw_minimizer_positions.sort_unstable();
     raw_minimizer_positions.dedup();
@@ -844,16 +845,28 @@ fn find_anchors_with_seed_hits_depth(
     ))
 }
 
+/// What an anchor lookup will accept from the index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SeedHitLimits {
+    /// Whether a sampled list may seed anchors here.
+    allow_sampled: bool,
+    /// Longest hit list the lookup will walk.
+    max_seed_hits: usize,
+}
+
 fn collect_matching_seed_hits(
     query_seed_hits: &CachedQuerySeedHits,
     read_len: usize,
     candidate: &CandidateRegion,
     _k: usize,
-    window_start: usize,
-    window_end: usize,
-    allow_sampled: bool,
-    max_seed_hits: usize,
+    window: (usize, usize),
+    limits: SeedHitLimits,
 ) -> (Vec<usize>, Vec<MatchingSeedHits>) {
+    let (window_start, window_end) = window;
+    let SeedHitLimits {
+        allow_sampled,
+        max_seed_hits,
+    } = limits;
     let seed_span = query_seed_hits.seed_span;
     let mut raw_minimizer_positions = Vec::new();
     let mut matching_seed_hits = Vec::new();
@@ -1660,10 +1673,11 @@ mod tests {
                         read_len,
                         &region,
                         24,
-                        window_start,
-                        window_end,
-                        false,
-                        128,
+                        (window_start, window_end),
+                        SeedHitLimits {
+                            allow_sampled: false,
+                            max_seed_hits: 128,
+                        },
                     );
                     let observed: Vec<(usize, Vec<u64>)> = matched
                         .into_iter()
