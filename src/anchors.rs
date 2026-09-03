@@ -698,7 +698,16 @@ fn find_anchors_with_seed_hits_depth(
     // `query - ref` over the probes that formed the region, so it is the
     // alignment's diagonal rather than the region's corner.
     let candidate_diagonal = candidate.diagonal_mean;
-    let diagonal_band = anchor_policy.diagonal_band;
+    // A read cannot contain an insertion longer than itself, and the window it
+    // is searched in is only the candidate plus a flank of its own length, so
+    // a seed cannot sit further from the diagonal than that either way. Taking
+    // the smaller of the two makes a band set for long reads mean something
+    // proportional on short ones instead of nothing at all.
+    let diagonal_band = if anchor_policy.diagonal_band == i64::MAX {
+        i64::MAX
+    } else {
+        anchor_policy.diagonal_band.min(read.sequence.len() as i64)
+    };
     let seed_diagonal = |q: usize, r: u64| -> i64 {
         match candidate.strand {
             Strand::Forward => q as i64 - r as i64,
