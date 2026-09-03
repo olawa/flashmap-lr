@@ -1,6 +1,5 @@
 use rs_lra::io::{
     load_reference_path, open_fastx_with_decompressor, resolve_decompressor, AlignmentSink,
-    SamWriter,
 };
 use rs_lra::{
     Aligner, AlignerConfig, AlignmentMode, CigarOp, Config, DiagnosticsSink, InMemorySeedIndex,
@@ -729,6 +728,89 @@ fn print_cap_distribution(index: &MinimizerIndex) {
     }
 }
 
+/// Renders finished reads for whichever output this run writes.
+enum RecordEncoder {
+    Sam(rs_lra::SamRecordFormatter),
+    Bam(rs_lra::bam::BamRecordEncoder),
+}
+
+impl RecordEncoder {
+    fn header(&self) -> Vec<u8> {
+        match self {
+            Self::Sam(formatter) => {
+                let mut out = Vec::new();
+                formatter
+                    .write_header(&mut out)
+                    .expect("writing a SAM header to a vector cannot fail");
+                out
+            }
+            Self::Bam(encoder) => encoder.header(),
+        }
+    }
+
+    fn encode(
+        &self,
+        batch: &[rs_lra::MappedRead],
+        out: &mut Vec<u8>,
+    ) -> Result<(), rs_lra::MapError> {
+        match self {
+            Self::Sam(formatter) => {
+                for mapped in batch {
+                    formatter
+                        .write_mapped_read(out, mapped)
+                        .map_err(|error| rs_lra::MapError::Output(error.to_string()))?;
+                }
+                Ok(())
+            }
+            Self::Bam(encoder) => {
+                encoder.encode_batch(batch, out);
+                Ok(())
+            }
+        }
+    }
+
+    /// Close the stream. A BGZF stream ends with a defined empty block, and a
+    /// reader that does not find one reports the file as truncated.
+    fn finish<W: Write>(&self, out: &mut W) -> io::Result<()> {
+        match self {
+            Self::Sam(_) => Ok(()),
+            Self::Bam(_) => rs_lra::bam::write_bgzf_eof(out),
+        }
+    }
+}
+
+/// Counts what reached the sink, for the encoding-rate line.
+struct ByteCountingSink<W: Write> {
+    inner: W,
+    bytes: u64,
+}
+
+impl<W: Write> ByteCountingSink<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, bytes: 0 }
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.bytes
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: Write> Write for ByteCountingSink<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.bytes = self.bytes.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Rough SAM bytes per read, to size the per-batch encode buffer once.
 ///
 /// A HiFi read is about 15 kb and its record carries sequence and qualities,
@@ -1119,8 +1201,17 @@ fn execute_mapping(
     .map_err(CliError::Output)?;
     // The writer owns its own copy for the header; the encoder needs one it
     // can share across workers.
-    let formatter = rs_lra::SamRecordFormatter::from_contigs(metadata.iter().cloned());
-    let mut writer = SamWriter::from_contigs(output, metadata)
+    // A BAM output is piped to `samtools sort`, which reads BAM directly. The
+    // records are already structured, so rendering them as text for it to parse
+    // back costs the formatting, the parse and about twice the bytes.
+    let encoder = if options.writes_bam() {
+        RecordEncoder::Bam(rs_lra::bam::BamRecordEncoder::from_contigs(metadata))
+    } else {
+        RecordEncoder::Sam(rs_lra::SamRecordFormatter::from_contigs(metadata))
+    };
+    let mut writer = ByteCountingSink::new(output);
+    writer
+        .write_all(&encoder.header())
         .map_err(|error| CliError::Pool(error.to_string()))?;
     let mut progress = ProgressReporter::new(options.quiet);
     let stats = aligner
@@ -1134,11 +1225,7 @@ fn execute_mapping(
                 // the sink -- on the one thread that has to serialize batch
                 // order, and so could not use the other workers at all.
                 out.reserve(batch.len() * ENCODED_BYTES_PER_READ_HINT);
-                for mapped in batch {
-                    formatter
-                        .write_mapped_read(out, mapped)
-                        .map_err(|error| rs_lra::MapError::Output(error.to_string()))?;
-                }
+                encoder.encode(batch, out)?;
                 encode_nanos.fetch_add(
                     encode_started.elapsed().as_nanos() as u64,
                     Ordering::Relaxed,
@@ -1150,22 +1237,24 @@ fn execute_mapping(
                     progress.update(mapped);
                 }
                 writer
-                    .write_encoded(&batch.encoded)
+                    .write_all(&batch.encoded)
                     .map_err(|error| error.to_string())
             },
         )
         .map_err(pool_error_to_cli)?;
-    writer
-        .finish()
+    encoder
+        .finish(&mut writer)
+        .and_then(|()| writer.finish())
         .map_err(|error| CliError::Pool(error.to_string()))?;
     progress.finish(&stats);
     if options.profile {
         profile.print();
         let seconds = encode_nanos.load(Ordering::Relaxed) as f64 / 1e9;
         eprintln!(
-            "  Record encoding:       {:.3} worker-s ({:.0} MB/s of SAM text per core)",
+            "  Record encoding:       {:.3} worker-s ({:.0} MB/s of {} per core)",
             seconds,
             writer.bytes_written() as f64 / 1e6 / seconds.max(1e-9),
+            if options.writes_bam() { "BAM" } else { "SAM text" },
         );
         // The collector is the only serial stage. Its wall time splits into
         // waiting for workers and pushing bytes at whatever consumes them, so
