@@ -192,10 +192,6 @@ struct LocalKmerMap {
 }
 
 impl LocalKmerMap {
-    fn build(sequence: &[u8], window_start: usize, k: usize) -> Self {
-        Self::build_strided(sequence, window_start, k, 1)
-    }
-
     /// Build over every `stride`-th position rather than all of them.
     ///
     /// A conservative probe for whether the map has to be dense: a stride
@@ -249,7 +245,7 @@ impl LocalKmerMap {
             }
             if run >= k {
                 let start = offset + 1 - k;
-                if stride > 1 && start % stride != 0 {
+                if stride > 1 && !start.is_multiple_of(stride) {
                     continue;
                 }
                 if packable {
