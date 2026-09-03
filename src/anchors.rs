@@ -121,6 +121,7 @@ pub(crate) fn cache_query_seed_hits(
     };
     cached.offsets.push(0);
     for &seed in query_seeds {
+        let seed_start = cached.hits.len();
         let mut callback_count = 0usize;
         let lookup = index.visit_hits(&seed, &mut |hit| {
             callback_count = callback_count.saturating_add(1);
@@ -128,6 +129,16 @@ pub(crate) fn cache_query_seed_hits(
                 cached.hits.push(hit);
             }
         });
+        // Establish the `(contig, ref_pos)` order that
+        // `collect_matching_seed_hits` binary-searches on.  A packed v13
+        // bucket already stores its hits that way, so for such an index this
+        // is one comparison pass and no sort; the sort is the fallback for a
+        // backend that reports them in another order.  Either way it runs once
+        // per read, not once per candidate region.
+        let seed_hits = &mut cached.hits[seed_start..];
+        if !seed_hits.is_sorted_by_key(|hit| (hit.contig, hit.ref_pos)) {
+            seed_hits.sort_unstable_by_key(|hit| (hit.contig, hit.ref_pos));
+        }
         cached.offsets.push(cached.hits.len());
         cached.lookups.push(lookup);
         cached.callback_counts.push(callback_count);
@@ -836,6 +847,10 @@ fn collect_matching_seed_hits(
     let seed_span = query_seed_hits.seed_span;
     let mut raw_minimizer_positions = Vec::new();
     let mut matching_seed_hits = Vec::new();
+    // A hit is inside the window when it ends at or before `window_end`.  A
+    // window shorter than one seed span can hold none, and the subtraction
+    // below would wrap.
+    let max_ref_pos = (window_end as u64).checked_sub(seed_span as u64);
     for seed_index in 0..query_seed_hits.seeds.len() {
         let seed = query_seed_hits.seeds[seed_index];
         let query_pos = seed.query_pos as usize;
@@ -844,32 +859,47 @@ fn collect_matching_seed_hits(
         }
         raw_minimizer_positions.push(query_pos);
 
-        let mut ref_positions = Vec::new();
-        let hit_start = query_seed_hits.offsets[seed_index];
-        let hit_end = query_seed_hits.offsets[seed_index + 1];
-        for &hit in &query_seed_hits.hits[hit_start..hit_end] {
-            if hit.contig != candidate.contig
-                || effective_strand(seed.strand, hit.strand) != candidate.strand
-                || hit.ref_pos < window_start as u64
-                || hit.ref_pos.saturating_add(seed_span as u64) > window_end as u64
-            {
-                continue;
-            }
-            ref_positions.push(hit.ref_pos);
-        }
         let lookup = query_seed_hits.lookups[seed_index];
         let callback_count = query_seed_hits.callback_counts[seed_index];
 
         // A capped/sampled or over-cap list is never allowed to seed a local
         // anchor. It can remain in `raw_minimizer_positions`, so staging still
-        // falls through to the verified local k-mer map.
+        // falls through to the verified local k-mer map.  Testing this before
+        // the hit list is walked only skips work whose result was discarded.
         if !matches!(lookup.completeness, crate::HitCompleteness::Complete)
             || callback_count > 128
             || lookup.reported_hits > 128
         {
             continue;
         }
-        ref_positions.sort_unstable();
+        let Some(max_ref_pos) = max_ref_pos else {
+            continue;
+        };
+
+        // `cache_query_seed_hits` leaves each seed's hits sorted by
+        // `(contig, ref_pos)`, so the hits inside this candidate's window are
+        // one contiguous run: seek to its first element rather than scanning
+        // the whole list.  The scan is repeated for every candidate region the
+        // read has, so without this the cost of a higher frequency cap is the
+        // product of list length and candidate count.
+        let hit_start = query_seed_hits.offsets[seed_index];
+        let hit_end = query_seed_hits.offsets[seed_index + 1];
+        let hits = &query_seed_hits.hits[hit_start..hit_end];
+        let first = hits.partition_point(|hit| {
+            (hit.contig, hit.ref_pos) < (candidate.contig, window_start as u64)
+        });
+        let mut ref_positions = Vec::new();
+        for &hit in &hits[first..] {
+            if hit.contig != candidate.contig || hit.ref_pos > max_ref_pos {
+                break;
+            }
+            if effective_strand(seed.strand, hit.strand) != candidate.strand {
+                continue;
+            }
+            ref_positions.push(hit.ref_pos);
+        }
+        // The run was walked in ascending `ref_pos`, so this is a duplicate
+        // pass only; `build_paired_staging` binary-searches these positions.
         ref_positions.dedup();
         if !ref_positions.is_empty() {
             matching_seed_hits.push(MatchingSeedHits {
@@ -1478,6 +1508,167 @@ mod tests {
             });
             SeedLookup::complete(1)
         }
+    }
+
+    /// The windowed seek must select exactly the hits the unconditional filter
+    /// selected.  The oracle below is the scan `collect_matching_seed_hits`
+    /// used before the hit lists were kept in `(contig, ref_pos)` order, so a
+    /// disagreement is a regression in the seek, not a change of policy.
+    fn window_filter_oracle(
+        cached: &CachedQuerySeedHits,
+        read_len: usize,
+        candidate: &CandidateRegion,
+        window_start: usize,
+        window_end: usize,
+    ) -> Vec<(usize, Vec<u64>)> {
+        let seed_span = cached.seed_span;
+        let mut selected = Vec::new();
+        for seed_index in 0..cached.seeds.len() {
+            let seed = cached.seeds[seed_index];
+            let query_pos = seed.query_pos as usize;
+            if query_pos > read_len.saturating_sub(seed_span) {
+                continue;
+            }
+            let mut ref_positions = Vec::new();
+            for &hit in cached.hits_at(seed_index) {
+                if hit.contig != candidate.contig
+                    || effective_strand(seed.strand, hit.strand) != candidate.strand
+                    || hit.ref_pos < window_start as u64
+                    || hit.ref_pos.saturating_add(seed_span as u64) > window_end as u64
+                {
+                    continue;
+                }
+                ref_positions.push(hit.ref_pos);
+            }
+            let lookup = cached.lookups[seed_index];
+            if !matches!(lookup.completeness, crate::HitCompleteness::Complete)
+                || cached.callback_counts[seed_index] > 128
+                || lookup.reported_hits > 128
+            {
+                continue;
+            }
+            ref_positions.sort_unstable();
+            ref_positions.dedup();
+            if !ref_positions.is_empty() {
+                selected.push((query_pos, ref_positions));
+            }
+        }
+        selected
+    }
+
+    /// Emits a deterministic pseudo-random hit list per seed, spread over
+    /// several contigs, both strands and positions on either side of the
+    /// window -- including hits reported out of ascending order, which the
+    /// packed reader does not produce but the cache is required to normalise.
+    struct ShuffledHitIndex {
+        hits_per_seed: usize,
+    }
+
+    impl SeedIndex for ShuffledHitIndex {
+        fn seed_span(&self) -> usize {
+            15
+        }
+
+        fn query_seeds(&self, _: &[u8]) -> Vec<QuerySeed> {
+            (0..16)
+                .map(|i| {
+                    QuerySeed::new(
+                        i * 4,
+                        if i % 3 == 0 {
+                            Strand::Reverse
+                        } else {
+                            Strand::Forward
+                        },
+                        SeedKey::new(i as u64 + 1, 0),
+                    )
+                })
+                .collect()
+        }
+
+        fn visit_hits(&self, seed: &QuerySeed, visit: &mut dyn FnMut(SeedHit)) -> SeedLookup {
+            let mut state = seed.query_pos as u64 * 2_654_435_761 + 12_345;
+            for _ in 0..self.hits_per_seed {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let draw = state >> 33;
+                // A narrow position range on purpose: the windows below then
+                // land on exact hit positions often enough to exercise both
+                // boundaries, which a sparse spread over a large reference
+                // would almost never do.
+                visit(SeedHit {
+                    contig: ContigId((draw % 3) as u32),
+                    ref_pos: (draw / 3) % 48,
+                    strand: if draw & (1 << 20) == 0 {
+                        Strand::Forward
+                    } else {
+                        Strand::Reverse
+                    },
+                });
+            }
+            SeedLookup::complete(self.hits_per_seed as u32)
+        }
+    }
+
+    #[test]
+    fn windowed_seek_selects_the_same_hits_as_a_full_scan() {
+        let index = ShuffledHitIndex { hits_per_seed: 40 };
+        let read_len = 96usize;
+        let seeds = index.query_seeds(&vec![b'A'; read_len]);
+        let cached = cache_query_seed_hits(&seeds, &index);
+
+        for seed_index in 0..seeds.len() {
+            let hits = cached.hits_at(seed_index);
+            assert!(
+                hits.is_sorted_by_key(|hit| (hit.contig, hit.ref_pos)),
+                "cache left seed {seed_index} unsorted",
+            );
+        }
+
+        let mut compared = 0usize;
+        let mut selected = 0usize;
+        for contig in 0..3u32 {
+            for strand in [Strand::Forward, Strand::Reverse] {
+                // Every window in the fixture's position range, including ones
+                // narrower than a seed span and ones whose ends coincide with
+                // a stored hit.
+                let windows = (0usize..48)
+                    .flat_map(|start| (start + 1..=48).map(move |end| (start, end)));
+                for (window_start, window_end) in windows {
+                    let mut region = candidate(48, strand);
+                    region.contig = ContigId(contig);
+                    let (_, matched) = collect_matching_seed_hits(
+                        &cached,
+                        read_len,
+                        &region,
+                        24,
+                        window_start,
+                        window_end,
+                    );
+                    let observed: Vec<(usize, Vec<u64>)> = matched
+                        .into_iter()
+                        .map(|seed| (seed.query_pos, seed.ref_positions))
+                        .collect();
+                    let expected = window_filter_oracle(
+                        &cached,
+                        read_len,
+                        &region,
+                        window_start,
+                        window_end,
+                    );
+                    assert_eq!(
+                        observed, expected,
+                        "contig {contig}, {strand:?}, window {window_start}..{window_end}",
+                    );
+                    selected += expected.iter().map(|(_, hits)| hits.len()).sum::<usize>();
+                    compared += 1;
+                }
+            }
+        }
+        // Every (start, end) window over the fixture's range, per contig and
+        // strand.
+        assert_eq!(compared, 3 * 2 * (48 * 49 / 2));
+        // Equality between two filters that both selected nothing proves
+        // nothing, so require the fixture to actually place hits in windows.
+        assert!(selected > 20, "fixture selected only {selected} hits");
     }
 
     fn candidate(len: usize, strand: Strand) -> CandidateRegion {
