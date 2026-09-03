@@ -693,7 +693,6 @@ fn find_anchors_scoped(
     let mut local_kmer_map = None;
     let mut raw_anchors = Vec::new();
     let mut coverage = AnchorCoverage::default();
-    let mut seen_seed_hits = HashSet::new();
     let mut kmer_hits = 0usize;
     let max_kmer_hits = anchor_policy
         .max_local_kmer_hits
@@ -773,7 +772,6 @@ fn find_anchors_scoped(
                           local_kmer_map: &mut Option<LocalKmerMap>,
                           raw_anchors: &mut Vec<Anchor>,
                           coverage: &mut AnchorCoverage,
-                          seen_seed_hits: &mut HashSet<(usize, u64)>,
                           kmer_hits: &mut usize,
                           full_span_found: &mut bool| {
         for &q_start in positions {
@@ -828,10 +826,7 @@ fn find_anchors_scoped(
                 }
                 *kmer_hits += 1;
                 hits_examined.set(hits_examined.get().saturating_add(1));
-                let key = (q_start, ref_start);
-                if !seen_seed_hits.insert(key) {
-                    continue;
-                }
+
                 if coverage.contains_seed(q_start, ref_start, k, candidate.strand) {
                     continue;
                 }
@@ -884,7 +879,6 @@ fn find_anchors_scoped(
         &mut local_kmer_map,
         &mut raw_anchors,
         &mut coverage,
-        &mut seen_seed_hits,
         &mut kmer_hits,
         &mut full_span_found,
     );
@@ -906,7 +900,6 @@ fn find_anchors_scoped(
             &mut local_kmer_map,
             &mut raw_anchors,
             &mut coverage,
-            &mut seen_seed_hits,
             &mut kmer_hits,
             &mut full_span_found,
         );
@@ -949,7 +942,6 @@ fn find_anchors_scoped(
             &mut local_kmer_map,
             &mut raw_anchors,
             &mut coverage,
-            &mut seen_seed_hits,
             &mut kmer_hits,
             &mut full_span_found,
         );
@@ -981,7 +973,6 @@ fn find_anchors_scoped(
             &mut local_kmer_map,
             &mut raw_anchors,
             &mut coverage,
-            &mut seen_seed_hits,
             &mut kmer_hits,
             &mut full_span_found,
         );
