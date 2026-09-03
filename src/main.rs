@@ -36,6 +36,7 @@ struct Options {
     anchor_k: Option<usize>,
     map_window: usize,
     chain_first: bool,
+    max_seed_hits: Option<usize>,
     near_exact: bool,
     near_exact_dp: bool,
     limit: Option<usize>,
@@ -103,6 +104,7 @@ impl Options {
         let mut anchor_k: Option<usize> = None;
         let mut map_window = 1usize;
         let mut chain_first = false;
+        let mut max_seed_hits: Option<usize> = None;
         let mut near_exact_dp = false;
         let mut limit: Option<usize> = None;
         let mut decompress_with: Option<String> = None;
@@ -153,6 +155,12 @@ impl Options {
                 }
                 "--map-window" => {
                     map_window = parse_positive(next_value(&mut args, &argument)?, "map-window")?;
+                }
+                "--max-seed-hits" => {
+                    max_seed_hits = Some(parse_positive(
+                        next_value(&mut args, &argument)?,
+                        "max-seed-hits",
+                    )?);
                 }
                 "--chain-first" => {
                     chain_first = true;
@@ -328,6 +336,7 @@ impl Options {
             anchor_k,
             map_window,
             chain_first,
+            max_seed_hits,
             near_exact,
             near_exact_dp,
             limit,
@@ -468,6 +477,7 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--anchor-k",
     "--map-window",
     "--chain-first",
+    "--max-seed-hits",
     "--near-exact",
     "--near-exact-dp",
     "--query-window",
@@ -575,6 +585,9 @@ fn usage() -> &'static str {
         "      --anchor-k N          Seed length for the local anchor scan. A shorter\n",
         "                            seed than the anchor it must reach spends most of\n",
         "                            its extensions on matches that cannot (default: 15)\n",
+        "      --max-seed-hits N     Longest index hit list an anchor lookup will use.\n",
+        "                            A frequent seed still resolves inside a chosen\n",
+        "                            region by seek, so the bound can be raised\n",
         "      --chain-first         Chain the index-resolved anchors first, and build\n",
         "                            the local map only over the holes it leaves\n",
         "      --map-window N        Window for the local map's minimizer selection.\n",
@@ -1183,6 +1196,7 @@ fn execute_mapping(
         || options.anchor_k.is_some()
         || options.map_window > 1
         || options.chain_first
+        || options.max_seed_hits.is_some()
     {
         let defaults = Config::default();
         let legacy = Config {
@@ -1191,6 +1205,7 @@ fn execute_mapping(
                 sampled_anchors: options.sampled_anchors,
                 map_window: options.map_window,
                 chain_first: options.chain_first,
+                max_seed_hits: options.max_seed_hits,
                 near_exact_candidate: options.near_exact,
                 near_exact_dp: options.near_exact_dp,
                 query_window: options.query_window,

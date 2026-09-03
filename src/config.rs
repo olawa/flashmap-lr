@@ -122,6 +122,8 @@ pub struct SeedingConfig {
     pub map_window: usize,
     /// Chain first, then fill only the holes the chain leaves.
     pub chain_first: bool,
+    /// Longest index hit list an anchor lookup will walk.
+    pub max_seed_hits: Option<usize>,
     /// Minimizer window used to query the index, independent of the window the
     /// index was built with. `0` uses the index's own window.
     ///
@@ -177,6 +179,7 @@ impl Default for Config {
                 sampled_anchors: false,
                 map_window: 1,
                 chain_first: false,
+                max_seed_hits: None,
                 query_window: 0,
                 segment_size: 2048,
                 segment_overlap: 512,
@@ -561,7 +564,10 @@ impl ResolvedMapperPolicy {
             emms_max_mismatch_run: config.candidates.emms_max_mismatch_run,
             emms_relock_span: config.candidates.emms_relock_span,
             allow_sampled_anchors: config.seeding.sampled_anchors,
-            max_seed_hits: if config.seeding.sampled_anchors { 512 } else { 128 },
+            max_seed_hits: config
+                .seeding
+                .max_seed_hits
+                .unwrap_or(if config.seeding.sampled_anchors { 512 } else { 128 }),
             map_window: config.seeding.map_window.max(1),
             chain_first: config.seeding.chain_first,
             ..policy.anchors
@@ -778,6 +784,7 @@ impl ResolvedMapperPolicy {
                 sampled_anchors: self.probes.sampled_anchors,
                 map_window: self.probes.map_window,
                 chain_first: self.anchors.chain_first,
+                max_seed_hits: Some(self.anchors.max_seed_hits),
             },
             candidates: CandidateConfig {
                 max_regions: self.candidates.max_regions,
