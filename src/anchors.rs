@@ -193,6 +193,16 @@ struct LocalKmerMap {
 
 impl LocalKmerMap {
     fn build(sequence: &[u8], window_start: usize, k: usize) -> Self {
+        Self::build_strided(sequence, window_start, k, 1)
+    }
+
+    /// Build over every `stride`-th position rather than all of them.
+    ///
+    /// A conservative probe for whether the map has to be dense: a stride
+    /// drops positions blindly, where a minimizer selection would drop them by
+    /// content and so keep read and reference choosing the same ones. If a
+    /// stride survives, a minimizer map certainly does.
+    fn build_strided(sequence: &[u8], window_start: usize, k: usize, stride: usize) -> Self {
         if sequence.len() < k {
             return Self::default();
         }
@@ -239,6 +249,9 @@ impl LocalKmerMap {
             }
             if run >= k {
                 let start = offset + 1 - k;
+                if stride > 1 && start % stride != 0 {
+                    continue;
+                }
                 if packable {
                     packed.push((code << offset_bits) | start as u64);
                 } else {
@@ -662,10 +675,11 @@ fn find_anchors_with_seed_hits_depth(
                 if local_kmer_map.is_none() {
                     map_builds.set(map_builds.get().saturating_add(1));
                     let build_started = std::time::Instant::now();
-                    *local_kmer_map = Some(LocalKmerMap::build(
+                    *local_kmer_map = Some(LocalKmerMap::build_strided(
                         &contig.sequence[window_start..window_end],
                         window_start,
                         k,
+                        anchor_policy.map_stride,
                     ));
                     map_nanos.set(
                         map_nanos

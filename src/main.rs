@@ -34,6 +34,7 @@ struct Options {
     reseed: bool,
     sampled_anchors: bool,
     anchor_k: Option<usize>,
+    map_stride: usize,
     near_exact: bool,
     near_exact_dp: bool,
     limit: Option<usize>,
@@ -99,6 +100,7 @@ impl Options {
         let mut reseed = false;
         let mut sampled_anchors = false;
         let mut anchor_k: Option<usize> = None;
+        let mut map_stride = 1usize;
         let mut near_exact_dp = false;
         let mut limit: Option<usize> = None;
         let mut decompress_with: Option<String> = None;
@@ -146,6 +148,9 @@ impl Options {
                         next_value(&mut args, &argument)?,
                         "anchor-k",
                     )?);
+                }
+                "--map-stride" => {
+                    map_stride = parse_positive(next_value(&mut args, &argument)?, "map-stride")?;
                 }
                 "--sampled-anchors" => {
                     sampled_anchors = true;
@@ -316,6 +321,7 @@ impl Options {
             reseed,
             sampled_anchors,
             anchor_k,
+            map_stride,
             near_exact,
             near_exact_dp,
             limit,
@@ -454,6 +460,7 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--reseed",
     "--sampled-anchors",
     "--anchor-k",
+    "--map-stride",
     "--near-exact",
     "--near-exact-dp",
     "--query-window",
@@ -561,6 +568,8 @@ fn usage() -> &'static str {
         "      --anchor-k N          Seed length for the local anchor scan. A shorter\n",
         "                            seed than the anchor it must reach spends most of\n",
         "                            its extensions on matches that cannot (default: 15)\n",
+        "      --map-stride N        Store every n-th window position in the local\n",
+        "                            k-mer map, to test how dense it has to be\n",
         "      --sampled-anchors     Let a sampled hit list seed anchors inside a\n",
         "                            chosen candidate (for a sampling cap index)\n",
         "      --reseed              Search query intervals no placement explains,\n",
@@ -1163,12 +1172,14 @@ fn execute_mapping(
         || options.reseed
         || options.sampled_anchors
         || options.anchor_k.is_some()
+        || options.map_stride > 1
     {
         let defaults = Config::default();
         let legacy = Config {
             seeding: rs_lra::SeedingConfig {
                 reseed_uncovered: options.reseed,
                 sampled_anchors: options.sampled_anchors,
+                map_stride: options.map_stride,
                 near_exact_candidate: options.near_exact,
                 near_exact_dp: options.near_exact_dp,
                 query_window: options.query_window,
