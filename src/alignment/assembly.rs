@@ -22,7 +22,7 @@ use super::prepare::{count_gap_opens, unlock_register_shifted_str_anchors, Orien
 use crate::config::{
     GapPolicy, NormalizationPolicy, ResolvedMapperPolicy, ScoringPolicy, TerminalPolicy,
 };
-use crate::dna::{base_code, encode_kmer};
+use crate::dna::base_code;
 use crate::{
     align_full, Alignment, AlignmentError, Chain, Cigar, CigarError, CigarOp, Config, Contig, Read,
 };
@@ -943,13 +943,36 @@ fn find_exact_island_chain(
 
     let mut matches = Vec::new();
     let query_step = (max_gap / 512).max(1);
-    for i in (0..=q_gap_len - k).step_by(query_step) {
-        if let Some(val) = encode_kmer(&q_gap_seq[i..i + k]) {
-            let bucket = bucket_range(val);
-            if !bucket.is_empty() && bucket.len() <= 16 {
-                for &(_, r_pos) in bucket {
-                    matches.push((i as u32, r_pos));
-                }
+    // Roll the query code the way the reference table above is built, rather
+    // than re-encoding each k-mer: `encode_kmer` is O(k) per offset, so a
+    // stride shorter than k -- which every gap below 512*k has -- pays more
+    // for the re-encodes than rolling every base costs.
+    let mut q_code = 0u64;
+    let mut q_run = 0usize;
+    for (offset, &base) in q_gap_seq.iter().enumerate() {
+        match base_code(base) {
+            Some(bits) => {
+                q_code = ((q_code << 2) | u64::from(bits)) & mask;
+                q_run += 1;
+            }
+            None => {
+                // An ambiguous base is what `encode_kmer` returned None for,
+                // so the run restarts and the k-mers spanning it are skipped.
+                q_code = 0;
+                q_run = 0;
+            }
+        }
+        if q_run < k {
+            continue;
+        }
+        let i = offset + 1 - k;
+        if !i.is_multiple_of(query_step) {
+            continue;
+        }
+        let bucket = bucket_range(q_code);
+        if !bucket.is_empty() && bucket.len() <= 16 {
+            for &(_, r_pos) in bucket {
+                matches.push((i as u32, r_pos));
             }
         }
     }
