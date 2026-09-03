@@ -120,6 +120,8 @@ pub struct SeedingConfig {
     pub sampled_anchors: bool,
     /// Window for the local map's minimizer selection. `0` or `1` stores all.
     pub map_window: usize,
+    /// Scan the index-resolved positions rarest first.
+    pub rarest_first: bool,
     /// Minimizer window used to query the index, independent of the window the
     /// index was built with. `0` uses the index's own window.
     ///
@@ -158,6 +160,9 @@ pub struct CandidateConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlignmentConfig {
+    /// Predecessors the gap island chain DP examines per interval.
+    /// `usize::MAX` leaves it unbounded, which is the historical behaviour.
+    pub island_chain_lookback: usize,
     pub bridge_flank: usize,
     pub bridge_max_gap: usize,
     /// Compatibility-only mode field.  New mapper construction uses the
@@ -174,6 +179,7 @@ impl Default for Config {
                 near_exact_dp: false,
                 sampled_anchors: false,
                 map_window: 1,
+                rarest_first: false,
                 query_window: 0,
                 segment_size: 2048,
                 segment_overlap: 512,
@@ -196,6 +202,7 @@ impl Default for Config {
                 tiered_candidates: false,
             },
             alignment: AlignmentConfig {
+                island_chain_lookback: usize::MAX,
                 bridge_flank: 256,
                 bridge_max_gap: 5_000,
                 // Sensitive is the production default. The explicit Fast
@@ -373,6 +380,8 @@ pub(crate) struct AnchorPolicy {
     pub(crate) allow_sampled_anchors: bool,
     /// Longest hit list an anchor lookup will walk.
     pub(crate) max_seed_hits: usize,
+    /// Scan the index-resolved positions rarest first.
+    pub(crate) rarest_first: bool,
     /// Window for the local map's minimizer selection. `1` stores all.
     pub(crate) map_window: usize,
 }
@@ -420,6 +429,13 @@ pub(crate) struct GapPolicy {
     pub(crate) medium_gap_dp_max: usize,
     pub(crate) medium_gap_dp_delta_max: usize,
     pub(crate) recursive_split_k: usize,
+    /// Predecessors the island chain DP examines per interval.
+    ///
+    /// The read-level chainer bounds its own look-back; this one had none,
+    /// and a repetitive gap is where the count runs away -- 144 intervals per
+    /// call on average, 1663 in the worst, which is 1.4M pairs for one gap.
+    /// `usize::MAX` is the unbounded behaviour.
+    pub(crate) island_chain_lookback: usize,
     pub(crate) recursive_split_min_gap: usize,
     pub(crate) recursive_split_max_depth: usize,
     pub(crate) recursive_split_max_gap: usize,
@@ -519,6 +535,7 @@ impl ResolvedMapperPolicy {
     pub(crate) fn from_legacy_config(config: &Config) -> Result<Self, ConfigError> {
         config.validate()?;
         let mut policy = Self::for_mode(config.alignment.mode, config.worker_pool.clone());
+        policy.gaps.island_chain_lookback = config.alignment.island_chain_lookback;
         policy.gaps.bridge_flank = config.alignment.bridge_flank;
         policy.gaps.bridge_max_gap = config.alignment.bridge_max_gap;
         policy.probes = ProbePolicy {
@@ -557,6 +574,7 @@ impl ResolvedMapperPolicy {
             allow_sampled_anchors: config.seeding.sampled_anchors,
             max_seed_hits: if config.seeding.sampled_anchors { 512 } else { 128 },
             map_window: config.seeding.map_window.max(1),
+            rarest_first: config.seeding.rarest_first,
             ..policy.anchors
         };
         policy.work_budget.max_candidates = config.candidates.max_regions.min(8);
@@ -645,6 +663,7 @@ impl ResolvedMapperPolicy {
             allow_sampled_anchors: false,
             max_seed_hits: 128,
             map_window: 1,
+            rarest_first: false,
         };
         let chaining = ChainPolicy {
             diagonal_tolerance: candidates.diagonal_tolerance,
@@ -683,6 +702,7 @@ impl ResolvedMapperPolicy {
                 medium_gap_dp_max: if mode.is_sensitive() { 4_096 } else { 2_048 },
                 medium_gap_dp_delta_max: if mode.is_sensitive() { 1_024 } else { 512 },
                 recursive_split_k: 13,
+                island_chain_lookback: usize::MAX,
                 recursive_split_min_gap: 13,
                 recursive_split_max_depth: 8,
                 recursive_split_max_gap: 1_000_000,
@@ -769,6 +789,7 @@ impl ResolvedMapperPolicy {
                 max_probe_frequency: self.probes.max_probe_frequency,
                 sampled_anchors: self.probes.sampled_anchors,
                 map_window: self.probes.map_window,
+                rarest_first: self.anchors.rarest_first,
             },
             candidates: CandidateConfig {
                 max_regions: self.candidates.max_regions,
@@ -783,6 +804,7 @@ impl ResolvedMapperPolicy {
                 tiered_candidates: self.work_budget.full_search_score_fraction > 0.0,
             },
             alignment: AlignmentConfig {
+                island_chain_lookback: self.gaps.island_chain_lookback,
                 bridge_flank: self.gaps.bridge_flank,
                 bridge_max_gap: self.gaps.bridge_max_gap,
                 mode: self.mode,

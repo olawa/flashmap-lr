@@ -35,6 +35,8 @@ struct Options {
     sampled_anchors: bool,
     anchor_k: Option<usize>,
     map_window: usize,
+    island_lookback: Option<usize>,
+    rarest_first: bool,
     near_exact: bool,
     near_exact_dp: bool,
     limit: Option<usize>,
@@ -101,6 +103,8 @@ impl Options {
         let mut sampled_anchors = false;
         let mut anchor_k: Option<usize> = None;
         let mut map_window = 1usize;
+        let mut island_lookback: Option<usize> = None;
+        let mut rarest_first = false;
         let mut near_exact_dp = false;
         let mut limit: Option<usize> = None;
         let mut decompress_with: Option<String> = None;
@@ -151,6 +155,15 @@ impl Options {
                 }
                 "--map-window" => {
                     map_window = parse_positive(next_value(&mut args, &argument)?, "map-window")?;
+                }
+                "--rarest-first" => {
+                    rarest_first = true;
+                }
+                "--island-lookback" => {
+                    island_lookback = Some(parse_positive(
+                        next_value(&mut args, &argument)?,
+                        "island-lookback",
+                    )?);
                 }
                 "--sampled-anchors" => {
                     sampled_anchors = true;
@@ -322,6 +335,8 @@ impl Options {
             sampled_anchors,
             anchor_k,
             map_window,
+            island_lookback,
+            rarest_first,
             near_exact,
             near_exact_dp,
             limit,
@@ -461,6 +476,8 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--sampled-anchors",
     "--anchor-k",
     "--map-window",
+    "--island-lookback",
+    "--rarest-first",
     "--near-exact",
     "--near-exact-dp",
     "--query-window",
@@ -568,6 +585,11 @@ fn usage() -> &'static str {
         "      --anchor-k N          Seed length for the local anchor scan. A shorter\n",
         "                            seed than the anchor it must reach spends most of\n",
         "                            its extensions on matches that cannot (default: 15)\n",
+        "      --rarest-first        Scan the index-resolved positions rarest first, so\n",
+        "                            a full-span anchor can stop the scan sooner\n",
+        "      --island-lookback N   Predecessors the gap island chain DP examines per\n",
+        "                            interval. Unbounded by default; a repetitive gap\n",
+        "                            can otherwise reach 1663 intervals in one call\n",
         "      --map-window N        Window for the local map's minimizer selection.\n",
         "                            A wider window stores fewer positions (default: 1)\n",
         "      --sampled-anchors     Let a sampled hit list seed anchors inside a\n",
@@ -1202,6 +1224,8 @@ fn execute_mapping(
         || options.sampled_anchors
         || options.anchor_k.is_some()
         || options.map_window > 1
+        || options.island_lookback.is_some()
+        || options.rarest_first
     {
         let defaults = Config::default();
         let legacy = Config {
@@ -1209,6 +1233,7 @@ fn execute_mapping(
                 reseed_uncovered: options.reseed,
                 sampled_anchors: options.sampled_anchors,
                 map_window: options.map_window,
+                rarest_first: options.rarest_first,
                 near_exact_candidate: options.near_exact,
                 near_exact_dp: options.near_exact_dp,
                 query_window: options.query_window,
@@ -1224,6 +1249,9 @@ fn execute_mapping(
             },
             alignment: rs_lra::AlignmentConfig {
                 mode: options.mode,
+                island_chain_lookback: options
+                    .island_lookback
+                    .unwrap_or(defaults.alignment.island_chain_lookback),
                 ..defaults.alignment
             },
             worker_pool: mapper_config.runtime.clone(),
@@ -1367,6 +1395,9 @@ struct ProfileReporter {
     flank_dp_nanos: AtomicU64,
     exact_island_calls: AtomicU64,
     exact_island_nanos: AtomicU64,
+    island_intervals: AtomicU64,
+    island_interval_pairs: AtomicU64,
+    island_max_intervals: AtomicU64,
     exact_island_max_bucket: AtomicU64,
     exact_island_rejected_buckets: AtomicU64,
     terminal_dp_calls: AtomicU64,
@@ -1475,6 +1506,11 @@ impl DiagnosticsSink for ProfileReporter {
                 diagnostics.exact_island_calls as u64,
             ),
             (&self.exact_island_nanos, diagnostics.exact_island_nanos),
+            (&self.island_intervals, diagnostics.island_intervals),
+            (
+                &self.island_interval_pairs,
+                diagnostics.island_interval_pairs,
+            ),
             (
                 &self.exact_island_rejected_buckets,
                 diagnostics.exact_island_rejected_buckets as u64,
@@ -1590,6 +1626,18 @@ impl DiagnosticsSink for ProfileReporter {
         ] {
             target.fetch_add(value, Ordering::Relaxed);
         }
+        let mut observed_max_intervals = self.island_max_intervals.load(Ordering::Relaxed);
+        while observed_max_intervals < u64::from(diagnostics.island_max_intervals) {
+            match self.island_max_intervals.compare_exchange_weak(
+                observed_max_intervals,
+                u64::from(diagnostics.island_max_intervals),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => observed_max_intervals = current,
+            }
+        }
         let mut observed_max_bucket = self.exact_island_max_bucket.load(Ordering::Relaxed);
         while observed_max_bucket < diagnostics.exact_island_max_bucket as u64 {
             match self.exact_island_max_bucket.compare_exchange_weak(
@@ -1700,6 +1748,15 @@ impl ProfileReporter {
             self.exact_island_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
             self.exact_island_max_bucket.load(Ordering::Relaxed),
             self.exact_island_rejected_buckets.load(Ordering::Relaxed),
+        );
+        let intervals = self.island_intervals.load(Ordering::Relaxed);
+        let pairs = self.island_interval_pairs.load(Ordering::Relaxed);
+        eprintln!(
+            "                         chain DP: {} intervals ({:.1}/call), {} pairs compared, worst call {}",
+            intervals,
+            intervals as f64 / self.exact_island_calls.load(Ordering::Relaxed).max(1) as f64,
+            pairs,
+            self.island_max_intervals.load(Ordering::Relaxed),
         );
         eprintln!(
             "  Terminal rescue:       {} DP ({:.3} s) / {} recursive ({:.3} s)",

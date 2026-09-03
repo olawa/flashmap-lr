@@ -795,9 +795,17 @@ fn try_append_exact_island_chain(
         gap_policy.recursive_split_k,
         max_gap,
         diagnostics.as_ref().is_some_and(|stats| stats.profiling),
+        gap_policy.island_chain_lookback,
     );
     if let Some(stats) = reborrow_diagnostics(diagnostics) {
         stats.exact_island_calls = stats.exact_island_calls.saturating_add(1);
+        stats.island_intervals = stats
+            .island_intervals
+            .saturating_add(u64::from(island_search.intervals));
+        stats.island_interval_pairs = stats
+            .island_interval_pairs
+            .saturating_add(island_search.compared);
+        stats.island_max_intervals = stats.island_max_intervals.max(island_search.intervals);
         stats.exact_island_nanos = stats
             .exact_island_nanos
             .saturating_add(
@@ -858,6 +866,10 @@ struct ExactIslandSearch {
     chain: Option<Vec<(usize, usize, usize)>>,
     max_bucket: usize,
     rejected_buckets: usize,
+    /// Intervals handed to the chain DP, which is quadratic in them.
+    intervals: u32,
+    /// Pairs the DP actually compared, which the look-back bounds.
+    compared: u64,
 }
 
 fn find_exact_island_chain(
@@ -866,6 +878,7 @@ fn find_exact_island_chain(
     k: usize,
     max_gap: usize,
     collect_stats: bool,
+    lookback: usize,
 ) -> ExactIslandSearch {
     let q_gap_len = q_gap_seq.len();
     let r_gap_len = r_gap_seq.len();
@@ -873,6 +886,8 @@ fn find_exact_island_chain(
         chain: None,
         max_bucket: 0,
         rejected_buckets: 0,
+        intervals: 0,
+        compared: 0,
     };
     if q_gap_len < k || r_gap_len < k {
         return search;
@@ -1016,6 +1031,12 @@ fn find_exact_island_chain(
         return search;
     }
 
+    // The chain DP below is quadratic in the intervals it is given, and
+    // nothing bounds that count directly -- it follows from bucket sizes and
+    // the query stride. Carry it out so the shape can be judged before it is
+    // changed.
+    search.intervals = intervals.len() as u32;
+    let mut compared = 0u64;
     let mut dp = vec![0i32; intervals.len()];
     let mut parent = vec![None; intervals.len()];
     let mut best_idx = 0;
@@ -1024,7 +1045,18 @@ fn find_exact_island_chain(
     for j in 0..intervals.len() {
         let (q_j, r_j, l_j) = intervals[j];
         dp[j] = l_j as i32;
-        for i in 0..j {
+        // Bound the look-back the way the read-level chainer does. Without it
+        // this is quadratic in a count nothing constrains: 144 intervals per
+        // call on average but 1663 in the worst, which is 1.4M pairs for one
+        // gap. The intervals are sorted by query start, so the nearest
+        // predecessors are the ones examined first and a bound drops the
+        // distant ones a colinear chain would not have used.
+        // Narrow the window rather than reverse it: the DP resolves ties by
+        // taking the first predecessor it finds, so walking the same order
+        // from a later start keeps the unbounded result identical when the
+        // bound does not bite.
+        for i in j.saturating_sub(lookback)..j {
+            compared += 1;
             let (q_i, r_i, l_i) = intervals[i];
             if q_i + l_i <= q_j && r_i + l_i <= r_j {
                 let dq = q_j - (q_i + l_i);
@@ -1060,6 +1092,9 @@ fn find_exact_island_chain(
         }
         chain.reverse();
         search.chain = Some(chain);
+    }
+    search.compared = compared;
+    {
     }
     search
 }

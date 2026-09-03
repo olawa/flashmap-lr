@@ -36,6 +36,12 @@ pub struct ReadDiagnostics {
     pub flank_dp_nanos: u64,
     pub exact_island_calls: u32,
     pub exact_island_nanos: u64,
+    /// Intervals the island chain DP was given, the pairs it therefore
+    /// compared, and the worst single call. The DP is quadratic in the first,
+    /// and nothing bounds it directly.
+    pub island_intervals: u64,
+    pub island_interval_pairs: u64,
+    pub island_max_intervals: u32,
     pub exact_island_max_bucket: u32,
     pub exact_island_rejected_buckets: u32,
     pub terminal_dp_calls: u32,
