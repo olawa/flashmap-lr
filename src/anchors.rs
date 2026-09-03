@@ -15,6 +15,7 @@ use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt, FxHashSet as HashSet, Fx
 
 use crate::config::{AnchorPolicy, ResolvedMapperPolicy};
 use crate::dna::{base_code, encode_kmer};
+use crate::minimizer_index::hash_code;
 use crate::{
     CandidateRegion, Config, ContigId, QuerySeed, Read, Reference, SeedHit, SeedIndex, SeedLookup,
     Strand,
@@ -191,34 +192,91 @@ struct LocalKmerMap {
     positions: Vec<u64>,
 }
 
-impl LocalKmerMap {
-    /// Build over every `stride`-th position rather than all of them.
-    ///
-    /// A conservative probe for whether the map has to be dense: a stride
-    /// drops positions blindly, where a minimizer selection would drop them by
-    /// content and so keep read and reference choosing the same ones. If a
-    /// stride survives, a minimizer map certainly does.
-    fn build_strided(sequence: &[u8], window_start: usize, k: usize, stride: usize) -> Self {
-        if sequence.len() < k {
-            return Self::default();
+/// Visit the hash-minimizer of every `window` consecutive k-mers.
+///
+/// The ordering is the index's: `hash_code` of the canonical k-mer, so a
+/// position the index selected at its own wider window is selected here too --
+/// a minimizer of a wide window is the minimum of every narrower window
+/// containing it. That is what lets the reference map and the read's scan
+/// shrink together without choosing different positions.
+///
+/// A window of `0` or `1` visits every position, which is the dense case.
+fn for_each_minimizer<F: FnMut(usize, u64)>(sequence: &[u8], k: usize, window: usize, mut visit: F) {
+    if k == 0 || k > 32 || sequence.len() < k {
+        return;
+    }
+    let mask = if k == 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * k)) - 1
+    };
+    let dense = window <= 1;
+    let mut deque: std::collections::VecDeque<(usize, u64, u64)> = std::collections::VecDeque::new();
+    let mut last_emitted: Option<usize> = None;
+    let mut fwd = 0u64;
+    let mut rc = 0u64;
+    let mut run = 0usize;
+    let mut kmers = 0usize;
+    for (offset, &base) in sequence.iter().enumerate() {
+        match base_code(base) {
+            Some(bits) => {
+                fwd = ((fwd << 2) | u64::from(bits)) & mask;
+                rc = (rc >> 2) | (u64::from(3 - bits) << (2 * (k - 1)));
+                run += 1;
+            }
+            None => {
+                // An ambiguous base ends the run and the window with it: a
+                // minimizer may not be chosen across a gap in the sequence.
+                fwd = 0;
+                rc = 0;
+                run = 0;
+                deque.clear();
+                last_emitted = None;
+                kmers = 0;
+                continue;
+            }
         }
+        if run < k {
+            continue;
+        }
+        let start = offset + 1 - k;
+        if dense {
+            visit(start, fwd);
+            continue;
+        }
+        let key = hash_code(fwd.min(rc));
+        while deque.back().is_some_and(|&(_, back_key, _)| back_key > key) {
+            deque.pop_back();
+        }
+        deque.push_back((kmers, key, fwd));
+        let window_start = (kmers + 1).saturating_sub(window);
+        while deque.front().is_some_and(|&(index, _, _)| index < window_start) {
+            deque.pop_front();
+        }
+        if kmers + 1 >= window {
+            if let Some(&(index, _, code)) = deque.front() {
+                if last_emitted != Some(index) {
+                    visit(start - (kmers - index), code);
+                    last_emitted = Some(index);
+                }
+            }
+        }
+        kmers += 1;
+    }
+}
 
-        if k > 32 {
+impl LocalKmerMap {
+    /// Build over the hash-minimizers of every `window` k-mers.
+    ///
+    /// A window of 1 stores every position, which is what the dense map did.
+    /// Above that the map shrinks while read and reference keep choosing the
+    /// same positions, because the selection is by content rather than by
+    /// stride -- and the index's own positions survive, since a minimizer of
+    /// its wider window is a minimizer of this narrower one.
+    fn build_minimizers(sequence: &[u8], window_start: usize, k: usize, window: usize) -> Self {
+        if sequence.len() < k || k > 32 {
             return Self::default();
         }
-        // Roll the two-bit code across the window instead of re-encoding each
-        // k-mer from scratch: `encode_kmer` is O(k) per offset, so a rebuilt
-        // window costs one base decode per (offset, k) pair rather than one
-        // per base.  An ambiguous base resets the run, which reproduces
-        // `encode_kmer` returning `None` for any window containing it.
-        let mask = if k == 32 {
-            u64::MAX
-        } else {
-            (1u64 << (2 * k)) - 1
-        };
-        // A code occupies 2k bits, so when the remaining bits can address the
-        // window the (code, offset) pair packs into one u64 and the grouping
-        // sort moves half as many bytes with a plain integer comparison.
         let offset_bits = 64 - 2 * k;
         let capacity = sequence.len() - k + 1;
         let packable = offset_bits >= 1 && (capacity as u128) <= (1u128 << offset_bits);
@@ -228,33 +286,16 @@ impl LocalKmerMap {
             0
         };
 
-        let mut packed: Vec<u64> = Vec::with_capacity(if packable { capacity } else { 0 });
-        let mut pairs: Vec<(u64, u64)> = Vec::with_capacity(if packable { 0 } else { capacity });
-        let mut code = 0u64;
-        let mut run = 0usize;
-        for (offset, &base) in sequence.iter().enumerate() {
-            match base_code(base) {
-                Some(bits) => {
-                    code = ((code << 2) | u64::from(bits)) & mask;
-                    run += 1;
-                }
-                None => {
-                    code = 0;
-                    run = 0;
-                }
+        let reserve = capacity / window.max(1) + 16;
+        let mut packed: Vec<u64> = Vec::with_capacity(if packable { reserve } else { 0 });
+        let mut pairs: Vec<(u64, u64)> = Vec::with_capacity(if packable { 0 } else { reserve });
+        for_each_minimizer(sequence, k, window, |start, code| {
+            if packable {
+                packed.push((code << offset_bits) | start as u64);
+            } else {
+                pairs.push((code, (window_start + start) as u64));
             }
-            if run >= k {
-                let start = offset + 1 - k;
-                if stride > 1 && !start.is_multiple_of(stride) {
-                    continue;
-                }
-                if packable {
-                    packed.push((code << offset_bits) | start as u64);
-                } else {
-                    pairs.push((code, (window_start + start) as u64));
-                }
-            }
-        }
+        });
 
         let mut codes;
         let mut positions;
@@ -671,11 +712,11 @@ fn find_anchors_with_seed_hits_depth(
                 if local_kmer_map.is_none() {
                     map_builds.set(map_builds.get().saturating_add(1));
                     let build_started = std::time::Instant::now();
-                    *local_kmer_map = Some(LocalKmerMap::build_strided(
+                    *local_kmer_map = Some(LocalKmerMap::build_minimizers(
                         &contig.sequence[window_start..window_end],
                         window_start,
                         k,
-                        anchor_policy.map_stride,
+                        anchor_policy.map_window,
                     ));
                     map_nanos.set(
                         map_nanos
@@ -838,9 +879,20 @@ fn find_anchors_with_seed_hits_depth(
     {
         entered_c = true;
         // Stage C: dense positions not already visited as minimizers.
-        let dense: Vec<usize> = (0..=scan_end)
-            .filter(|pos| raw_minimizer_positions.binary_search(pos).is_err())
-            .collect();
+        // The map only holds positions this selection chose, so scanning any
+        // others is a lookup that cannot hit. Both sides shrink together.
+        let mut dense: Vec<usize> = Vec::new();
+        if anchor_policy.map_window <= 1 {
+            dense.extend(
+                (0..=scan_end).filter(|pos| raw_minimizer_positions.binary_search(pos).is_err()),
+            );
+        } else {
+            for_each_minimizer(read.sequence, k, anchor_policy.map_window, |start, _| {
+                if start <= scan_end && raw_minimizer_positions.binary_search(&start).is_err() {
+                    dense.push(start);
+                }
+            });
+        }
         scan_positions(
             &dense,
             &mut local_kmer_map,

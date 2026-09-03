@@ -118,8 +118,8 @@ pub struct SeedingConfig {
     pub near_exact_dp: bool,
     /// Let a sampled hit list seed anchors inside a chosen candidate region.
     pub sampled_anchors: bool,
-    /// Store every n-th position in the local k-mer map. `0` or `1` stores all.
-    pub map_stride: usize,
+    /// Window for the local map's minimizer selection. `0` or `1` stores all.
+    pub map_window: usize,
     /// Minimizer window used to query the index, independent of the window the
     /// index was built with. `0` uses the index's own window.
     ///
@@ -173,7 +173,7 @@ impl Default for Config {
                 near_exact_candidate: false,
                 near_exact_dp: false,
                 sampled_anchors: false,
-                map_stride: 1,
+                map_window: 1,
                 query_window: 0,
                 segment_size: 2048,
                 segment_overlap: 512,
@@ -319,7 +319,7 @@ pub(crate) struct ProbePolicy {
     pub(crate) near_exact_candidate: bool,
     pub(crate) near_exact_dp: bool,
     pub(crate) sampled_anchors: bool,
-    pub(crate) map_stride: usize,
+    pub(crate) map_window: usize,
     pub(crate) near_exact_dp_max_drift: usize,
     pub(crate) near_exact_dp_band_slack: usize,
     pub(crate) near_exact_dp_max_divergence: f64,
@@ -373,8 +373,8 @@ pub(crate) struct AnchorPolicy {
     pub(crate) allow_sampled_anchors: bool,
     /// Longest hit list an anchor lookup will walk.
     pub(crate) max_seed_hits: usize,
-    /// Store every n-th window position in the local map instead of all.
-    pub(crate) map_stride: usize,
+    /// Window for the local map's minimizer selection. `1` stores all.
+    pub(crate) map_window: usize,
 }
 
 /// Startup-resolved Minimap-DP chaining policy.
@@ -528,7 +528,7 @@ impl ResolvedMapperPolicy {
             near_exact_candidate: config.seeding.near_exact_candidate,
             near_exact_dp: config.seeding.near_exact_dp,
             sampled_anchors: config.seeding.sampled_anchors,
-            map_stride: config.seeding.map_stride.max(1),
+            map_window: config.seeding.map_window.max(1),
             near_exact_dp_max_drift: policy.probes.near_exact_dp_max_drift,
             near_exact_dp_band_slack: policy.probes.near_exact_dp_band_slack,
             near_exact_dp_max_divergence: policy.probes.near_exact_dp_max_divergence,
@@ -556,7 +556,7 @@ impl ResolvedMapperPolicy {
             emms_relock_span: config.candidates.emms_relock_span,
             allow_sampled_anchors: config.seeding.sampled_anchors,
             max_seed_hits: if config.seeding.sampled_anchors { 512 } else { 128 },
-            map_stride: config.seeding.map_stride.max(1),
+            map_window: config.seeding.map_window.max(1),
             ..policy.anchors
         };
         policy.work_budget.max_candidates = config.candidates.max_regions.min(8);
@@ -575,7 +575,7 @@ impl ResolvedMapperPolicy {
     fn for_mode(mode: AlignmentMode, runtime: RuntimeConfig) -> Self {
         let probes = ProbePolicy {
             sampled_anchors: false,
-            map_stride: 1,
+            map_window: 1,
             // Default to the index's own window so a decoupled query is an
             // explicit choice, measured per index, rather than a silent change
             // in which seeds every existing caller sees.
@@ -644,7 +644,7 @@ impl ResolvedMapperPolicy {
             sufficient_coverage_permille: 350,
             allow_sampled_anchors: false,
             max_seed_hits: 128,
-            map_stride: 1,
+            map_window: 1,
         };
         let chaining = ChainPolicy {
             diagonal_tolerance: candidates.diagonal_tolerance,
@@ -768,7 +768,7 @@ impl ResolvedMapperPolicy {
                 max_total_hits_scanned: self.probes.max_total_hits_scanned,
                 max_probe_frequency: self.probes.max_probe_frequency,
                 sampled_anchors: self.probes.sampled_anchors,
-                map_stride: self.probes.map_stride,
+                map_window: self.probes.map_window,
             },
             candidates: CandidateConfig {
                 max_regions: self.candidates.max_regions,

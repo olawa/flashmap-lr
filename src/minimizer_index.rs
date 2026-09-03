@@ -1202,7 +1202,7 @@ fn reverse_complement_code(code: u64, k: usize) -> u64 {
 }
 
 #[inline]
-fn hash_code(code: u64) -> u64 {
+pub(crate) fn hash_code(code: u64) -> u64 {
     xxh64(&code.to_le_bytes(), 42)
 }
 
