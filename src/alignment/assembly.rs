@@ -649,7 +649,13 @@ fn append_gap_recursive(
         && delta <= medium_gap_dp_delta_max
         && query_len.saturating_mul(reference_len) <= 16_000_000
     {
-        let band = delta.saturating_add(32).clamp(32, 256);
+        // KSW2 restricts the alignment to |i - j| <= band, so a band below
+        // the length difference cannot represent the indel the gate above
+        // just admitted. The clamp used to stop at 256 while the gate let
+        // delta reach 512, which silently truncated every indel in between.
+        let band = delta
+            .saturating_add(32)
+            .clamp(32, medium_gap_dp_delta_max.saturating_add(32));
         if let Some(alignment) = run_gap_dp(
             query_slice,
             reference_slice,

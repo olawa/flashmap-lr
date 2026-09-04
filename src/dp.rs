@@ -372,3 +372,39 @@ mod tests {
             .any(|op| matches!(op, CigarOp::Ins(1))));
     }
 }
+
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+
+    /// KSW2 restricts the alignment to `|i - j| <= band`, so a band narrower
+    /// than the length difference has no path that spells the indel. The
+    /// medium gap stage used to clamp its band at 256 while admitting a delta
+    /// of up to 512, which is this test's gap.
+    #[test]
+    fn a_band_narrower_than_the_indel_cannot_spell_it() {
+        let unit = b"GATTACACGCTAGCTTACGGTCAAGCTTGAC";
+        let reference: Vec<u8> = unit.iter().cycle().take(1_000).copied().collect();
+        let mut query = reference[..300].to_vec();
+        query.extend_from_slice(&reference[700..1_000]);
+
+        let deletion = |band: usize| -> Option<u32> {
+            Some(
+                align_full(&query, &reference, band)?
+                    .cigar
+                    .ops()
+                    .iter()
+                    .filter_map(|op| match op {
+                        crate::CigarOp::Del(len) => Some(*len),
+                        _ => None,
+                    })
+                    .sum(),
+            )
+        };
+
+        // Not a truncated alignment: no alignment at all, so the stage that
+        // asked for it is skipped and the gap falls through to a coarser one.
+        assert_eq!(deletion(256), None, "a 256 band has no path to 400 bases");
+        assert_eq!(deletion(432), Some(400), "a band above the delta has one");
+    }
+}
