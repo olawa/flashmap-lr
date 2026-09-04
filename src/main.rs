@@ -44,6 +44,7 @@ struct Options {
     diagonal_band: Option<i64>,
     near_exact: bool,
     near_exact_dp: bool,
+    lazy_seed_cache: bool,
     limit: Option<usize>,
     decompress_with: Option<String>,
 }
@@ -116,6 +117,7 @@ impl Options {
         let mut rarest_first = false;
         let mut diagonal_band: Option<i64> = None;
         let mut near_exact_dp = false;
+        let mut lazy_seed_cache = false;
         let mut limit: Option<usize> = None;
         let mut decompress_with: Option<String> = None;
         let mut explicit_mode = None;
@@ -213,6 +215,9 @@ impl Options {
                 }
                 "--near-exact" => {
                     near_exact = true;
+                }
+                "--lazy-seed-cache" => {
+                    lazy_seed_cache = true;
                 }
                 "--near-exact-dp" => {
                     near_exact = true;
@@ -385,6 +390,7 @@ impl Options {
             diagonal_band,
             near_exact,
             near_exact_dp,
+            lazy_seed_cache,
             limit,
             decompress_with,
         })
@@ -531,6 +537,7 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--diagonal-band",
     "--near-exact",
     "--near-exact-dp",
+    "--lazy-seed-cache",
     "--query-window",
     "--fast",
     "--standard",
@@ -640,6 +647,12 @@ fn usage() -> &'static str {
         "                            agree on one diagonal, skipping probe clustering\n",
         "      --near-exact-dp       As --near-exact, and align the locked region in\n",
         "                            one banded pass instead of finding anchors\n",
+        "      --lazy-seed-cache     Resolve only the read's end windows before that\n",
+        "                            lock, and the rest only for a read its banded\n",
+        "                            pass declines. The lock reads nothing else,\n",
+        "                            so the rest is built for no reason when the\n",
+        "                            pass takes the read. Needs the banded pass\n",
+        "                            above; output is unchanged (default: off)\n",
         "      --anchor-k N          Seed length for the local anchor scan. A shorter\n",
         "                            seed than the anchor it must reach spends most of\n",
         "                            its extensions on matches that cannot (default: 15)\n",
@@ -798,6 +811,7 @@ fn describe_settings(options: &Options) -> String {
     flag(options.reseed, "reseed");
     flag(options.near_exact, "near-exact");
     flag(options.near_exact_dp, "near-exact-dp");
+    flag(options.lazy_seed_cache, "lazy-seed-cache");
     flag(options.paired_emms, "paired-emms");
     flag(options.tiered_candidates, "tiered-candidates");
     if let Some(flank) = options.overlap_flank {
@@ -1379,6 +1393,7 @@ fn execute_mapping(
                 diagonal_band: options.diagonal_band.unwrap_or(i64::MAX),
                 near_exact_candidate: options.near_exact,
                 near_exact_dp: options.near_exact_dp,
+                lazy_seed_cache: options.lazy_seed_cache,
                 query_window: options.query_window,
                 ..defaults.seeding
             },
@@ -1610,6 +1625,7 @@ struct ProfileReporter {
     anchor_overlaps_trimmed: AtomicU64,
     anchor_overlaps_removed: AtomicU64,
     anchor_overlap_flanked_bases: AtomicU64,
+    lazy_seed_cache_rebuilds: AtomicU64,
     anchor_runs_dissolved: AtomicU64,
     anchors_dissolved: AtomicU64,
     chain_query_gap_buckets: [AtomicU64; 7],
@@ -1859,6 +1875,10 @@ impl DiagnosticsSink for ProfileReporter {
             (
                 &self.anchor_overlap_flanked_bases,
                 diagnostics.anchor_overlap_flanked_bases,
+            ),
+            (
+                &self.lazy_seed_cache_rebuilds,
+                diagnostics.lazy_seed_cache_rebuilds as u64,
             ),
             (
                 &self.anchor_runs_dissolved,
@@ -2141,6 +2161,12 @@ impl ProfileReporter {
         if flanked > 0 {
             eprintln!(
                 "  Overlap flank:         {flanked} anchor bases handed to the gap DP as context"
+            );
+        }
+        let rebuilds = self.lazy_seed_cache_rebuilds.load(Ordering::Relaxed);
+        if rebuilds > 0 {
+            eprintln!(
+                "  Lazy seed cache:       {rebuilds} reads the banded pass declined, rebuilt in full"
             );
         }
         let runs = self.anchor_runs_dissolved.load(Ordering::Relaxed);

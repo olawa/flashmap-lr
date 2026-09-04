@@ -194,8 +194,24 @@ impl<'a> Aligner<'a> {
         // Every remaining phase needs the same read-global seed hits, and
         // `lookup` and `visit_hits` run the same table probe, so resolve each
         // query minimizer exactly once here.
+        // The two-ended lock reads only the read's end windows, and when its
+        // banded pass takes the read nothing else reads the cache at all. Under
+        // --lazy-seed-cache the windows are resolved first and the rest only
+        // for a read the pass declines.
         let phase_started = phase_timer(profiling);
-        let query_seed_hits = cache_query_seed_hits(&query_seeds, self.index);
+        let lazy = self.policy.probes.lazy_seed_cache
+            && self.policy.probes.near_exact_candidate
+            && self.policy.probes.near_exact_dp;
+        let mut query_seed_hits = if lazy {
+            crate::anchors::cache_endpoint_seed_hits(
+                &query_seeds,
+                self.index,
+                read.sequence.len(),
+                self.policy.probes.endpoint_window,
+            )
+        } else {
+            cache_query_seed_hits(&query_seeds, self.index)
+        };
         diagnostics.seed_cache_nanos = phase_nanos(phase_started);
         if profiling {
             probe_near_exact_potential(
@@ -267,6 +283,17 @@ impl<'a> Aligner<'a> {
                     },
                 });
             }
+        }
+
+        // Past the banded pass, every remaining phase needs the whole read's
+        // hits, so an end-window cache has to become a full one here.
+        if lazy {
+            let phase_started = phase_timer(profiling);
+            query_seed_hits = cache_query_seed_hits(&query_seeds, self.index);
+            diagnostics.seed_cache_nanos = diagnostics
+                .seed_cache_nanos
+                .saturating_add(phase_nanos(phase_started));
+            diagnostics.lazy_seed_cache_rebuilds = 1;
         }
 
         let candidates = if let Some(candidate) = locked {

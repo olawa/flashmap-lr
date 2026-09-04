@@ -108,6 +108,69 @@ impl CachedQuerySeedHits {
     }
 }
 
+/// Resolve only the seeds in the read's two end windows.
+///
+/// The two-ended lock reads nothing else -- it keeps a seed only when it falls
+/// in the first or last `window` bases -- but the full cache resolves every
+/// query minimizer against the index before the lock is even attempted. On a
+/// 14.8 kb read the windows are about a seventh of it, and when the locked
+/// region's banded pass succeeds the rest is never read at all.
+///
+/// A seed outside the windows is recorded as `Absent` with no hits, which is
+/// what the lock already skips. The cache is therefore only good for the lock:
+/// a read the lock declines must rebuild it in full before anything else uses
+/// it.
+pub(crate) fn cache_endpoint_seed_hits(
+    query_seeds: &[QuerySeed],
+    index: &dyn SeedIndex,
+    read_len: usize,
+    endpoint_window: usize,
+) -> CachedQuerySeedHits {
+    let seed_span = index.seed_span();
+    let window = endpoint_window.min(read_len / 2);
+    let mut cached = CachedQuerySeedHits {
+        seed_span,
+        seeds: query_seeds.to_vec(),
+        offsets: Vec::with_capacity(query_seeds.len() + 1),
+        hits: Vec::new(),
+        lookups: Vec::with_capacity(query_seeds.len()),
+        callback_counts: Vec::with_capacity(query_seeds.len()),
+    };
+    cached.offsets.push(0);
+    let right_window_start = read_len.saturating_sub(window);
+    for &seed in query_seeds {
+        let position = seed.query_pos as usize;
+        let in_window = window > 0
+            && read_len >= 2 * window
+            && (position < window || position >= right_window_start);
+        if !in_window {
+            cached.offsets.push(cached.hits.len());
+            cached.lookups.push(SeedLookup {
+                completeness: crate::HitCompleteness::Absent,
+                reported_hits: 0,
+            });
+            cached.callback_counts.push(0);
+            continue;
+        }
+        let seed_start = cached.hits.len();
+        let mut callback_count = 0usize;
+        let lookup = index.visit_hits(&seed, &mut |hit| {
+            callback_count = callback_count.saturating_add(1);
+            if callback_count <= 128 {
+                cached.hits.push(hit);
+            }
+        });
+        let seed_hits = &mut cached.hits[seed_start..];
+        if !seed_hits.is_sorted_by_key(|hit| (hit.contig, hit.ref_pos)) {
+            seed_hits.sort_unstable_by_key(|hit| (hit.contig, hit.ref_pos));
+        }
+        cached.offsets.push(cached.hits.len());
+        cached.lookups.push(lookup);
+        cached.callback_counts.push(callback_count);
+    }
+    cached
+}
+
 pub(crate) fn cache_query_seed_hits(
     query_seeds: &[QuerySeed],
     index: &dyn SeedIndex,
@@ -2190,6 +2253,108 @@ mod tests {
         .unwrap();
         assert_eq!(anchors.len(), 1);
         assert_eq!(anchors[0].ref_start, 0);
+    }
+}
+
+#[cfg(test)]
+mod endpoint_cache_tests {
+    use super::*;
+
+    /// A stand-in index that records which seeds were looked up, so the test
+    /// measures the work skipped rather than the answer given.
+    struct CountingIndex {
+        looked_up: std::sync::Mutex<Vec<u32>>,
+    }
+
+    impl SeedIndex for CountingIndex {
+        fn seed_span(&self) -> usize {
+            15
+        }
+
+        fn query_seeds(&self, _sequence: &[u8]) -> Vec<QuerySeed> {
+            Vec::new()
+        }
+
+        fn visit_hits(&self, seed: &QuerySeed, visit: &mut dyn FnMut(SeedHit)) -> SeedLookup {
+            self.looked_up
+                .lock()
+                .expect("no panics in the test")
+                .push(seed.query_pos);
+            visit(SeedHit {
+                contig: ContigId(0),
+                ref_pos: u64::from(seed.query_pos),
+                strand: Strand::Forward,
+            });
+            SeedLookup::complete(1)
+        }
+    }
+
+    fn seeds(positions: &[u32]) -> Vec<QuerySeed> {
+        positions
+            .iter()
+            .map(|&query_pos| {
+                QuerySeed::new(
+                    query_pos,
+                    Strand::Forward,
+                    crate::types::SeedKey::new(u64::from(query_pos), 0),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_the_end_windows_reach_the_index() {
+        let read_len = 10_000usize;
+        let seeds = seeds(&[0, 500, 999, 1_000, 5_000, 8_999, 9_000, 9_500, 9_999]);
+        let index = CountingIndex {
+            looked_up: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let cached = cache_endpoint_seed_hits(&seeds, &index, read_len, 1_000);
+        assert_eq!(
+            *index.looked_up.lock().expect("no panics in the test"),
+            vec![0, 500, 999, 9_000, 9_500, 9_999],
+            "the middle of the read must not be resolved"
+        );
+
+        // A skipped seed reads as absent, which is what the two-ended lock
+        // already ignores -- not as a resolved seed with no hits.
+        for (position, index_of) in [(1_000u32, 3usize), (5_000, 4), (8_999, 5)] {
+            let lookup = cached.lookup_at(index_of).expect("a lookup per seed");
+            assert_eq!(lookup.completeness, crate::HitCompleteness::Absent);
+            assert_eq!(lookup.reported_hits, 0, "seed at {position}");
+        }
+        assert_eq!(
+            cached.lookup_at(0).map(|lookup| lookup.reported_hits),
+            Some(1)
+        );
+    }
+
+    /// The window is `min(endpoint_window, read_len / 2)`, the same rule the
+    /// two-ended lock applies, so a short read is covered end to end and
+    /// nothing is skipped that the lock would have read.
+    #[test]
+    fn the_window_scales_with_the_read_the_way_the_lock_does() {
+        let index = CountingIndex {
+            looked_up: std::sync::Mutex::new(Vec::new()),
+        };
+        cache_endpoint_seed_hits(&seeds(&[0, 100, 200]), &index, 300, 1_000);
+        assert_eq!(
+            *index.looked_up.lock().expect("no panics in the test"),
+            vec![0, 100, 200],
+            "150-base windows meet in the middle of a 300-base read"
+        );
+
+        // Doubled, the same seeds straddle a gap the lock never reads.
+        let index = CountingIndex {
+            looked_up: std::sync::Mutex::new(Vec::new()),
+        };
+        cache_endpoint_seed_hits(&seeds(&[0, 100, 200]), &index, 600, 100);
+        assert_eq!(
+            *index.looked_up.lock().expect("no panics in the test"),
+            vec![0],
+            "only the first 100 and last 100 bases of 600"
+        );
     }
 }
 

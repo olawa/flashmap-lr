@@ -116,6 +116,9 @@ pub struct SeedingConfig {
     pub near_exact_candidate: bool,
     /// Align a locked region in one banded pass instead of finding anchors.
     pub near_exact_dp: bool,
+    /// Resolve only the read's end windows before the two-ended lock, and
+    /// build the rest only for a read the lock's banded pass declines.
+    pub lazy_seed_cache: bool,
     /// Let a sampled hit list seed anchors inside a chosen candidate region.
     pub sampled_anchors: bool,
     /// Window for the local map's minimizer selection. `0` or `1` stores all.
@@ -197,6 +200,7 @@ impl Default for Config {
                 reseed_uncovered: false,
                 near_exact_candidate: false,
                 near_exact_dp: false,
+                lazy_seed_cache: false,
                 sampled_anchors: false,
                 map_window: 1,
                 rarest_first: false,
@@ -354,6 +358,15 @@ pub(crate) struct ProbePolicy {
     pub(crate) map_window: usize,
     pub(crate) near_exact_dp_max_drift: usize,
     pub(crate) near_exact_dp_band_slack: usize,
+    /// Resolve only the read's end windows before the two-ended lock.
+    ///
+    /// The lock reads nothing but those windows, and when its banded pass
+    /// succeeds the rest of the seed cache is never read at all -- yet it is
+    /// built for every read, ahead of the attempt. On a 441k-read HiFi subset
+    /// with --near-exact-dp the pass took 94.5% of reads while the cache cost
+    /// 181 of 1196 worker-seconds. A read the pass declines rebuilds the cache
+    /// in full, so the only waste is resolving its end windows twice.
+    pub(crate) lazy_seed_cache: bool,
     pub(crate) near_exact_dp_max_divergence: f64,
     pub(crate) query_window: usize,
     pub(crate) segment_size: usize,
@@ -610,6 +623,7 @@ impl ResolvedMapperPolicy {
             map_window: config.seeding.map_window.max(1),
             near_exact_dp_max_drift: policy.probes.near_exact_dp_max_drift,
             near_exact_dp_band_slack: policy.probes.near_exact_dp_band_slack,
+            lazy_seed_cache: config.seeding.lazy_seed_cache,
             near_exact_dp_max_divergence: policy.probes.near_exact_dp_max_divergence,
             query_window: config.seeding.query_window,
             segment_size: config.seeding.segment_size,
@@ -677,6 +691,7 @@ impl ResolvedMapperPolicy {
             // hundred the band stops being cheaper than anchor discovery.
             near_exact_dp_max_drift: 256,
             near_exact_dp_band_slack: 64,
+            lazy_seed_cache: false,
             near_exact_dp_max_divergence: 0.10,
             segment_size: 2_048,
             segment_overlap: 512,
@@ -858,6 +873,7 @@ impl ResolvedMapperPolicy {
                 reseed_uncovered: self.probes.reseed_uncovered,
                 near_exact_candidate: self.probes.near_exact_candidate,
                 near_exact_dp: self.probes.near_exact_dp,
+                lazy_seed_cache: self.probes.lazy_seed_cache,
                 query_window: self.probes.query_window,
                 segment_size: self.probes.segment_size,
                 segment_overlap: self.probes.segment_overlap,

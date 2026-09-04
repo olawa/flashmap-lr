@@ -117,6 +117,10 @@ pub struct ReadDiagnostics {
     /// Anchor bases handed back to the gap DP as context around a resolved
     /// overlap. Zero means --overlap-flank changed nothing.
     pub anchor_overlap_flanked_bases: u64,
+    /// Reads whose end-window seed cache had to be rebuilt in full because
+    /// the locked banded pass declined them. Under --lazy-seed-cache this is
+    /// the only waste: their end windows were resolved twice.
+    pub lazy_seed_cache_rebuilds: u32,
     pub anchor_runs_dissolved: u64,
     pub anchors_dissolved: u64,
     pub stage_a_anchors: u32,
