@@ -794,10 +794,11 @@ impl<'a> Aligner<'a> {
         } else {
             chain.query_covered_fraction
         };
-        let mapq = confidence_cap(mapping_quality(
+        let mapq = confidence_cap(mapping_quality_with_saturation(
             best_rank_score,
             second_score,
             confidence_coverage,
+            self.policy.work_budget.mapq_score_saturation,
         ));
         let contig = self.reference.contig(*contig_id).ok_or(MapError::Anchor(
             crate::AnchorError::MissingReference(*contig_id),
@@ -829,7 +830,7 @@ impl<'a> Aligner<'a> {
             // separate placement of a different part of the read: whether the
             // primary was unambiguous says nothing about whether this segment
             // is, and copying the value hides a segment that had a competitor.
-            let supplementary_mapq = confidence_cap(mapping_quality(
+            let supplementary_mapq = confidence_cap(mapping_quality_with_saturation(
                 endpoint_rank_score(
                     supplementary_chain.score,
                     supplementary_support,
@@ -857,6 +858,7 @@ impl<'a> Aligner<'a> {
                 } else {
                     chain_span_coverage(supplementary_chain)
                 },
+                self.policy.work_budget.mapq_score_saturation,
             ));
             let alignment = crate::alignment::build_chain_alignment_with_policy(
                 read,
@@ -1655,7 +1657,32 @@ fn phase_nanos(started: Option<Instant>) -> u64 {
     started.map_or(0, elapsed_nanos)
 }
 
-fn mapping_quality(best_score: i32, second_score: Option<i32>, coverage: f64) -> u8 {
+/// Confidence in a placement, given the runner-up it beat.
+///
+/// The margin between two chains carries two separate arguments, and either
+/// one can settle a read.
+///
+/// The *ratio* says how much better the best chain is in proportion. It is the
+/// right question for a short read, where the whole score is a few dozen
+/// bases and a 20% deficit is a handful of them.
+///
+/// The *difference* says how much evidence separates them outright, and on a
+/// long read that is the question that matters. A chain score is the sum of
+/// its anchor lengths, so a 15 kb read scores in the thousands: a rival a
+/// hundred anchor-covered bases behind is beaten by a hundred bases of unique
+/// sequence, and the ratio calls that 0.007 and hands back MAPQ 0. A hundred
+/// exactly-matching bases do not occur twice by accident.
+///
+/// `saturation` is the difference that counts as decisive on its own. The
+/// default is the score a both-ends endpoint match is already worth in the
+/// ranking, so a rival a full endpoint's worth behind is beaten -- a unit the
+/// ranking trusts elsewhere rather than a fresh guess.
+fn mapping_quality_with_saturation(
+    best_score: i32,
+    second_score: Option<i32>,
+    coverage: f64,
+    saturation: i32,
+) -> u8 {
     // The LR chain score margin is useful only when the chain covers a
     // meaningful part of the read.  This is the same coverage knee used by
     // FlashMap's default LR emission path: sparse anchors on a short repeat
@@ -1663,15 +1690,28 @@ fn mapping_quality(best_score: i32, second_score: Option<i32>, coverage: f64) ->
     const COVERAGE_KNEE: f64 = 0.80;
     let margin = second_score
         .map(|second| {
-            if best_score > 0 {
-                (best_score.saturating_sub(second) as f64 / best_score as f64).clamp(0.0, 1.0)
+            let difference = best_score.saturating_sub(second).max(0);
+            let by_ratio = if best_score > 0 {
+                difference as f64 / best_score as f64
             } else {
                 0.0
-            }
+            };
+            let by_difference = if saturation > 0 {
+                difference as f64 / saturation as f64
+            } else {
+                0.0
+            };
+            by_ratio.max(by_difference).clamp(0.0, 1.0)
         })
         .unwrap_or(1.0);
     let coverage_factor = (coverage.clamp(0.0, 1.0) / COVERAGE_KNEE).min(1.0);
     (60.0 * margin * coverage_factor).round().clamp(0.0, 60.0) as u8
+}
+
+/// The historical rule: the ratio alone, with no absolute term.
+#[cfg(test)]
+fn mapping_quality(best_score: i32, second_score: Option<i32>, coverage: f64) -> u8 {
+    mapping_quality_with_saturation(best_score, second_score, coverage, 0)
 }
 
 /// Does this candidate cover query that no accepted placement explains?
@@ -2234,6 +2274,68 @@ mod tests {
         assert_eq!(primary.ref_end, 20);
         assert_eq!(primary.cigar.ops(), &[crate::CigarOp::Match(20)]);
         assert_eq!(primary.edit_distance, 0);
+    }
+
+    /// The absolute term must not disturb what the ratio already decided; a
+    /// both-ends endpoint's worth of difference is simply another way to be
+    /// sure.
+    #[test]
+    fn the_absolute_term_leaves_the_ratios_answers_alone() {
+        const SATURATION: i32 = 250;
+        for (best, second, coverage) in [
+            (100, None, 1.0),
+            (100, None, 0.80),
+            (100, None, 0.40),
+            (100, Some(99), 1.0),
+            (100, Some(50), 1.0),
+            (100, Some(100), 1.0),
+        ] {
+            assert_eq!(
+                mapping_quality_with_saturation(best, second, coverage, SATURATION),
+                mapping_quality(best, second, coverage),
+                "score {best} against {second:?} at coverage {coverage}"
+            );
+        }
+    }
+
+    /// A chain score is the sum of its anchor lengths, so a long read scores
+    /// in the thousands and the ratio cannot see a decisive difference.
+    #[test]
+    fn a_long_read_is_settled_by_the_difference_the_ratio_cannot_see() {
+        const SATURATION: i32 = 250;
+        // 15 kb of anchors, a rival a hundred anchor-covered bases behind.
+        assert_eq!(
+            mapping_quality(15_000, Some(14_900), 1.0),
+            0,
+            "the ratio calls a hundred bases of unique sequence a coin toss"
+        );
+        assert_eq!(
+            mapping_quality_with_saturation(15_000, Some(14_900), 1.0, SATURATION),
+            24
+        );
+
+        // A full endpoint's worth behind is decisive on its own.
+        assert_eq!(
+            mapping_quality_with_saturation(15_000, Some(14_750), 1.0, SATURATION),
+            60
+        );
+
+        // And a genuinely close second stays close: ten bases in fifteen
+        // thousand is not evidence.
+        assert_eq!(
+            mapping_quality_with_saturation(15_000, Some(14_990), 1.0, SATURATION),
+            2
+        );
+    }
+
+    /// The coverage factor still bounds the result, so the absolute term
+    /// cannot hand MAPQ 60 to a chain that explains a fraction of the read.
+    #[test]
+    fn the_absolute_term_is_still_bounded_by_coverage() {
+        assert_eq!(
+            mapping_quality_with_saturation(15_000, Some(14_000), 0.40, 250),
+            30
+        );
     }
 
     #[test]

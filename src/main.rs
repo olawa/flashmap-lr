@@ -46,6 +46,7 @@ struct Options {
     near_exact_dp: bool,
     lazy_seed_cache: bool,
     mapq_from_span: bool,
+    mapq_saturation: Option<i32>,
     dp_band_slack: Option<usize>,
     dp_max_drift: Option<usize>,
     dp_min_drift: Option<usize>,
@@ -123,6 +124,7 @@ impl Options {
         let mut near_exact_dp = false;
         let mut lazy_seed_cache = false;
         let mut mapq_from_span = false;
+        let mut mapq_saturation: Option<i32> = None;
         let mut dp_band_slack: Option<usize> = None;
         let mut dp_max_drift: Option<usize> = None;
         let mut dp_min_drift: Option<usize> = None;
@@ -241,6 +243,12 @@ impl Options {
                         next_value(&mut args, &argument)?,
                         "dp-min-drift",
                     )?);
+                }
+                "--mapq-saturation" => {
+                    mapq_saturation = Some(parse_count(
+                        next_value(&mut args, &argument)?,
+                        "mapq-saturation",
+                    )? as i32);
                 }
                 "--mapq-from-span" => {
                     mapq_from_span = true;
@@ -421,6 +429,7 @@ impl Options {
             near_exact_dp,
             lazy_seed_cache,
             mapq_from_span,
+            mapq_saturation,
             dp_band_slack,
             dp_max_drift,
             dp_min_drift,
@@ -580,6 +589,7 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--near-exact-dp",
     "--lazy-seed-cache",
     "--mapq-from-span",
+    "--mapq-saturation",
     "--dp-band-slack",
     "--dp-max-drift",
     "--dp-min-drift",
@@ -692,6 +702,13 @@ fn usage() -> &'static str {
         "                            agree on one diagonal, skipping probe clustering\n",
         "      --near-exact-dp       As --near-exact, and align the locked region in\n",
         "                            one banded pass instead of finding anchors\n",
+        "      --mapq-saturation N   Score difference that settles a placement on its\n",
+        "                            own. A chain score is the sum of its anchor\n",
+        "                            lengths, so a 15 kb read scores in the thousands\n",
+        "                            and a rival 100 bases behind reads as a 0.7%\n",
+        "                            margin -- MAPQ 0 for 100 bases of unique\n",
+        "                            sequence. 250 is what a both-ends endpoint match\n",
+        "                            is worth in the ranking (default: 0, ratio only)\n",
         "      --mapq-from-span      Score confidence by how much of the read the\n",
         "                            chain spans, not by how densely its anchors\n",
         "                            covered that span. An unambiguous placement is\n",
@@ -856,35 +873,65 @@ fn print_index_banner(path: &std::path::Path, index: &MinimizerIndex) {
 /// defaults is printed, so an ordinary run stays one short line and an
 /// experiment says what it is.
 fn describe_settings(options: &Options) -> String {
-    let mut parts = vec![match options.mode {
-        AlignmentMode::Fast => "fast".to_owned(),
-        AlignmentMode::Standard => "standard".to_owned(),
-        AlignmentMode::Sensitive => "sensitive".to_owned(),
-    }];
-    let mut flag = |on: bool, name: &str| {
+    let mode = match options.mode {
+        AlignmentMode::Fast => "fast",
+        AlignmentMode::Standard => "standard",
+        AlignmentMode::Sensitive => "sensitive",
+    };
+    let mut parts = non_default_settings(options);
+    if parts.is_empty() {
+        parts.push("defaults".to_owned());
+    }
+    parts.insert(0, mode.to_owned());
+    parts.join(", ")
+}
+
+/// Every search setting this run departs from the defaults on.
+///
+/// This is also what decides whether the run needs the legacy configuration:
+/// a setting the banner names but the configuration never receives is a flag
+/// that silently does nothing, which is how --near-exact-dp and six others
+/// came to be accepted and ignored. Naming and honouring a flag are now the
+/// same list.
+fn non_default_settings(options: &Options) -> Vec<String> {
+    fn flag(parts: &mut Vec<String>, on: bool, name: &str) {
         if on {
             parts.push(name.to_owned());
         }
-    };
-    flag(options.drop_contained, "drop-contained-anchors");
-    flag(options.rarest_first, "rarest-first");
-    flag(options.sampled_anchors, "sampled-anchors");
-    flag(options.reseed, "reseed");
-    flag(options.near_exact || options.near_exact_dp, "near-exact");
-    flag(options.near_exact_dp, "near-exact-dp");
-    // The lazy cache is only consulted on the banded pass's path, so naming
-    // it otherwise would report an effect the run did not have.
+    }
+    let parts = &mut Vec::<String>::new();
+    flag(parts, options.drop_contained, "drop-contained-anchors");
+    flag(parts, options.rarest_first, "rarest-first");
+    flag(parts, options.sampled_anchors, "sampled-anchors");
+    flag(parts, options.reseed, "reseed");
     flag(
-        options.lazy_seed_cache && options.near_exact_dp,
-        "lazy-seed-cache",
+        parts,
+        options.near_exact || options.near_exact_dp,
+        "near-exact",
     );
-    flag(options.paired_emms, "paired-emms");
-    flag(options.tiered_candidates, "tiered-candidates");
-    if let Some(flank) = options.overlap_flank {
-        match options.overlap_flank_min {
-            Some(min) => parts.push(format!("overlap-flank {flank} (min {min})")),
-            None => parts.push(format!("overlap-flank {flank} (every overlap)")),
-        }
+    flag(parts, options.near_exact_dp, "near-exact-dp");
+    // The lazy cache is only consulted on the banded pass's path. Naming it
+    // plainly would claim an effect the run did not have; dropping it would
+    // hide a flag that did nothing. Say which.
+    if options.lazy_seed_cache {
+        parts.push(if options.near_exact_dp {
+            "lazy-seed-cache".to_owned()
+        } else {
+            "lazy-seed-cache (inert without the banded pass)".to_owned()
+        });
+    }
+    flag(parts, options.paired_emms, "paired-emms");
+    flag(parts, options.tiered_candidates, "tiered-candidates");
+    flag(parts, options.mapq_from_span, "mapq-from-span");
+    if let Some(saturation) = options.mapq_saturation {
+        parts.push(format!("mapq-saturation {saturation}"));
+    }
+    match (options.overlap_flank, options.overlap_flank_min) {
+        (Some(flank), Some(min)) => parts.push(format!("overlap-flank {flank} (min {min})")),
+        (Some(flank), None) => parts.push(format!("overlap-flank {flank} (every overlap)")),
+        // A threshold with nothing to threshold.
+        (None, Some(min)) => parts.push(format!("overlap-flank-min {min} (inert without a flank)")),
+        (None, None) => {}
     }
     for (value, name) in [
         (options.dp_band_slack, "dp-band-slack"),
@@ -907,10 +954,7 @@ fn describe_settings(options: &Options) -> String {
     if options.query_window > 0 {
         parts.push(format!("query-window {}", options.query_window));
     }
-    if parts.len() == 1 {
-        parts.push("defaults".to_owned());
-    }
-    parts.join(", ")
+    std::mem::take(parts)
 }
 
 /// What the seeds above the cap look like, and what keeping some would cost.
@@ -1436,22 +1480,8 @@ fn execute_mapping(
     // hatch for benchmark/debug runs.  The normal CLI path always constructs
     // the small public MapperConfig and therefore cannot accidentally combine
     // hidden algorithm thresholds with a mode selection.
-    let aligner_config = if options.paired_emms
-        || options.tiered_candidates
-        || options.query_window > 0
-        || options.near_exact
-        || options.reseed
-        || options.sampled_anchors
-        || options.anchor_k.is_some()
-        || options.map_window > 1
-        || options.island_lookback.is_some()
-        || options.dissolve_repeat_run.is_some()
-        || options.overlap_flank.is_some()
-        || options.overlap_flank_min.is_some()
-        || options.drop_contained
-        || options.rarest_first
-        || options.diagonal_band.is_some()
-    {
+    // A setting the banner names must be one the configuration receives.
+    let aligner_config = if !non_default_settings(&options).is_empty() {
         let defaults = Config::default();
         let legacy = Config {
             seeding: rs_lra::SeedingConfig {
@@ -1467,6 +1497,9 @@ fn execute_mapping(
                 near_exact_dp: options.near_exact_dp,
                 lazy_seed_cache: options.lazy_seed_cache,
                 mapq_from_span: options.mapq_from_span,
+                mapq_score_saturation: options
+                    .mapq_saturation
+                    .unwrap_or(defaults.seeding.mapq_score_saturation),
                 near_exact_dp_band_slack: options
                     .dp_band_slack
                     .unwrap_or(defaults.seeding.near_exact_dp_band_slack),
@@ -2499,6 +2532,82 @@ mod tests {
                 line.len() <= 80,
                 "help line is {} columns: {line}",
                 line.len()
+            );
+        }
+    }
+
+    #[test]
+    /// Every search option must reach the configuration, and the settings
+    /// banner is what decides that: a run builds the legacy configuration
+    /// only when this list is non-empty. An option the parser accepts but the
+    /// list does not name is therefore accepted and silently ignored -- which
+    /// is exactly what happened to --near-exact-dp, --lazy-seed-cache,
+    /// --dp-band-slack, --dp-max-drift, --dp-min-drift, --mapq-from-span and
+    /// --mapq-saturation, all of which ran to completion changing nothing.
+    ///
+    /// Adding a search flag to KNOWN_OPTIONS without adding it to
+    /// `non_default_settings` now fails here rather than in a profile that
+    /// looks identical for no visible reason.
+    #[test]
+    fn every_search_option_reaches_the_configuration() {
+        // Options that describe the run's inputs, outputs or resources rather
+        // than its search, and so correctly leave the configuration alone.
+        const NOT_A_SEARCH_SETTING: &[&str] = &[
+            "--index",
+            "--ref",
+            "--reference",
+            "--query",
+            "--fastq",
+            "--reads",
+            "--output",
+            "--threads",
+            "--workers",
+            "--chunk-size",
+            "--quiet",
+            "--profile",
+            "--index-info",
+            "--limit",
+            "--help",
+            "--version",
+            "--preset",
+            "--fast",
+            "--standard",
+            "--sensitive",
+            "--decompress-with",
+            "--sort-memory",
+            "--bam-compression",
+            // Input and mode aliases of options already listed above.
+            "--fastx",
+            "--no-sensitive",
+        ];
+
+        for &option in KNOWN_OPTIONS {
+            if NOT_A_SEARCH_SETTING.contains(&option) {
+                continue;
+            }
+            // Try it as a switch first, then as one taking a value; a search
+            // option has to be reachable in one of those two shapes.
+            let base = ["rs-lra", "-i", "index.fmi", "-q", "reads.fq"];
+            let parsed = [
+                vec![option.to_owned()],
+                vec![option.to_owned(), "8".to_owned()],
+            ]
+            .into_iter()
+            .find_map(|extra| {
+                let args = base
+                    .iter()
+                    .map(|part| (*part).to_owned())
+                    .chain(extra)
+                    .collect::<Vec<_>>();
+                Options::parse(args).ok()
+            });
+            let Some(options) = parsed else {
+                panic!("{option} is in KNOWN_OPTIONS but the parser accepts neither shape");
+            };
+            assert!(
+                !non_default_settings(&options).is_empty(),
+                "{option} parses but non_default_settings does not name it, so the run \
+                 would not build the configuration that honours it"
             );
         }
     }

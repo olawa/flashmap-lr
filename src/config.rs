@@ -128,6 +128,15 @@ pub struct SeedingConfig {
     /// locus"; the span is the thing the proxy stood for, and it does not fall
     /// when anchors are deliberately dropped.
     pub mapq_from_span: bool,
+    /// Score difference that settles a placement on its own.
+    ///
+    /// A chain score is the sum of its anchor lengths, so on a 15 kb read it
+    /// runs to thousands and a rival a hundred bases behind reads as a 0.7%
+    /// ratio -- MAPQ 0 for a hundred bases of unique sequence. This is the
+    /// difference that counts as decisive whatever the scores are. Zero
+    /// restores the ratio-only rule; 250 is the score a both-ends endpoint
+    /// match is already worth in the ranking.
+    pub mapq_score_saturation: i32,
     /// Bases of band beyond the measured drift for the locked banded pass.
     ///
     /// The two end seeds bound only the net shift between them, so a read
@@ -230,6 +239,7 @@ impl Default for Config {
                 near_exact_candidate: false,
                 near_exact_dp: false,
                 mapq_from_span: false,
+                mapq_score_saturation: 0,
                 near_exact_dp_band_slack: 64,
                 near_exact_dp_max_drift: 256,
                 near_exact_dp_min_drift: 0,
@@ -605,6 +615,9 @@ pub(crate) struct WorkBudget {
     /// Score confidence by the chain's span over the read rather than by its
     /// anchor density within that span.
     pub(crate) mapq_from_span: bool,
+    /// Score difference that settles a placement on its own, regardless of
+    /// how large the scores themselves are. Zero is the ratio-only rule.
+    pub(crate) mapq_score_saturation: i32,
     /// Fast-only coarse-candidate entropy guard. When at least this many
     /// candidates remain within `ambiguity_score_fraction` of the top probe
     /// score, only `ambiguity_candidate_budget` candidates are resolved and
@@ -699,6 +712,7 @@ impl ResolvedMapperPolicy {
         };
         policy.work_budget.max_candidates = config.candidates.max_regions.min(8);
         policy.work_budget.mapq_from_span = config.seeding.mapq_from_span;
+        policy.work_budget.mapq_score_saturation = config.seeding.mapq_score_saturation;
         // Tiered and EMMS switches are compatibility-only.  They are carried
         // into the resolved policy only when explicitly requested through the
         // legacy Config; MapperConfig itself cannot create these combinations.
@@ -883,6 +897,7 @@ impl ResolvedMapperPolicy {
             low_coverage_fraction: 0.40,
             limited_mapq_cap: if mode.resolves_full_depth() { 60 } else { 50 },
             mapq_from_span: false,
+            mapq_score_saturation: 0,
             ambiguity_score_fraction: 0.90,
             ambiguity_candidate_count: if mode.resolves_full_depth() {
                 usize::MAX
@@ -915,6 +930,7 @@ impl ResolvedMapperPolicy {
                 near_exact_candidate: self.probes.near_exact_candidate,
                 near_exact_dp: self.probes.near_exact_dp,
                 mapq_from_span: self.work_budget.mapq_from_span,
+                mapq_score_saturation: self.work_budget.mapq_score_saturation,
                 near_exact_dp_band_slack: self.probes.near_exact_dp_band_slack,
                 near_exact_dp_max_drift: self.probes.near_exact_dp_max_drift,
                 near_exact_dp_min_drift: self.probes.near_exact_dp_min_drift,
