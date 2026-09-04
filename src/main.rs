@@ -1740,6 +1740,8 @@ struct ProfileReporter {
     anchor_overlaps_trimmed: AtomicU64,
     anchor_overlaps_removed: AtomicU64,
     anchor_overlap_flanked_bases: AtomicU64,
+    mapq_span_applied: AtomicU64,
+    mapq_span_withheld: AtomicU64,
     lazy_seed_cache_rebuilds: AtomicU64,
     anchor_runs_dissolved: AtomicU64,
     anchors_dissolved: AtomicU64,
@@ -1990,6 +1992,14 @@ impl DiagnosticsSink for ProfileReporter {
             (
                 &self.anchor_overlap_flanked_bases,
                 diagnostics.anchor_overlap_flanked_bases,
+            ),
+            (
+                &self.mapq_span_applied,
+                diagnostics.mapq_span_applied as u64,
+            ),
+            (
+                &self.mapq_span_withheld,
+                diagnostics.mapq_span_withheld as u64,
             ),
             (
                 &self.lazy_seed_cache_rebuilds,
@@ -2276,6 +2286,14 @@ impl ProfileReporter {
         if flanked > 0 {
             eprintln!(
                 "  Overlap flank:         {flanked} anchor bases handed to the gap DP as context"
+            );
+        }
+        let span_applied = self.mapq_span_applied.load(Ordering::Relaxed);
+        let span_withheld = self.mapq_span_withheld.load(Ordering::Relaxed);
+        if span_applied + span_withheld > 0 {
+            eprintln!(
+                "  MAPQ from span:        {span_applied} placements had a rival to weigh, \
+                 {span_withheld} did not and kept the anchor-density term"
             );
         }
         let rebuilds = self.lazy_seed_cache_rebuilds.load(Ordering::Relaxed);

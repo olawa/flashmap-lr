@@ -788,12 +788,25 @@ impl<'a> Aligner<'a> {
         // of the read the placement claims. The factor was always meant to be
         // the second, and only the second survives anchors being dropped on
         // purpose.
-        let confidence_coverage = if self.policy.work_budget.mapq_from_span {
-            let span = chain.q_end.saturating_sub(chain.q_start) as f64;
-            (span / read.sequence.len().max(1) as f64).clamp(0.0, 1.0)
-        } else {
-            chain.query_covered_fraction
-        };
+        //
+        // But it may only replace the density term when a rival was actually
+        // weighed. With no second score the margin is 1.0 by assumption, not
+        // by evidence, and the density term is then the only thing standing
+        // between a sparsely-anchored placement and MAPQ 60. Fast skips rival
+        // candidates outright -- 306645 of them on a whole-genome run -- so
+        // handing those reads a span near 1.0 as well makes an unexamined
+        // locus maximally confident. Keeping density there is what stops it.
+        let confidence_coverage =
+            if self.policy.work_budget.mapq_from_span && second_score.is_some() {
+                diagnostics.mapq_span_applied = 1;
+                let span = chain.q_end.saturating_sub(chain.q_start) as f64;
+                (span / read.sequence.len().max(1) as f64).clamp(0.0, 1.0)
+            } else {
+                if self.policy.work_budget.mapq_from_span {
+                    diagnostics.mapq_span_withheld = 1;
+                }
+                chain.query_covered_fraction
+            };
         let mapq = confidence_cap(mapping_quality_with_saturation(
             best_rank_score,
             second_score,
