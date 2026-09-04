@@ -45,6 +45,9 @@ struct Options {
     near_exact: bool,
     near_exact_dp: bool,
     lazy_seed_cache: bool,
+    dp_band_slack: Option<usize>,
+    dp_max_drift: Option<usize>,
+    dp_min_drift: Option<usize>,
     limit: Option<usize>,
     decompress_with: Option<String>,
 }
@@ -118,6 +121,9 @@ impl Options {
         let mut diagonal_band: Option<i64> = None;
         let mut near_exact_dp = false;
         let mut lazy_seed_cache = false;
+        let mut dp_band_slack: Option<usize> = None;
+        let mut dp_max_drift: Option<usize> = None;
+        let mut dp_min_drift: Option<usize> = None;
         let mut limit: Option<usize> = None;
         let mut decompress_with: Option<String> = None;
         let mut explicit_mode = None;
@@ -215,6 +221,24 @@ impl Options {
                 }
                 "--near-exact" => {
                     near_exact = true;
+                }
+                "--dp-band-slack" => {
+                    dp_band_slack = Some(parse_count(
+                        next_value(&mut args, &argument)?,
+                        "dp-band-slack",
+                    )?);
+                }
+                "--dp-max-drift" => {
+                    dp_max_drift = Some(parse_positive(
+                        next_value(&mut args, &argument)?,
+                        "dp-max-drift",
+                    )?);
+                }
+                "--dp-min-drift" => {
+                    dp_min_drift = Some(parse_count(
+                        next_value(&mut args, &argument)?,
+                        "dp-min-drift",
+                    )?);
                 }
                 "--lazy-seed-cache" => {
                     lazy_seed_cache = true;
@@ -391,6 +415,9 @@ impl Options {
             near_exact,
             near_exact_dp,
             lazy_seed_cache,
+            dp_band_slack,
+            dp_max_drift,
+            dp_min_drift,
             limit,
             decompress_with,
         })
@@ -496,6 +523,14 @@ where
         .ok_or_else(|| CliError::MissingValue(option.to_owned()))
 }
 
+/// Parse a count that is allowed to be zero, where zero means "none" rather
+/// than a mistake -- a band slack of none, a drift floor of none.
+fn parse_count(value: String, option: &'static str) -> Result<usize, CliError> {
+    value
+        .parse::<usize>()
+        .map_err(|_| CliError::InvalidNumber { option, value })
+}
+
 fn parse_positive(value: String, option: &'static str) -> Result<usize, CliError> {
     value
         .parse::<usize>()
@@ -538,6 +573,9 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--near-exact",
     "--near-exact-dp",
     "--lazy-seed-cache",
+    "--dp-band-slack",
+    "--dp-max-drift",
+    "--dp-min-drift",
     "--query-window",
     "--fast",
     "--standard",
@@ -647,6 +685,17 @@ fn usage() -> &'static str {
         "                            agree on one diagonal, skipping probe clustering\n",
         "      --near-exact-dp       As --near-exact, and align the locked region in\n",
         "                            one banded pass instead of finding anchors\n",
+        "      --dp-band-slack N     Band the banded pass adds beyond the measured\n",
+        "                            drift. The end seeds bound only the net shift,\n",
+        "                            so an internal +50 and -50 needs band the drift\n",
+        "                            does not ask for. Mean drift on HiFi is 23, so\n",
+        "                            the default makes the band four times what the\n",
+        "                            read asked for (default: 64)\n",
+        "      --dp-max-drift N      Widest drift the banded pass attempts; beyond it\n",
+        "                            the read goes to the anchor path (default: 256)\n",
+        "      --dp-min-drift N      Narrowest drift worth the banded pass. A read\n",
+        "                            whose ends already agree is one the anchor path\n",
+        "                            resolves cheaply (default: 0, attempt every one)\n",
         "      --lazy-seed-cache     Resolve only the read's end windows before that\n",
         "                            lock, and the rest only for a read its banded\n",
         "                            pass declines. The lock reads nothing else,\n",
@@ -821,6 +870,9 @@ fn describe_settings(options: &Options) -> String {
         }
     }
     for (value, name) in [
+        (options.dp_band_slack, "dp-band-slack"),
+        (options.dp_max_drift, "dp-max-drift"),
+        (options.dp_min_drift, "dp-min-drift"),
         (options.dissolve_repeat_run, "dissolve-repeat-anchors"),
         (options.island_lookback, "island-lookback"),
         (options.anchor_k, "anchor-k"),
@@ -1394,6 +1446,15 @@ fn execute_mapping(
                 near_exact_candidate: options.near_exact,
                 near_exact_dp: options.near_exact_dp,
                 lazy_seed_cache: options.lazy_seed_cache,
+                near_exact_dp_band_slack: options
+                    .dp_band_slack
+                    .unwrap_or(defaults.seeding.near_exact_dp_band_slack),
+                near_exact_dp_max_drift: options
+                    .dp_max_drift
+                    .unwrap_or(defaults.seeding.near_exact_dp_max_drift),
+                near_exact_dp_min_drift: options
+                    .dp_min_drift
+                    .unwrap_or(defaults.seeding.near_exact_dp_min_drift),
                 query_window: options.query_window,
                 ..defaults.seeding
             },

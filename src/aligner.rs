@@ -1113,7 +1113,7 @@ impl<'a> Aligner<'a> {
     ) -> Result<Option<crate::Alignment>, MapError> {
         let policy = &self.policy.probes;
         let drift = locus.drift as usize;
-        if drift > policy.near_exact_dp_max_drift {
+        if drift > policy.near_exact_dp_max_drift || drift < policy.near_exact_dp_min_drift {
             return Ok(None);
         }
         let contig = self

@@ -116,6 +116,23 @@ pub struct SeedingConfig {
     pub near_exact_candidate: bool,
     /// Align a locked region in one banded pass instead of finding anchors.
     pub near_exact_dp: bool,
+    /// Bases of band beyond the measured drift for the locked banded pass.
+    ///
+    /// The two end seeds bound only the net shift between them, so a read
+    /// carrying a +50 and a -50 needs band where its drift says none. The
+    /// slack pays for that. It is also the whole cost: mean drift on a HiFi
+    /// subset was 23, so a slack of 64 makes the band four times what the
+    /// drift asked for, on every read.
+    pub near_exact_dp_band_slack: usize,
+    /// Widest drift the locked banded pass will attempt. Beyond it the read
+    /// goes to the anchor path, where a structural difference belongs.
+    pub near_exact_dp_max_drift: usize,
+    /// Narrowest drift worth the banded pass.
+    ///
+    /// A read whose ends agree to within a few bases is one the anchor path
+    /// already resolves cheaply; the pass costs more there than it replaces.
+    /// Zero attempts every locked read, which is the measured behaviour.
+    pub near_exact_dp_min_drift: usize,
     /// Resolve only the read's end windows before the two-ended lock, and
     /// build the rest only for a read the lock's banded pass declines.
     pub lazy_seed_cache: bool,
@@ -200,6 +217,9 @@ impl Default for Config {
                 reseed_uncovered: false,
                 near_exact_candidate: false,
                 near_exact_dp: false,
+                near_exact_dp_band_slack: 64,
+                near_exact_dp_max_drift: 256,
+                near_exact_dp_min_drift: 0,
                 lazy_seed_cache: false,
                 sampled_anchors: false,
                 map_window: 1,
@@ -358,6 +378,7 @@ pub(crate) struct ProbePolicy {
     pub(crate) map_window: usize,
     pub(crate) near_exact_dp_max_drift: usize,
     pub(crate) near_exact_dp_band_slack: usize,
+    pub(crate) near_exact_dp_min_drift: usize,
     /// Resolve only the read's end windows before the two-ended lock.
     ///
     /// The lock reads nothing but those windows, and when its banded pass
@@ -621,8 +642,9 @@ impl ResolvedMapperPolicy {
             near_exact_dp: config.seeding.near_exact_dp,
             sampled_anchors: config.seeding.sampled_anchors,
             map_window: config.seeding.map_window.max(1),
-            near_exact_dp_max_drift: policy.probes.near_exact_dp_max_drift,
-            near_exact_dp_band_slack: policy.probes.near_exact_dp_band_slack,
+            near_exact_dp_max_drift: config.seeding.near_exact_dp_max_drift,
+            near_exact_dp_band_slack: config.seeding.near_exact_dp_band_slack,
+            near_exact_dp_min_drift: config.seeding.near_exact_dp_min_drift,
             lazy_seed_cache: config.seeding.lazy_seed_cache,
             near_exact_dp_max_divergence: policy.probes.near_exact_dp_max_divergence,
             query_window: config.seeding.query_window,
@@ -691,6 +713,7 @@ impl ResolvedMapperPolicy {
             // hundred the band stops being cheaper than anchor discovery.
             near_exact_dp_max_drift: 256,
             near_exact_dp_band_slack: 64,
+            near_exact_dp_min_drift: 0,
             lazy_seed_cache: false,
             near_exact_dp_max_divergence: 0.10,
             segment_size: 2_048,
@@ -873,6 +896,9 @@ impl ResolvedMapperPolicy {
                 reseed_uncovered: self.probes.reseed_uncovered,
                 near_exact_candidate: self.probes.near_exact_candidate,
                 near_exact_dp: self.probes.near_exact_dp,
+                near_exact_dp_band_slack: self.probes.near_exact_dp_band_slack,
+                near_exact_dp_max_drift: self.probes.near_exact_dp_max_drift,
+                near_exact_dp_min_drift: self.probes.near_exact_dp_min_drift,
                 lazy_seed_cache: self.probes.lazy_seed_cache,
                 query_window: self.probes.query_window,
                 segment_size: self.probes.segment_size,
