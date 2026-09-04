@@ -775,6 +775,61 @@ fn print_index_banner(path: &std::path::Path, index: &MinimizerIndex) {
     );
 }
 
+/// Name the search settings a run is actually using.
+///
+/// The flags decide what the numbers below them mean, and a profile pasted
+/// into a comparison carries no record of them. Only what departs from the
+/// defaults is printed, so an ordinary run stays one short line and an
+/// experiment says what it is.
+fn describe_settings(options: &Options) -> String {
+    let mut parts = vec![match options.mode {
+        AlignmentMode::Fast => "fast".to_owned(),
+        AlignmentMode::Standard => "standard".to_owned(),
+        AlignmentMode::Sensitive => "sensitive".to_owned(),
+    }];
+    let mut flag = |on: bool, name: &str| {
+        if on {
+            parts.push(name.to_owned());
+        }
+    };
+    flag(options.drop_contained, "drop-contained-anchors");
+    flag(options.rarest_first, "rarest-first");
+    flag(options.sampled_anchors, "sampled-anchors");
+    flag(options.reseed, "reseed");
+    flag(options.near_exact, "near-exact");
+    flag(options.near_exact_dp, "near-exact-dp");
+    flag(options.paired_emms, "paired-emms");
+    flag(options.tiered_candidates, "tiered-candidates");
+    if let Some(flank) = options.overlap_flank {
+        match options.overlap_flank_min {
+            Some(min) => parts.push(format!("overlap-flank {flank} (min {min})")),
+            None => parts.push(format!("overlap-flank {flank} (every overlap)")),
+        }
+    }
+    for (value, name) in [
+        (options.dissolve_repeat_run, "dissolve-repeat-anchors"),
+        (options.island_lookback, "island-lookback"),
+        (options.anchor_k, "anchor-k"),
+    ] {
+        if let Some(value) = value {
+            parts.push(format!("{name} {value}"));
+        }
+    }
+    if let Some(band) = options.diagonal_band {
+        parts.push(format!("diagonal-band {band}"));
+    }
+    if options.map_window > 1 {
+        parts.push(format!("map-window {}", options.map_window));
+    }
+    if options.query_window > 0 {
+        parts.push(format!("query-window {}", options.query_window));
+    }
+    if parts.len() == 1 {
+        parts.push("defaults".to_owned());
+    }
+    parts.join(", ")
+}
+
 /// What the seeds above the cap look like, and what keeping some would cost.
 ///
 /// A `drop` policy stores nothing for them, so every query minimizer that
@@ -1256,6 +1311,9 @@ fn execute_mapping(
     metadata: Vec<(rs_lra::ContigId, String, usize)>,
     options: &Options,
 ) -> Result<(), CliError> {
+    if !options.quiet {
+        eprintln!("[rs-lra] settings: {}", describe_settings(options));
+    }
     // A spawned decompressor runs on the same cores as the workers, so it has
     // to come out of the thread budget rather than be added on top of it.
     // Oversubscribing starves it: it then cannot feed the workers it is
