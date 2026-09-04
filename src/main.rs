@@ -45,6 +45,7 @@ struct Options {
     near_exact: bool,
     near_exact_dp: bool,
     lazy_seed_cache: bool,
+    mapq_from_span: bool,
     dp_band_slack: Option<usize>,
     dp_max_drift: Option<usize>,
     dp_min_drift: Option<usize>,
@@ -121,6 +122,7 @@ impl Options {
         let mut diagonal_band: Option<i64> = None;
         let mut near_exact_dp = false;
         let mut lazy_seed_cache = false;
+        let mut mapq_from_span = false;
         let mut dp_band_slack: Option<usize> = None;
         let mut dp_max_drift: Option<usize> = None;
         let mut dp_min_drift: Option<usize> = None;
@@ -239,6 +241,9 @@ impl Options {
                         next_value(&mut args, &argument)?,
                         "dp-min-drift",
                     )?);
+                }
+                "--mapq-from-span" => {
+                    mapq_from_span = true;
                 }
                 "--lazy-seed-cache" => {
                     lazy_seed_cache = true;
@@ -415,6 +420,7 @@ impl Options {
             near_exact,
             near_exact_dp,
             lazy_seed_cache,
+            mapq_from_span,
             dp_band_slack,
             dp_max_drift,
             dp_min_drift,
@@ -573,6 +579,7 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--near-exact",
     "--near-exact-dp",
     "--lazy-seed-cache",
+    "--mapq-from-span",
     "--dp-band-slack",
     "--dp-max-drift",
     "--dp-min-drift",
@@ -685,6 +692,11 @@ fn usage() -> &'static str {
         "                            agree on one diagonal, skipping probe clustering\n",
         "      --near-exact-dp       As --near-exact, and align the locked region in\n",
         "                            one banded pass instead of finding anchors\n",
+        "      --mapq-from-span      Score confidence by how much of the read the\n",
+        "                            chain spans, not by how densely its anchors\n",
+        "                            covered that span. An unambiguous placement is\n",
+        "                            otherwise capped at MAPQ 30 when its anchors\n",
+        "                            reached 40% of the read (default: off)\n",
         "      --dp-band-slack N     Band the banded pass adds beyond the measured\n",
         "                            drift. The end seeds bound only the net shift,\n",
         "                            so an internal +50 and -50 needs band the drift\n",
@@ -1454,6 +1466,7 @@ fn execute_mapping(
                 near_exact_candidate: options.near_exact || options.near_exact_dp,
                 near_exact_dp: options.near_exact_dp,
                 lazy_seed_cache: options.lazy_seed_cache,
+                mapq_from_span: options.mapq_from_span,
                 near_exact_dp_band_slack: options
                     .dp_band_slack
                     .unwrap_or(defaults.seeding.near_exact_dp_band_slack),

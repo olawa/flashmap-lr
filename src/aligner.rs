@@ -784,10 +784,20 @@ impl<'a> Aligner<'a> {
             }
             mapq
         };
+        // Anchor density says how the locus was found; the span says how much
+        // of the read the placement claims. The factor was always meant to be
+        // the second, and only the second survives anchors being dropped on
+        // purpose.
+        let confidence_coverage = if self.policy.work_budget.mapq_from_span {
+            let span = chain.q_end.saturating_sub(chain.q_start) as f64;
+            (span / read.sequence.len().max(1) as f64).clamp(0.0, 1.0)
+        } else {
+            chain.query_covered_fraction
+        };
         let mapq = confidence_cap(mapping_quality(
             best_rank_score,
             second_score,
-            chain.query_covered_fraction,
+            confidence_coverage,
         ));
         let contig = self.reference.contig(*contig_id).ok_or(MapError::Anchor(
             crate::AnchorError::MissingReference(*contig_id),
@@ -839,7 +849,14 @@ impl<'a> Aligner<'a> {
                 // read is the normal case for a split, not a warning sign, and
                 // scaling by the whole read caps every split segment low
                 // however unambiguous its locus is.
-                chain_span_coverage(supplementary_chain),
+                if self.policy.work_budget.mapq_from_span {
+                    // A supplementary already measures against its own span,
+                    // so under this rule it is by definition complete: its
+                    // confidence comes from the competitor term alone.
+                    1.0
+                } else {
+                    chain_span_coverage(supplementary_chain)
+                },
             ));
             let alignment = crate::alignment::build_chain_alignment_with_policy(
                 read,

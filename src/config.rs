@@ -116,6 +116,18 @@ pub struct SeedingConfig {
     pub near_exact_candidate: bool,
     /// Align a locked region in one banded pass instead of finding anchors.
     pub near_exact_dp: bool,
+    /// Score a placement's confidence by how much of the read its chain
+    /// spans, rather than by how densely its anchors covered that span.
+    ///
+    /// The coverage factor exists so a chain built from sparse anchors on a
+    /// short repeat cannot claim MAPQ 60. But it multiplies the whole score,
+    /// so an unambiguous placement with no competitor at all is capped at 30
+    /// when its anchors covered 40% of the read -- and a verify run found 3113
+    /// reads at least 30 below minimap2 at the same position, against 126 the
+    /// other way. Anchor density is a proxy for "did we really see this
+    /// locus"; the span is the thing the proxy stood for, and it does not fall
+    /// when anchors are deliberately dropped.
+    pub mapq_from_span: bool,
     /// Bases of band beyond the measured drift for the locked banded pass.
     ///
     /// The two end seeds bound only the net shift between them, so a read
@@ -217,6 +229,7 @@ impl Default for Config {
                 reseed_uncovered: false,
                 near_exact_candidate: false,
                 near_exact_dp: false,
+                mapq_from_span: false,
                 near_exact_dp_band_slack: 64,
                 near_exact_dp_max_drift: 256,
                 near_exact_dp_min_drift: 0,
@@ -589,6 +602,9 @@ pub(crate) struct WorkBudget {
     pub(crate) high_coverage_fraction: f64,
     pub(crate) low_coverage_fraction: f64,
     pub(crate) limited_mapq_cap: u8,
+    /// Score confidence by the chain's span over the read rather than by its
+    /// anchor density within that span.
+    pub(crate) mapq_from_span: bool,
     /// Fast-only coarse-candidate entropy guard. When at least this many
     /// candidates remain within `ambiguity_score_fraction` of the top probe
     /// score, only `ambiguity_candidate_budget` candidates are resolved and
@@ -682,6 +698,7 @@ impl ResolvedMapperPolicy {
             ..policy.anchors
         };
         policy.work_budget.max_candidates = config.candidates.max_regions.min(8);
+        policy.work_budget.mapq_from_span = config.seeding.mapq_from_span;
         // Tiered and EMMS switches are compatibility-only.  They are carried
         // into the resolved policy only when explicitly requested through the
         // legacy Config; MapperConfig itself cannot create these combinations.
@@ -865,6 +882,7 @@ impl ResolvedMapperPolicy {
             high_coverage_fraction: 0.90,
             low_coverage_fraction: 0.40,
             limited_mapq_cap: if mode.resolves_full_depth() { 60 } else { 50 },
+            mapq_from_span: false,
             ambiguity_score_fraction: 0.90,
             ambiguity_candidate_count: if mode.resolves_full_depth() {
                 usize::MAX
@@ -896,6 +914,7 @@ impl ResolvedMapperPolicy {
                 reseed_uncovered: self.probes.reseed_uncovered,
                 near_exact_candidate: self.probes.near_exact_candidate,
                 near_exact_dp: self.probes.near_exact_dp,
+                mapq_from_span: self.work_budget.mapq_from_span,
                 near_exact_dp_band_slack: self.probes.near_exact_dp_band_slack,
                 near_exact_dp_max_drift: self.probes.near_exact_dp_max_drift,
                 near_exact_dp_min_drift: self.probes.near_exact_dp_min_drift,
