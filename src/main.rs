@@ -858,9 +858,14 @@ fn describe_settings(options: &Options) -> String {
     flag(options.rarest_first, "rarest-first");
     flag(options.sampled_anchors, "sampled-anchors");
     flag(options.reseed, "reseed");
-    flag(options.near_exact, "near-exact");
+    flag(options.near_exact || options.near_exact_dp, "near-exact");
     flag(options.near_exact_dp, "near-exact-dp");
-    flag(options.lazy_seed_cache, "lazy-seed-cache");
+    // The lazy cache is only consulted on the banded pass's path, so naming
+    // it otherwise would report an effect the run did not have.
+    flag(
+        options.lazy_seed_cache && options.near_exact_dp,
+        "lazy-seed-cache",
+    );
     flag(options.paired_emms, "paired-emms");
     flag(options.tiered_candidates, "tiered-candidates");
     if let Some(flank) = options.overlap_flank {
@@ -1443,7 +1448,10 @@ fn execute_mapping(
                 map_window: options.map_window,
                 rarest_first: options.rarest_first,
                 diagonal_band: options.diagonal_band.unwrap_or(i64::MAX),
-                near_exact_candidate: options.near_exact,
+                // The banded pass aligns a locked region, so it is inert
+                // without the lock -- and silently so, since the flag would
+                // still be named in the settings line.
+                near_exact_candidate: options.near_exact || options.near_exact_dp,
                 near_exact_dp: options.near_exact_dp,
                 lazy_seed_cache: options.lazy_seed_cache,
                 near_exact_dp_band_slack: options
