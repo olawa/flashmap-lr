@@ -36,6 +36,7 @@ struct Options {
     anchor_k: Option<usize>,
     map_window: usize,
     island_lookback: Option<usize>,
+    dissolve_repeat_run: Option<usize>,
     rarest_first: bool,
     diagonal_band: Option<i64>,
     near_exact: bool,
@@ -105,6 +106,7 @@ impl Options {
         let mut anchor_k: Option<usize> = None;
         let mut map_window = 1usize;
         let mut island_lookback: Option<usize> = None;
+        let mut dissolve_repeat_run: Option<usize> = None;
         let mut rarest_first = false;
         let mut diagonal_band: Option<i64> = None;
         let mut near_exact_dp = false;
@@ -135,7 +137,10 @@ impl Options {
                     threads = parse_positive(next_value(&mut args, &argument)?, "threads")?;
                 }
                 "-w" | "--workers" => {
-                    workers = Some(parse_positive(next_value(&mut args, &argument)?, "workers")?);
+                    workers = Some(parse_positive(
+                        next_value(&mut args, &argument)?,
+                        "workers",
+                    )?);
                 }
                 "-c" | "--chunk-size" => {
                     chunk_size = parse_positive(next_value(&mut args, &argument)?, "chunk-size")?;
@@ -173,6 +178,12 @@ impl Options {
                         "island-lookback",
                     )?);
                 }
+                "--dissolve-repeat-anchors" => {
+                    dissolve_repeat_run = Some(parse_positive(
+                        next_value(&mut args, &argument)?,
+                        "dissolve-repeat-anchors",
+                    )?);
+                }
                 "--sampled-anchors" => {
                     sampled_anchors = true;
                 }
@@ -187,7 +198,8 @@ impl Options {
                     near_exact_dp = true;
                 }
                 "--query-window" => {
-                    query_window = parse_positive(next_value(&mut args, &argument)?, "query-window")?;
+                    query_window =
+                        parse_positive(next_value(&mut args, &argument)?, "query-window")?;
                 }
                 "--bam-compression" => {
                     let value = next_value(&mut args, &argument)?;
@@ -344,6 +356,7 @@ impl Options {
             anchor_k,
             map_window,
             island_lookback,
+            dissolve_repeat_run,
             rarest_first,
             diagonal_band,
             near_exact,
@@ -413,9 +426,9 @@ impl std::fmt::Display for CliError {
                 f,
                 "unknown preset {preset:?}; expected \"standard\", \"fast\", or \"sensitive\""
             ),
-            Self::ConflictingMode => {
-                f.write_str("conflicting alignment modes; choose --fast, --standard, or --sensitive")
-            }
+            Self::ConflictingMode => f.write_str(
+                "conflicting alignment modes; choose --fast, --standard, or --sensitive",
+            ),
             Self::UnknownOption(option) => match suggest_option(option) {
                 Some(suggestion) => write!(
                     f,
@@ -486,6 +499,7 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--anchor-k",
     "--map-window",
     "--island-lookback",
+    "--dissolve-repeat-anchors",
     "--rarest-first",
     "--diagonal-band",
     "--near-exact",
@@ -603,6 +617,12 @@ fn usage() -> &'static str {
         "      --island-lookback N   Predecessors the gap island chain DP examines per\n",
         "                            interval. Unbounded by default; a repetitive gap\n",
         "                            can otherwise reach 1663 intervals in one call\n",
+        "      --dissolve-repeat-anchors N\n",
+        "                            Let one continuous DP replace a run of up to N\n",
+        "                            chained anchors when the span they sit in carries\n",
+        "                            an indel and the DP reads it at least as well. An\n",
+        "                            expansion the scan filled with anchors otherwise\n",
+        "                            comes out short or split (default: off)\n",
         "      --map-window N        Window for the local map's minimizer selection.\n",
         "                            A wider window stores fewer positions (default: 1)\n",
         "      --sampled-anchors     Let a sampled hit list seed anchors inside a\n",
@@ -640,8 +660,7 @@ fn usage() -> &'static str {
 /// and "the index does not contain it" indistinguishable.
 fn print_index_info(index: &MinimizerIndex) {
     let summary = index.summary();
-    let dropped = summary.capped_skipped_hits as f64
-        / summary.entries_before_capping.max(1) as f64;
+    let dropped = summary.capped_skipped_hits as f64 / summary.entries_before_capping.max(1) as f64;
     println!("  format:            v{}", summary.format_version);
     println!(
         "  built by:          flashmap {} on {}",
@@ -1238,6 +1257,7 @@ fn execute_mapping(
         || options.anchor_k.is_some()
         || options.map_window > 1
         || options.island_lookback.is_some()
+        || options.dissolve_repeat_run.is_some()
         || options.rarest_first
         || options.diagonal_band.is_some()
     {
@@ -1267,6 +1287,9 @@ fn execute_mapping(
                 island_chain_lookback: options
                     .island_lookback
                     .unwrap_or(defaults.alignment.island_chain_lookback),
+                dissolve_repeat_run: options
+                    .dissolve_repeat_run
+                    .unwrap_or(defaults.alignment.dissolve_repeat_run),
                 ..defaults.alignment
             },
             worker_pool: mapper_config.runtime.clone(),
@@ -1288,8 +1311,7 @@ fn execute_mapping(
     } else {
         aligner
     };
-    let pool = WorkerPool::new(runtime)
-        .map_err(|error| CliError::Pool(error.to_string()))?;
+    let pool = WorkerPool::new(runtime).map_err(|error| CliError::Pool(error.to_string()))?;
 
     let reads = open_fastx_with_decompressor(&options.reads, decompressor.as_deref())
         .map_err(CliError::Reads)?;
@@ -1371,7 +1393,11 @@ fn execute_mapping(
             "  Record encoding:       {:.3} worker-s ({:.0} MB/s of {} per core)",
             seconds,
             writer.bytes_written() as f64 / 1e6 / seconds.max(1e-9),
-            if options.writes_bam() { "BAM" } else { "SAM text" },
+            if options.writes_bam() {
+                "BAM"
+            } else {
+                "SAM text"
+            },
         );
         // The collector is the only serial stage. Its wall time splits into
         // waiting for workers and pushing bytes at whatever consumes them, so
@@ -1435,6 +1461,12 @@ struct ProfileReporter {
     chained_anchors: AtomicU64,
     chained_on_diagonal_50: AtomicU64,
     chain_ref_gap_buckets: [AtomicU64; 7],
+    anchor_overlap_buckets: [AtomicU64; 7],
+    anchor_overlaps_reference_only: AtomicU64,
+    anchor_overlaps_trimmed: AtomicU64,
+    anchor_overlaps_removed: AtomicU64,
+    anchor_runs_dissolved: AtomicU64,
+    anchors_dissolved: AtomicU64,
     chain_query_gap_buckets: [AtomicU64; 7],
     stage_a_anchors: AtomicU64,
     stage_bc_anchors: AtomicU64,
@@ -1588,8 +1620,14 @@ impl DiagnosticsSink for ProfileReporter {
                 &self.chained_on_diagonal_50,
                 diagnostics.chained_on_diagonal_50,
             ),
-            (&self.stage_a_anchors, u64::from(diagnostics.stage_a_anchors)),
-            (&self.stage_bc_anchors, u64::from(diagnostics.stage_bc_anchors)),
+            (
+                &self.stage_a_anchors,
+                u64::from(diagnostics.stage_a_anchors),
+            ),
+            (
+                &self.stage_bc_anchors,
+                u64::from(diagnostics.stage_bc_anchors),
+            ),
             (&self.stage_a_query_bases, diagnostics.stage_a_query_bases),
             (
                 &self.stage_b_added_query_bases,
@@ -1611,8 +1649,14 @@ impl DiagnosticsSink for ProfileReporter {
                 &self.index_blind_positions,
                 u64::from(diagnostics.index_blind_positions),
             ),
-            (&self.stage_b_entered, u64::from(diagnostics.stage_b_entered)),
-            (&self.stage_c_entered, u64::from(diagnostics.stage_c_entered)),
+            (
+                &self.stage_b_entered,
+                u64::from(diagnostics.stage_b_entered),
+            ),
+            (
+                &self.stage_c_entered,
+                u64::from(diagnostics.stage_c_entered),
+            ),
             (
                 &self.candidates_anchored,
                 u64::from(diagnostics.candidates_anchored),
@@ -1643,7 +1687,10 @@ impl DiagnosticsSink for ProfileReporter {
                 &self.near_exact_single_ended,
                 u64::from(diagnostics.near_exact_single_ended),
             ),
-            (&self.near_exact_loci, u64::from(diagnostics.near_exact_loci)),
+            (
+                &self.near_exact_loci,
+                u64::from(diagnostics.near_exact_loci),
+            ),
             (
                 &self.ambiguous_candidate_stops,
                 diagnostics.ambiguous_candidate_stops as u64,
@@ -1652,6 +1699,23 @@ impl DiagnosticsSink for ProfileReporter {
                 &self.ambiguous_candidates_skipped,
                 diagnostics.ambiguous_candidates_skipped as u64,
             ),
+            (
+                &self.anchor_overlaps_reference_only,
+                diagnostics.anchor_overlaps_reference_only,
+            ),
+            (
+                &self.anchor_overlaps_trimmed,
+                diagnostics.anchor_overlaps_trimmed,
+            ),
+            (
+                &self.anchor_overlaps_removed,
+                diagnostics.anchor_overlaps_removed,
+            ),
+            (
+                &self.anchor_runs_dissolved,
+                diagnostics.anchor_runs_dissolved,
+            ),
+            (&self.anchors_dissolved, diagnostics.anchors_dissolved),
         ] {
             target.fetch_add(value, Ordering::Relaxed);
         }
@@ -1666,6 +1730,13 @@ impl DiagnosticsSink for ProfileReporter {
             .chain_query_gap_buckets
             .iter()
             .zip(diagnostics.chain_query_gap_buckets)
+        {
+            slot.fetch_add(value, Ordering::Relaxed);
+        }
+        for (slot, value) in self
+            .anchor_overlap_buckets
+            .iter()
+            .zip(diagnostics.anchor_overlap_buckets)
         {
             slot.fetch_add(value, Ordering::Relaxed);
         }
@@ -1899,6 +1970,31 @@ impl ProfileReporter {
             }
             eprintln!("    {label:<10} {refs:>12} deletions   {queries:>12} insertions");
         }
+        let trimmed = self.anchor_overlaps_trimmed.load(Ordering::Relaxed);
+        let removed = self.anchor_overlaps_removed.load(Ordering::Relaxed);
+        if trimmed + removed > 0 {
+            let reference_only = self.anchor_overlaps_reference_only.load(Ordering::Relaxed);
+            eprintln!(
+                "  Anchor overlaps:       {trimmed} trimmed, {removed} anchors consumed entirely, \
+                 {reference_only} on the reference axis only"
+            );
+            const OVERLAP_LABELS: [&str; 7] =
+                ["<=4", "5-16", "17-64", "65-256", "257-1k", "1k-4k", "4k+"];
+            for (index, label) in OVERLAP_LABELS.iter().enumerate() {
+                let count = self.anchor_overlap_buckets[index].load(Ordering::Relaxed);
+                if count == 0 {
+                    continue;
+                }
+                eprintln!("    {label:<10} {count:>12}");
+            }
+        }
+        let runs = self.anchor_runs_dissolved.load(Ordering::Relaxed);
+        if runs > 0 {
+            let dissolved = self.anchors_dissolved.load(Ordering::Relaxed);
+            eprintln!(
+                "  Runs dissolved:        {runs} spans re-read by one DP, {dissolved} anchors dropped"
+            );
+        }
         let sampled = self.sampled_lookups_admitted.load(Ordering::Relaxed);
         if sampled > 0 {
             eprintln!(
@@ -1945,7 +2041,11 @@ impl ProfileReporter {
         }
         eprintln!(
             "                        {single} single-ended only; {:.2} mean consistent loci",
-            if two_ended > 0 { loci as f64 / two_ended as f64 } else { 0.0 },
+            if two_ended > 0 {
+                loci as f64 / two_ended as f64
+            } else {
+                0.0
+            },
         );
         eprintln!(
             "  Fast escalation:      {} suspicious gaps; {} ambiguous reads ({} candidates skipped)",
@@ -2074,9 +2174,11 @@ mod tests {
     #[test]
     fn only_the_decompressor_comes_out_of_the_budget() {
         let bam = Options::parse(
-            ["rs-lra", "-i", "r.fmi", "-q", "r.fq", "-o", "out.bam", "-t", "48"]
-                .into_iter()
-                .map(str::to_owned),
+            [
+                "rs-lra", "-i", "r.fmi", "-q", "r.fq", "-o", "out.bam", "-t", "48",
+            ]
+            .into_iter()
+            .map(str::to_owned),
         )
         .unwrap();
         assert_eq!(bam.resolved_workers(true), 47);
@@ -2346,9 +2448,11 @@ mod tests {
         assert_eq!(budget.resolved_workers(true), 47);
 
         let explicit = Options::parse(
-            ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "-t", "48", "-w", "18"]
-                .into_iter()
-                .map(str::to_owned),
+            [
+                "rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "-t", "48", "-w", "18",
+            ]
+            .into_iter()
+            .map(str::to_owned),
         )
         .unwrap();
         assert_eq!(explicit.threads, 48);
@@ -2382,7 +2486,15 @@ mod tests {
     fn parser_accepts_limit_and_query_window() {
         let options = Options::parse(
             [
-                "rs-lra", "-i", "ref.fmi", "-q", "reads.fq", "-n", "1000", "--query-window", "12",
+                "rs-lra",
+                "-i",
+                "ref.fmi",
+                "-q",
+                "reads.fq",
+                "-n",
+                "1000",
+                "--query-window",
+                "12",
             ]
             .into_iter()
             .map(str::to_owned),

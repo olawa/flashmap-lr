@@ -201,7 +201,12 @@ struct LocalKmerMap {
 /// shrink together without choosing different positions.
 ///
 /// A window of `0` or `1` visits every position, which is the dense case.
-fn for_each_minimizer<F: FnMut(usize, u64)>(sequence: &[u8], k: usize, window: usize, mut visit: F) {
+fn for_each_minimizer<F: FnMut(usize, u64)>(
+    sequence: &[u8],
+    k: usize,
+    window: usize,
+    mut visit: F,
+) {
     if k == 0 || k > 32 || sequence.len() < k {
         return;
     }
@@ -211,7 +216,8 @@ fn for_each_minimizer<F: FnMut(usize, u64)>(sequence: &[u8], k: usize, window: u
         (1u64 << (2 * k)) - 1
     };
     let dense = window <= 1;
-    let mut deque: std::collections::VecDeque<(usize, u64, u64)> = std::collections::VecDeque::new();
+    let mut deque: std::collections::VecDeque<(usize, u64, u64)> =
+        std::collections::VecDeque::new();
     let mut last_emitted: Option<usize> = None;
     let mut fwd = 0u64;
     let mut rc = 0u64;
@@ -250,7 +256,10 @@ fn for_each_minimizer<F: FnMut(usize, u64)>(sequence: &[u8], k: usize, window: u
         }
         deque.push_back((kmers, key, fwd));
         let window_start = (kmers + 1).saturating_sub(window);
-        while deque.front().is_some_and(|&(index, _, _)| index < window_start) {
+        while deque
+            .front()
+            .is_some_and(|&(index, _, _)| index < window_start)
+        {
             deque.pop_front();
         }
         if kmers + 1 >= window {
@@ -597,26 +606,23 @@ fn find_anchors_with_seed_hits_depth(
     // query and the local k-mer map is then built over all of it.
     let flank = anchor_policy.reference_flank.min(read.sequence.len()) as u64;
     let window_start = candidate.ref_start.saturating_sub(flank) as usize;
-    let window_end = candidate
-        .ref_end
-        .saturating_add(flank)
-        .min(reference_len) as usize;
+    let window_end = candidate.ref_end.saturating_add(flank).min(reference_len) as usize;
     if window_start >= window_end || window_end > contig.sequence.len() {
         return Err(AnchorError::InvalidCandidateBounds);
     }
 
     let (mut raw_minimizer_positions, mut matching_seed_hits, sampled_admitted) =
         collect_matching_seed_hits(
-        query_seed_hits,
-        read.sequence.len(),
-        candidate,
-        k,
-        (window_start, window_end),
-        SeedHitLimits {
-            allow_sampled: anchor_policy.allow_sampled_anchors,
-            max_seed_hits: anchor_policy.max_seed_hits,
-        },
-    );
+            query_seed_hits,
+            read.sequence.len(),
+            candidate,
+            k,
+            (window_start, window_end),
+            SeedHitLimits {
+                allow_sampled: anchor_policy.allow_sampled_anchors,
+                max_seed_hits: anchor_policy.max_seed_hits,
+            },
+        );
     raw_minimizer_positions.sort_unstable();
     raw_minimizer_positions.dedup();
     matching_seed_hits.sort_unstable_by_key(|seed| seed.query_pos);
@@ -951,9 +957,7 @@ fn find_anchors_with_seed_hits_depth(
     }
 
     if let Some(stats) = diagnostics.as_mut() {
-        stats.local_kmer_map_builds = stats
-            .local_kmer_map_builds
-            .saturating_add(map_builds.get());
+        stats.local_kmer_map_builds = stats.local_kmer_map_builds.saturating_add(map_builds.get());
         stats.local_kmer_map_nanos = stats.local_kmer_map_nanos.saturating_add(map_nanos.get());
         stats.scan_positions_visited = stats
             .scan_positions_visited
@@ -1119,7 +1123,11 @@ fn collect_matching_seed_hits(
             });
         }
     }
-    (raw_minimizer_positions, matching_seed_hits, sampled_admitted)
+    (
+        raw_minimizer_positions,
+        matching_seed_hits,
+        sampled_admitted,
+    )
 }
 
 fn build_paired_staging(
@@ -1167,26 +1175,18 @@ fn build_paired_staging(
                 let (min_right, max_right) = match strand {
                     Strand::Forward => (
                         left_ref.saturating_add(
-                            query_distance
-                                .saturating_sub(policy.paired_distance_tolerance)
-                                as u64,
+                            query_distance.saturating_sub(policy.paired_distance_tolerance) as u64,
                         ),
                         left_ref.saturating_add(
-                            query_distance
-                                .saturating_add(policy.paired_distance_tolerance)
-                                as u64,
+                            query_distance.saturating_add(policy.paired_distance_tolerance) as u64,
                         ),
                     ),
                     Strand::Reverse => (
                         left_ref.saturating_sub(
-                            query_distance
-                                .saturating_add(policy.paired_distance_tolerance)
-                                as u64,
+                            query_distance.saturating_add(policy.paired_distance_tolerance) as u64,
                         ),
                         left_ref.saturating_sub(
-                            query_distance
-                                .saturating_sub(policy.paired_distance_tolerance)
-                                as u64,
+                            query_distance.saturating_sub(policy.paired_distance_tolerance) as u64,
                         ),
                     ),
                 };
@@ -1216,9 +1216,7 @@ fn build_paired_staging(
                             }
                             Entry::Occupied(slot) => {
                                 let existing = &mut emms_pairs[*slot.get()];
-                                let widest = existing
-                                    .q_right
-                                    .saturating_sub(existing.q_left);
+                                let widest = existing.q_right.saturating_sub(existing.q_left);
                                 if query_distance > widest {
                                     *existing = pair;
                                 }
@@ -1373,11 +1371,7 @@ fn build_paired_emms_anchor(
         if next_ref < window_start as u64 || next_ref >= window_end as u64 {
             break;
         }
-        if !bases_match(
-            read[q_end],
-            reference[next_ref as usize],
-            candidate.strand,
-        ) {
+        if !bases_match(read[q_end], reference[next_ref as usize], candidate.strand) {
             break;
         }
         q_end += 1;
@@ -1442,10 +1436,10 @@ fn extend_exact_anchor(request: ExactAnchorRequest<'_>) -> Option<Anchor> {
     let ref_seed_start_usize = ref_seed_start as usize;
     if !seed_verified
         && !(0..k).all(|offset| {
-        let ref_offset = match strand {
-            Strand::Forward => offset,
-            Strand::Reverse => k - 1 - offset,
-        };
+            let ref_offset = match strand {
+                Strand::Forward => offset,
+                Strand::Reverse => k - 1 - offset,
+            };
             bases_match(
                 read[q_seed_start + offset],
                 reference[ref_seed_start_usize + ref_offset],
@@ -1804,7 +1798,9 @@ mod tests {
         fn visit_hits(&self, seed: &QuerySeed, visit: &mut dyn FnMut(SeedHit)) -> SeedLookup {
             let mut state = seed.query_pos as u64 * 2_654_435_761 + 12_345;
             for _ in 0..self.hits_per_seed {
-                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
                 let draw = state >> 33;
                 // A narrow position range on purpose: the windows below then
                 // land on exact hit positions often enough to exercise both
@@ -1846,8 +1842,8 @@ mod tests {
                 // Every window in the fixture's position range, including ones
                 // narrower than a seed span and ones whose ends coincide with
                 // a stored hit.
-                let windows = (0usize..48)
-                    .flat_map(|start| (start + 1..=48).map(move |end| (start, end)));
+                let windows =
+                    (0usize..48).flat_map(|start| (start + 1..=48).map(move |end| (start, end)));
                 for (window_start, window_end) in windows {
                     let mut region = candidate(48, strand);
                     region.contig = ContigId(contig);
@@ -1866,13 +1862,8 @@ mod tests {
                         .into_iter()
                         .map(|seed| (seed.query_pos, seed.ref_positions))
                         .collect();
-                    let expected = window_filter_oracle(
-                        &cached,
-                        read_len,
-                        &region,
-                        window_start,
-                        window_end,
-                    );
+                    let expected =
+                        window_filter_oracle(&cached, read_len, &region, window_start, window_end);
                     assert_eq!(
                         observed, expected,
                         "contig {contig}, {strand:?}, window {window_start}..{window_end}",

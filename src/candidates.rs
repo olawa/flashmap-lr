@@ -310,7 +310,11 @@ fn add_cluster(
         + cluster.len() as i32
         + endpoint_bonus;
 
-    let q_start = cluster.iter().map(|hit| hit.probe.read_pos).min().unwrap_or(0);
+    let q_start = cluster
+        .iter()
+        .map(|hit| hit.probe.read_pos)
+        .min()
+        .unwrap_or(0);
     let q_end = cluster
         .iter()
         .map(|hit| hit.probe.read_pos)

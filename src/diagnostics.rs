@@ -91,6 +91,31 @@ pub struct ReadDiagnostics {
     pub chain_ref_gap_buckets: [u64; 7],
     /// The same for the query side, which is the biggest insertion.
     pub chain_query_gap_buckets: [u64; 7],
+    /// Overlaps between consecutive chained anchors, bucketed by size.
+    ///
+    /// Exact extension stops at the first mismatch. Inside a tandem repeat
+    /// every copy matches, so an anchor entering the repeat from the left
+    /// runs to the far end of it and the next anchor runs back to the near
+    /// end -- they overlap by roughly the repeat. Resolving that overlap
+    /// costs the chain the span it should have handed to the gap DP, so a
+    /// repeat expansion can come out a whole number of copies short. These
+    /// buckets say how large the overlaps actually are.
+    pub anchor_overlap_buckets: [u64; 7],
+    /// Overlaps that appear on the reference axis only.
+    ///
+    /// A query-side overlap is two anchors covering the same read bases,
+    /// which is ordinary. Reference-only is the expansion signature: the
+    /// read moved on while both anchors sat on the same reference span.
+    pub anchor_overlaps_reference_only: u64,
+    /// Anchors the overlap resolution trimmed, and the ones it consumed
+    /// entirely. A removal loses evidence the chainer had already accepted.
+    pub anchor_overlaps_trimmed: u64,
+    pub anchor_overlaps_removed: u64,
+    /// Runs of chained anchors one continuous DP replaced, and how many
+    /// anchors that cost. Zero means --dissolve-repeat-anchors changed
+    /// nothing, whatever else moved.
+    pub anchor_runs_dissolved: u64,
+    pub anchors_dissolved: u64,
     pub stage_a_anchors: u32,
     pub stage_bc_anchors: u32,
     pub stage_a_query_bases: u64,

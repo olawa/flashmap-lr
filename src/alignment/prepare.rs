@@ -70,7 +70,26 @@ pub(super) fn orient_anchors(
 /// repeat or a matched indel. FlashMap trims the left span in this situation;
 /// doing the same before gap assembly prevents an invalid negative gap from
 /// turning into a dropped read.
-pub(super) fn normalize_anchor_overlaps(mut anchors: Vec<OrientedAnchor>) -> Vec<OrientedAnchor> {
+/// What resolving the overlaps cost, for the caller to record.
+#[derive(Default)]
+pub(super) struct OverlapStats {
+    pub buckets: [u64; 7],
+    pub dissolved_runs: u64,
+    pub dissolved_anchors: u64,
+    pub reference_only: u64,
+    pub trimmed: u64,
+    pub removed: u64,
+}
+
+#[cfg(test)]
+pub(super) fn normalize_anchor_overlaps(anchors: Vec<OrientedAnchor>) -> Vec<OrientedAnchor> {
+    normalize_anchor_overlaps_measured(anchors, &mut OverlapStats::default())
+}
+
+pub(super) fn normalize_anchor_overlaps_measured(
+    mut anchors: Vec<OrientedAnchor>,
+    stats: &mut OverlapStats,
+) -> Vec<OrientedAnchor> {
     // Removing an anchor can expose a second overlap between its predecessor
     // and successor.  Walk back after every removal so the final list is
     // genuinely monotonic; a single forward pass is insufficient for
@@ -85,6 +104,12 @@ pub(super) fn normalize_anchor_overlaps(mut anchors: Vec<OrientedAnchor>) -> Vec
         if overlap == 0 {
             index += 1;
             continue;
+        }
+        const EDGES: [usize; 7] = [4, 16, 64, 256, 1_024, 4_096, usize::MAX];
+        let bucket = EDGES.iter().position(|&edge| overlap <= edge).unwrap_or(6);
+        stats.buckets[bucket] = stats.buckets[bucket].saturating_add(1);
+        if overlap_ref > overlap_q {
+            stats.reference_only = stats.reference_only.saturating_add(1);
         }
 
         let left_q_len = left.q_end.saturating_sub(left.q_start);
@@ -113,8 +138,10 @@ pub(super) fn normalize_anchor_overlaps(mut anchors: Vec<OrientedAnchor>) -> Vec
                 != anchors[index].ref_end - anchors[index].ref_start
         {
             anchors.remove(index);
+            stats.removed = stats.removed.saturating_add(1);
             index = index.saturating_sub(1);
         } else {
+            stats.trimmed = stats.trimmed.saturating_add(1);
             index += 1;
         }
     }
@@ -196,6 +223,153 @@ fn score_cigar_ops(
         }
     }
     score
+}
+
+/// Replace a run of chained anchors with one continuous DP when the span they
+/// sit in carries an indel and the DP reads it at least as well.
+///
+/// Exact extension stops at the first mismatch, and inside a tandem repeat
+/// there is no mismatch to stop at -- every copy matches on every diagonal.
+/// The scan therefore manufactures anchors right through the repeat, chaining
+/// threads a colinear path between them, and the gap DP is handed only what
+/// is left over between them. An expansion then comes out a whole number of
+/// copies short, or split into a run of small indels, because the interior
+/// anchors pinned a register that the whole event contradicts.
+///
+/// The existing register-shift unlock removes one short STR anchor at a time.
+/// This removes the whole run at once, and asks the same question the unlock
+/// asks: does one continuous alignment over the span score at least as well
+/// with fewer gap opens? If the interior anchors are genuine, it does not,
+/// and nothing changes. The candidate spans are only those whose flanking
+/// geometry already shows a real indel, so the DP runs a handful of times per
+/// read rather than per anchor.
+///
+/// Returns the anchors kept, and counts the runs it dissolved.
+pub(super) fn dissolve_indel_spanning_anchor_runs(
+    mut anchors: Vec<OrientedAnchor>,
+    query: &[u8],
+    reference: &[u8],
+    gap_policy: &GapPolicy,
+    scoring_policy: &ScoringPolicy,
+    stats: &mut OverlapStats,
+) -> Vec<OrientedAnchor> {
+    let max_run = gap_policy.dissolve_repeat_run;
+    if max_run == 0 || anchors.len() < 3 {
+        return anchors;
+    }
+    // A span is only worth a DP if the anchors around it already disagree
+    // about length by more than sequencing noise would explain.
+    const MIN_INDEL: usize = 20;
+
+    let mut left = 0usize;
+    while left + 2 < anchors.len() {
+        // The longest run this left flank can bound, shortest span first so
+        // the DP stays inside its budget.
+        let limit = (left + 1 + max_run).min(anchors.len() - 1);
+        let mut dissolved = false;
+        for right in (left + 2..=limit).rev() {
+            let (flank_left, flank_right) = (&anchors[left], &anchors[right]);
+            let query_span = flank_right.q_start.saturating_sub(flank_left.q_end);
+            let reference_span = flank_right.ref_start.saturating_sub(flank_left.ref_end);
+            if query_span == 0 || reference_span == 0 {
+                continue;
+            }
+            if query_span.abs_diff(reference_span) < MIN_INDEL {
+                continue;
+            }
+            if query_span > gap_policy.medium_gap_dp_max
+                || reference_span > gap_policy.medium_gap_dp_max
+            {
+                continue;
+            }
+            let (Some(q_sub), Some(ref_sub)) = (
+                query.get(flank_left.q_end..flank_right.q_start),
+                reference.get(flank_left.ref_end..flank_right.ref_start),
+            ) else {
+                continue;
+            };
+
+            // The path as chained: every interior anchor pinned, with the
+            // gaps between them resolved the way assembly would resolve them.
+            let mut split_ops = Vec::new();
+            let mut cursor = (flank_left.q_end, flank_left.ref_end);
+            let mut buildable = true;
+            for anchor in &anchors[left + 1..right] {
+                if append_gap_with_policy(
+                    &mut split_ops,
+                    query,
+                    reference,
+                    cursor.0,
+                    anchor.q_start,
+                    cursor.1,
+                    anchor.ref_start,
+                    gap_policy,
+                    None,
+                )
+                .is_err()
+                {
+                    buildable = false;
+                    break;
+                }
+                split_ops.push(CigarOp::Match((anchor.q_end - anchor.q_start) as u32));
+                cursor = (anchor.q_end, anchor.ref_end);
+            }
+            if !buildable
+                || append_gap_with_policy(
+                    &mut split_ops,
+                    query,
+                    reference,
+                    cursor.0,
+                    flank_right.q_start,
+                    cursor.1,
+                    flank_right.ref_start,
+                    gap_policy,
+                    None,
+                )
+                .is_err()
+            {
+                continue;
+            }
+
+            let mut continuous_ops = Vec::new();
+            if append_gap_with_policy(
+                &mut continuous_ops,
+                query,
+                reference,
+                flank_left.q_end,
+                flank_right.q_start,
+                flank_left.ref_end,
+                flank_right.ref_start,
+                gap_policy,
+                None,
+            )
+            .is_err()
+            {
+                continue;
+            }
+
+            let split_score = score_cigar_ops(&split_ops, q_sub, ref_sub, scoring_policy);
+            let continuous_score = score_cigar_ops(&continuous_ops, q_sub, ref_sub, scoring_policy);
+            if continuous_score > split_score
+                || (continuous_score == split_score
+                    && count_gap_opens(&continuous_ops) < count_gap_opens(&split_ops))
+            {
+                stats.dissolved_runs = stats.dissolved_runs.saturating_add(1);
+                stats.dissolved_anchors = stats
+                    .dissolved_anchors
+                    .saturating_add((right - left - 1) as u64);
+                anchors.drain(left + 1..right);
+                dissolved = true;
+                break;
+            }
+        }
+        // A dissolved run can expose a longer one across the same flank, so
+        // the left flank is only advanced when nothing was removed.
+        if !dissolved {
+            left += 1;
+        }
+    }
+    anchors
 }
 
 /// Guarded register-shift realignment:

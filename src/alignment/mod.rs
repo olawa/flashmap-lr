@@ -33,12 +33,7 @@ pub(crate) fn normalize_banded_cigar(
         normalization_policy,
         scoring_policy,
     );
-    normalize::collapse_balanced_indels_to_mnvs(
-        ops,
-        reference,
-        oriented_query,
-        *ref_start,
-    );
+    normalize::collapse_balanced_indels_to_mnvs(ops, reference, oriented_query, *ref_start);
     normalize::left_align_indels_with_policy(
         ops,
         reference,
@@ -47,11 +42,6 @@ pub(crate) fn normalize_banded_cigar(
         normalization_policy,
         scoring_policy,
     );
-    normalize::collapse_balanced_indels_to_mnvs(
-        ops,
-        reference,
-        oriented_query,
-        *ref_start,
-    );
+    normalize::collapse_balanced_indels_to_mnvs(ops, reference, oriented_query, *ref_start);
     normalize::clean_cigar_edges(ops, ref_start);
 }

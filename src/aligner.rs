@@ -356,7 +356,11 @@ impl<'a> Aligner<'a> {
                 // uncovered split segment.
                 if top_has_both_ends
                     && candidate.endpoint_support == crate::EndpointSupport::InternalOnly
-                    && !candidate_explains_new_query(candidate, &placements, &self.policy.structural)
+                    && !candidate_explains_new_query(
+                        candidate,
+                        &placements,
+                        &self.policy.structural,
+                    )
                 {
                     search_completeness = SearchCompleteness::Limited;
                     continue;
@@ -686,9 +690,7 @@ impl<'a> Aligner<'a> {
                     &self.policy.chaining,
                 );
                 if let Some(chain) = chain_set.primary.take() {
-                    if chain.query_covered_bases
-                        >= self.policy.structural.min_supplementary_bases
-                    {
+                    if chain.query_covered_bases >= self.policy.structural.min_supplementary_bases {
                         diagnostics.reseed_placements =
                             diagnostics.reseed_placements.saturating_add(1);
                         placements.push((candidate.contig, chain, candidate.endpoint_support));
@@ -982,8 +984,10 @@ impl<'a> Aligner<'a> {
         {
             // Group this interval's hits by locus. A short segment yields few
             // seeds, so every hit is worth grouping rather than sampling.
-            let mut groups: std::collections::HashMap<(crate::ContigId, crate::Strand, i64), (u64, u64, u32)> =
-                std::collections::HashMap::new();
+            let mut groups: std::collections::HashMap<
+                (crate::ContigId, crate::Strand, i64),
+                (u64, u64, u32),
+            > = std::collections::HashMap::new();
             for (index, seed) in query_seeds.iter().enumerate() {
                 let position = seed.query_pos as usize;
                 if position < q_start || position + seed_span > q_end {
@@ -1005,19 +1009,24 @@ impl<'a> Aligner<'a> {
                             seed.query_pos as i64 + hit.ref_pos as i64 + seed_span as i64 - 1
                         }
                     };
-                    let band = if tolerance > 0 { diagonal / tolerance } else { diagonal };
-                    let entry = groups
-                        .entry((hit.contig, strand, band))
-                        .or_insert((hit.ref_pos, hit.ref_pos, 0));
+                    let band = if tolerance > 0 {
+                        diagonal / tolerance
+                    } else {
+                        diagonal
+                    };
+                    let entry = groups.entry((hit.contig, strand, band)).or_insert((
+                        hit.ref_pos,
+                        hit.ref_pos,
+                        0,
+                    ));
                     entry.0 = entry.0.min(hit.ref_pos);
                     entry.1 = entry.1.max(hit.ref_pos);
                     entry.2 = entry.2.saturating_add(1);
                 }
             }
 
-            let Some((&(contig, strand, _), &(ref_start, ref_last, support))) = groups
-                .iter()
-                .max_by_key(|(_, (_, _, support))| *support)
+            let Some((&(contig, strand, _), &(ref_start, ref_last, support))) =
+                groups.iter().max_by_key(|(_, (_, _, support))| *support)
             else {
                 continue;
             };
@@ -1078,9 +1087,12 @@ impl<'a> Aligner<'a> {
         if drift > policy.near_exact_dp_max_drift {
             return Ok(None);
         }
-        let contig = self.reference.contig(candidate.contig).ok_or(MapError::Anchor(
-            crate::AnchorError::MissingReference(candidate.contig),
-        ))?;
+        let contig = self
+            .reference
+            .contig(candidate.contig)
+            .ok_or(MapError::Anchor(crate::AnchorError::MissingReference(
+                candidate.contig,
+            )))?;
         let start = candidate.ref_start as usize;
         let end = (candidate.ref_end as usize).min(contig.sequence.len());
         let window = contig.sequence.get(start..end).filter(|w| !w.is_empty());
@@ -1467,7 +1479,14 @@ fn probe_near_exact_potential(
 ) {
     let mut loci = Vec::new();
     let mut single_ended = false;
-    find_two_ended_loci(read_len, query_seeds, hits, policy, &mut loci, &mut single_ended);
+    find_two_ended_loci(
+        read_len,
+        query_seeds,
+        hits,
+        policy,
+        &mut loci,
+        &mut single_ended,
+    );
     if single_ended {
         diagnostics.near_exact_single_ended = 1;
     }
@@ -1517,7 +1536,9 @@ fn near_exact_mapq(
     // Divergence at or below what a clean HiFi read shows is not evidence
     // against the placement, so it costs nothing.
     const CLEAN_DIVERGENCE: f64 = 0.02;
-    let ceiling = policy.near_exact_dp_max_divergence.max(CLEAN_DIVERGENCE + 1e-6);
+    let ceiling = policy
+        .near_exact_dp_max_divergence
+        .max(CLEAN_DIVERGENCE + 1e-6);
     let sequence = ((ceiling - divergence) / (ceiling - CLEAN_DIVERGENCE)).clamp(0.0, 1.0);
 
     let max_drift = policy.near_exact_dp_max_drift.max(1) as f64;
@@ -1525,7 +1546,9 @@ fn near_exact_mapq(
 
     let uniqueness = if seed_frequency <= 1 { 1.0 } else { 0.85 };
 
-    (60.0 * sequence * geometry * uniqueness).round().clamp(0.0, 60.0) as u8
+    (60.0 * sequence * geometry * uniqueness)
+        .round()
+        .clamp(0.0, 60.0) as u8
 }
 
 /// Query spans of at least `minimum` bases that no placement explains.
@@ -1618,7 +1641,12 @@ fn candidate_explains_new_query(
     let covered: u32 = placements
         .iter()
         .map(|(_, chain, _)| {
-            interval_overlap(candidate.q_start, candidate.q_end, chain.q_start, chain.q_end)
+            interval_overlap(
+                candidate.q_start,
+                candidate.q_end,
+                chain.q_start,
+                chain.q_end,
+            )
         })
         .sum();
     // The same threshold the supplementary selector uses, so a candidate is
@@ -1792,7 +1820,10 @@ mod tests {
         // difference loses most of its confidence well before the rejection
         // threshold refuses it outright.
         assert!(near_exact_mapq(0.05, 0, 1, &policy) < 40);
-        assert_eq!(near_exact_mapq(policy.near_exact_dp_max_divergence, 0, 1, &policy), 0);
+        assert_eq!(
+            near_exact_mapq(policy.near_exact_dp_max_divergence, 0, 1, &policy),
+            0
+        );
         // Drift is softer: a real indel between the ends widens it too, so it
         // can halve the score but not erase it.
         let tight = near_exact_mapq(0.005, 0, 1, &policy);

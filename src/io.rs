@@ -381,10 +381,7 @@ impl Drop for ChildReader {
 /// Callers need this before opening, because a spawned decompressor competes
 /// for the same cores as the mapper workers and has to be budgeted for rather
 /// than added on top of them.
-pub fn resolve_decompressor(
-    path: impl AsRef<Path>,
-    requested: Option<&str>,
-) -> Option<String> {
+pub fn resolve_decompressor(path: impl AsRef<Path>, requested: Option<&str>) -> Option<String> {
     let path = path.as_ref();
     let mut file = File::open(path).ok()?;
     let mut magic = [0u8; 2];
@@ -801,11 +798,7 @@ impl SamRecordFormatter {
         Ok(())
     }
 
-    fn write_sa_entry<W: Write>(
-        &self,
-        out: &mut W,
-        alignment: &Alignment,
-    ) -> Result<(), SamError> {
+    fn write_sa_entry<W: Write>(&self, out: &mut W, alignment: &Alignment) -> Result<(), SamError> {
         let name = self.alignment_contig_name(alignment)?;
         let pos = alignment
             .ref_start
@@ -887,7 +880,6 @@ impl<W: Write> SamWriter<W> {
         self.writer
     }
 }
-
 
 fn write_optional_fields<W: Write>(
     writer: &mut W,
@@ -998,10 +990,7 @@ impl SamtoolsSortSink {
     ) -> io::Result<Self> {
         let threads = threads.max(1);
         let mut command = Command::new("samtools");
-        command
-            .arg("sort")
-            .arg("-@")
-            .arg(threads.to_string());
+        command.arg("sort").arg("-@").arg(threads.to_string());
         if let Some(memory) = sort_memory {
             // samtools applies -m per sort thread.
             command.arg("-m").arg(memory);
@@ -1276,7 +1265,10 @@ mod tests {
     fn pigz_is_held_to_one_inflate_thread() {
         assert_eq!(with_thread_limit("pigz -dc"), "pigz -dc -p 1");
         assert_eq!(with_thread_limit("unpigz -c"), "unpigz -c -p 1");
-        assert_eq!(with_thread_limit("/usr/bin/pigz -dc"), "/usr/bin/pigz -dc -p 1");
+        assert_eq!(
+            with_thread_limit("/usr/bin/pigz -dc"),
+            "/usr/bin/pigz -dc -p 1"
+        );
     }
 
     #[test]

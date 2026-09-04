@@ -96,7 +96,9 @@ fn write_bgzf_block(payload: &[u8], out: &mut Vec<u8>) {
     let deflate_len = 5 + payload.len();
     let block_size = 18 + deflate_len + 8;
     let header_start = out.len();
-    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0xff, 6, 0, b'B', b'C', 2, 0]);
+    out.extend_from_slice(&[
+        0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0xff, 6, 0, b'B', b'C', 2, 0,
+    ]);
     out.extend_from_slice(&((block_size - 1) as u16).to_le_bytes());
     debug_assert_eq!(out.len() - header_start, 18);
 
@@ -166,10 +168,7 @@ impl BamRecordEncoder {
     }
 
     fn ref_id(&self, contig: ContigId) -> i32 {
-        self.ref_ids
-            .get(contig.0 as usize)
-            .copied()
-            .unwrap_or(-1)
+        self.ref_ids.get(contig.0 as usize).copied().unwrap_or(-1)
     }
 
     /// The BAM header, framed as BGZF, for the start of the stream.
@@ -445,13 +444,27 @@ mod tests {
         let payload = b"the quick brown fox";
         let mut out = Vec::new();
         write_bgzf_block(payload, &mut out);
-        assert_eq!(&out[..4], &[0x1f, 0x8b, 0x08, 0x04], "gzip magic and FEXTRA");
+        assert_eq!(
+            &out[..4],
+            &[0x1f, 0x8b, 0x08, 0x04],
+            "gzip magic and FEXTRA"
+        );
         assert_eq!(&out[12..14], b"BC", "the BGZF subfield");
         let bsize = u16::from_le_bytes([out[16], out[17]]) as usize + 1;
         assert_eq!(bsize, out.len(), "BSIZE counts the whole block");
-        let crc = u32::from_le_bytes([out[out.len() - 8], out[out.len() - 7], out[out.len() - 6], out[out.len() - 5]]);
+        let crc = u32::from_le_bytes([
+            out[out.len() - 8],
+            out[out.len() - 7],
+            out[out.len() - 6],
+            out[out.len() - 5],
+        ]);
         assert_eq!(crc, crc32fast::hash(payload));
-        let isize_field = u32::from_le_bytes([out[out.len() - 4], out[out.len() - 3], out[out.len() - 2], out[out.len() - 1]]);
+        let isize_field = u32::from_le_bytes([
+            out[out.len() - 4],
+            out[out.len() - 3],
+            out[out.len() - 2],
+            out[out.len() - 1],
+        ]);
         assert_eq!(isize_field as usize, payload.len());
     }
 

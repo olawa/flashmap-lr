@@ -14,8 +14,8 @@ use super::normalize::{
 #[cfg(test)]
 use super::normalize::{largest_nm_preserving_shift, left_align_indels};
 use super::prepare::{
-    chain_strand, normalize_anchor_overlaps, orient_anchors, oriented_query,
-    unlock_register_shifted_str_anchors_with_policy,
+    chain_strand, dissolve_indel_spanning_anchor_runs, normalize_anchor_overlaps_measured,
+    orient_anchors, oriented_query, unlock_register_shifted_str_anchors_with_policy,
 };
 #[cfg(test)]
 use super::prepare::{count_gap_opens, unlock_register_shifted_str_anchors, OrientedAnchor};
@@ -257,8 +257,19 @@ fn build_chain_cigar_with_policy(
     mut diagnostics: Option<&mut crate::ReadDiagnostics>,
 ) -> Result<(Cigar, usize, Vec<u8>), ChainCigarError> {
     let oriented_query = oriented_query(read.sequence, chain_strand(chain)?);
-    let raw_anchors =
-        normalize_anchor_overlaps(orient_anchors(chain, read.sequence.len(), contig)?);
+    let mut overlaps = super::prepare::OverlapStats::default();
+    let raw_anchors = normalize_anchor_overlaps_measured(
+        orient_anchors(chain, read.sequence.len(), contig)?,
+        &mut overlaps,
+    );
+    let raw_anchors = dissolve_indel_spanning_anchor_runs(
+        raw_anchors,
+        &oriented_query,
+        contig.sequence,
+        gap_policy,
+        scoring_policy,
+        &mut overlaps,
+    );
     let anchors = unlock_register_shifted_str_anchors_with_policy(
         raw_anchors,
         &oriented_query,
@@ -266,6 +277,31 @@ fn build_chain_cigar_with_policy(
         gap_policy,
         scoring_policy,
     );
+    if let Some(diagnostics) = diagnostics.as_deref_mut() {
+        for (slot, value) in diagnostics
+            .anchor_overlap_buckets
+            .iter_mut()
+            .zip(overlaps.buckets)
+        {
+            *slot = slot.saturating_add(value);
+        }
+        diagnostics.anchor_overlaps_reference_only = diagnostics
+            .anchor_overlaps_reference_only
+            .saturating_add(overlaps.reference_only);
+        diagnostics.anchor_overlaps_trimmed = diagnostics
+            .anchor_overlaps_trimmed
+            .saturating_add(overlaps.trimmed);
+        diagnostics.anchor_overlaps_removed = diagnostics
+            .anchor_overlaps_removed
+            .saturating_add(overlaps.removed);
+        diagnostics.anchor_runs_dissolved = diagnostics
+            .anchor_runs_dissolved
+            .saturating_add(overlaps.dissolved_runs);
+        diagnostics.anchors_dissolved = diagnostics
+            .anchors_dissolved
+            .saturating_add(overlaps.dissolved_anchors);
+    }
+
     let first = anchors.first().ok_or(ChainCigarError::EmptyChain)?;
     let last = anchors.last().ok_or(ChainCigarError::EmptyChain)?;
     let mut ref_start = first.ref_start;
@@ -786,9 +822,7 @@ fn try_append_exact_island_chain(
     let reference_slice = reference
         .get(ref_start..ref_end)
         .ok_or(ChainCigarError::InvalidReferenceCoordinates)?;
-    let island_started = diagnostics
-        .as_ref()
-        .map(|_| std::time::Instant::now());
+    let island_started = diagnostics.as_ref().map(|_| std::time::Instant::now());
     let island_search = find_exact_island_chain(
         query_slice,
         reference_slice,
@@ -808,9 +842,7 @@ fn try_append_exact_island_chain(
         stats.island_max_intervals = stats.island_max_intervals.max(island_search.intervals);
         stats.exact_island_nanos = stats
             .exact_island_nanos
-            .saturating_add(
-                island_started.map_or(0, crate::diagnostics::elapsed_nanos),
-            );
+            .saturating_add(island_started.map_or(0, crate::diagnostics::elapsed_nanos));
         stats.exact_island_max_bucket = stats
             .exact_island_max_bucket
             .max(island_search.max_bucket as u32);
@@ -1094,8 +1126,7 @@ fn find_exact_island_chain(
         search.chain = Some(chain);
     }
     search.compared = compared;
-    {
-    }
+    {}
     search
 }
 
@@ -1330,7 +1361,7 @@ mod tests {
                 ref_end: 20,
             },
         ];
-        let normalized = normalize_anchor_overlaps(anchors);
+        let normalized = crate::alignment::prepare::normalize_anchor_overlaps(anchors);
         assert_eq!(
             normalized,
             vec![
@@ -1497,7 +1528,8 @@ mod tests {
         reference.reverse();
         assert_eq!(query.len(), reference.len());
 
-        let mut policy = ResolvedMapperPolicy::from_mapper_config(&MapperConfig::default()).unwrap();
+        let mut policy =
+            ResolvedMapperPolicy::from_mapper_config(&MapperConfig::default()).unwrap();
         // Decline every DP and rescue stage so the fallback is the only path.
         policy.gaps.bridge_max_gap = 0;
         policy.gaps.small_gap_dp_max = 0;
@@ -1552,7 +1584,8 @@ mod tests {
         // resolution is a quality rule shared by Fast, Standard, and
         // Sensitive. Build the bounded policy directly so the escalation
         // path itself stays covered.
-        let mut policy = ResolvedMapperPolicy::from_mapper_config(&MapperConfig::default()).unwrap();
+        let mut policy =
+            ResolvedMapperPolicy::from_mapper_config(&MapperConfig::default()).unwrap();
         policy.gaps.recursive_split_max_depth = 2;
         policy.gaps.recursive_split_max_gap = 4_096;
         policy.gaps.recursive_split_trigger_nm_permille = 50;
@@ -1709,6 +1742,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn dissolving_config(run: usize) -> crate::config::GapPolicy {
+        let mut policy = crate::config::ResolvedMapperPolicy::from_legacy_config(&config())
+            .expect("test configuration resolves to an anchor policy");
+        policy.gaps.dissolve_repeat_run = run;
+        policy.gaps
+    }
+
+    #[test]
+    fn a_run_of_repeat_interior_anchors_gives_way_to_one_dp() {
+        // A 20 bp expansion of a 2 bp unit, with two interior anchors that
+        // pin the wrong register: the chain spells it as several small gaps
+        // where one continuous insertion says the same thing for less.
+        let reference = b"AC".repeat(60);
+        let query = b"AC".repeat(70);
+        let scoring = crate::config::ResolvedMapperPolicy::from_legacy_config(&config())
+            .expect("test configuration resolves to an anchor policy")
+            .scoring;
+        let anchors = vec![
+            OrientedAnchor {
+                q_start: 0,
+                q_end: 30,
+                ref_start: 0,
+                ref_end: 30,
+            },
+            OrientedAnchor {
+                q_start: 40,
+                q_end: 60,
+                ref_start: 34,
+                ref_end: 54,
+            },
+            OrientedAnchor {
+                q_start: 70,
+                q_end: 90,
+                ref_start: 58,
+                ref_end: 78,
+            },
+            OrientedAnchor {
+                q_start: 100,
+                q_end: 120,
+                ref_start: 80,
+                ref_end: 100,
+            },
+        ];
+
+        let untouched = super::dissolve_indel_spanning_anchor_runs(
+            anchors.clone(),
+            &query,
+            &reference,
+            &dissolving_config(0),
+            &scoring,
+            &mut super::super::prepare::OverlapStats::default(),
+        );
+        assert_eq!(untouched.len(), 4, "the pass is off by default");
+
+        let mut stats = super::super::prepare::OverlapStats::default();
+        let dissolved = super::dissolve_indel_spanning_anchor_runs(
+            anchors,
+            &query,
+            &reference,
+            &dissolving_config(8),
+            &scoring,
+            &mut stats,
+        );
+        assert!(dissolved.len() < 4, "the interior anchors survived the DP");
+        assert_eq!(stats.dissolved_runs, 1);
+        assert_eq!(stats.dissolved_anchors as usize, 4 - dissolved.len());
+        // The flanks are never candidates for removal.
+        assert_eq!(dissolved.first().map(|a| a.q_start), Some(0));
+        assert_eq!(dissolved.last().map(|a| a.q_end), Some(120));
     }
 
     #[test]

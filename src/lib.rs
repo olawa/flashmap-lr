@@ -51,10 +51,8 @@ pub use index::{
 };
 pub use io::{
     load_reference, load_reference_path, open_fastx, open_fastx_with_decompressor,
-    resolve_decompressor, FastxError,
-    FastxFormat, FastxReader,
-    FastxSource,
-    ReferenceIoError, SamError, SamRecordFormatter, SamWriter,
+    resolve_decompressor, FastxError, FastxFormat, FastxReader, FastxSource, ReferenceIoError,
+    SamError, SamRecordFormatter, SamWriter,
 };
 pub use probes::{extract_backbone_probes, extract_read_probes, Probe};
 pub use segment::{segment_read, Segment};

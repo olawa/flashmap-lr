@@ -165,6 +165,16 @@ pub struct AlignmentConfig {
     /// Predecessors the gap island chain DP examines per interval.
     /// `usize::MAX` leaves it unbounded, which is the historical behaviour.
     pub island_chain_lookback: usize,
+    /// Dissolve runs of chained anchors that sit inside an indel and test
+    /// whether one continuous DP over the whole span reads it better.
+    ///
+    /// Inside a tandem repeat every copy matches, so the scan manufactures
+    /// anchors throughout it. Chaining then threads a path between them and
+    /// the gap DP only ever sees the leftovers, which is how an expansion
+    /// comes out a whole number of copies short or split into fragments.
+    /// Zero leaves the behaviour unchanged; otherwise it is the longest run
+    /// of anchors a single DP is allowed to replace.
+    pub dissolve_repeat_run: usize,
     pub bridge_flank: usize,
     pub bridge_max_gap: usize,
     /// Compatibility-only mode field.  New mapper construction uses the
@@ -206,6 +216,7 @@ impl Default for Config {
             },
             alignment: AlignmentConfig {
                 island_chain_lookback: usize::MAX,
+                dissolve_repeat_run: 0,
                 bridge_flank: 256,
                 bridge_max_gap: 5_000,
                 // Sensitive is the production default. The explicit Fast
@@ -442,6 +453,9 @@ pub(crate) struct GapPolicy {
     /// call on average, 1663 in the worst, which is 1.4M pairs for one gap.
     /// `usize::MAX` is the unbounded behaviour.
     pub(crate) island_chain_lookback: usize,
+    /// Longest run of chained anchors one continuous DP may replace, when
+    /// the span they sit in carries an indel. Zero disables the pass.
+    pub(crate) dissolve_repeat_run: usize,
     pub(crate) recursive_split_min_gap: usize,
     pub(crate) recursive_split_max_depth: usize,
     pub(crate) recursive_split_max_gap: usize,
@@ -542,6 +556,7 @@ impl ResolvedMapperPolicy {
         config.validate()?;
         let mut policy = Self::for_mode(config.alignment.mode, config.worker_pool.clone());
         policy.gaps.island_chain_lookback = config.alignment.island_chain_lookback;
+        policy.gaps.dissolve_repeat_run = config.alignment.dissolve_repeat_run;
         policy.gaps.bridge_flank = config.alignment.bridge_flank;
         policy.gaps.bridge_max_gap = config.alignment.bridge_max_gap;
         policy.probes = ProbePolicy {
@@ -578,7 +593,11 @@ impl ResolvedMapperPolicy {
             emms_max_mismatch_run: config.candidates.emms_max_mismatch_run,
             emms_relock_span: config.candidates.emms_relock_span,
             allow_sampled_anchors: config.seeding.sampled_anchors,
-            max_seed_hits: if config.seeding.sampled_anchors { 512 } else { 128 },
+            max_seed_hits: if config.seeding.sampled_anchors {
+                512
+            } else {
+                128
+            },
             map_window: config.seeding.map_window.max(1),
             rarest_first: config.seeding.rarest_first,
             diagonal_band: config.seeding.diagonal_band,
@@ -701,22 +720,23 @@ impl ResolvedMapperPolicy {
         // first place. Fast giving up DP depth cost it aligned bases in
         // exactly the unique regions it is meant to be correct in.
         let gaps = GapPolicy {
-                bridge_flank: 256,
-                bridge_max_gap: 5_000,
-                small_gap_dp_max: 1_024,
-                small_gap_dp_delta_max: 256,
-                // Sensitive spends a wider banded window on the same gaps
-                // Standard already resolves; the DP rule is unchanged.
-                medium_gap_dp_max: if mode.is_sensitive() { 4_096 } else { 2_048 },
-                medium_gap_dp_delta_max: if mode.is_sensitive() { 1_024 } else { 512 },
-                recursive_split_k: 13,
-                island_chain_lookback: usize::MAX,
-                recursive_split_min_gap: 13,
-                recursive_split_max_depth: 8,
-                recursive_split_max_gap: 1_000_000,
-                recursive_split_trigger_nm_permille: 0,
-                flank_max: 64,
-                flank_min: 16,
+            bridge_flank: 256,
+            bridge_max_gap: 5_000,
+            small_gap_dp_max: 1_024,
+            small_gap_dp_delta_max: 256,
+            // Sensitive spends a wider banded window on the same gaps
+            // Standard already resolves; the DP rule is unchanged.
+            medium_gap_dp_max: if mode.is_sensitive() { 4_096 } else { 2_048 },
+            medium_gap_dp_delta_max: if mode.is_sensitive() { 1_024 } else { 512 },
+            recursive_split_k: 13,
+            island_chain_lookback: usize::MAX,
+            dissolve_repeat_run: 0,
+            recursive_split_min_gap: 13,
+            recursive_split_max_depth: 8,
+            recursive_split_max_gap: 1_000_000,
+            recursive_split_trigger_nm_permille: 0,
+            flank_max: 64,
+            flank_min: 16,
         };
         let terminal = TerminalPolicy {
             max_dp_query: 300,
@@ -763,7 +783,11 @@ impl ResolvedMapperPolicy {
             low_coverage_fraction: 0.40,
             limited_mapq_cap: if mode.resolves_full_depth() { 60 } else { 50 },
             ambiguity_score_fraction: 0.90,
-            ambiguity_candidate_count: if mode.resolves_full_depth() { usize::MAX } else { 4 },
+            ambiguity_candidate_count: if mode.resolves_full_depth() {
+                usize::MAX
+            } else {
+                4
+            },
             ambiguity_candidate_budget: 3,
             ambiguity_mapq_cap: 5,
         };
@@ -814,6 +838,7 @@ impl ResolvedMapperPolicy {
             },
             alignment: AlignmentConfig {
                 island_chain_lookback: self.gaps.island_chain_lookback,
+                dissolve_repeat_run: self.gaps.dissolve_repeat_run,
                 bridge_flank: self.gaps.bridge_flank,
                 bridge_max_gap: self.gaps.bridge_max_gap,
                 mode: self.mode,

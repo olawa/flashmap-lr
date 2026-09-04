@@ -720,7 +720,11 @@ impl SeedIndex for MinimizerIndex {
     fn query_seeds_with_window(&self, sequence: &[u8], window: usize) -> Vec<QuerySeed> {
         // Clamped up to the index window: a smaller query window would select
         // minimizers the index never stored, so those lookups could only miss.
-        let window = if window == 0 { self.w } else { window.max(self.w) };
+        let window = if window == 0 {
+            self.w
+        } else {
+            window.max(self.w)
+        };
         query_minimizers(sequence, self.k, window)
             .into_iter()
             .map(|(position, hash, code, is_rc)| {
@@ -779,10 +783,9 @@ impl SeedIndex for MinimizerIndex {
                 // seed as `Sampled`, which is exactly the evidence probe
                 // selection refuses to build a candidate from.  A single
                 // inlined hit is never a capped bucket.
-                return self.inline_hit(range).map_or_else(
-                    SeedLookup::absent,
-                    |_| SeedLookup::complete(1),
-                );
+                return self
+                    .inline_hit(range)
+                    .map_or_else(SeedLookup::absent, |_| SeedLookup::complete(1));
             }
             let stored = ((range >> 32) & 0xffff) as u32;
             if stored == 0 {
