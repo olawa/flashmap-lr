@@ -78,6 +78,24 @@ printf 'truth %s, A %s, B %s indel records\n' \
   "$(wc -l < "$OUT/truth.tsv")" "$(wc -l < "$OUT/a.tsv")" "$(wc -l < "$OUT/b.tsv")"
 
 awk -F'\t' -v window="$WINDOW" -v examples="$EXAMPLES" -v out="$OUT" '
+  # Smallest p such that the sequence repeats with period p. A tandem repeat
+  # answers with its unit length, so a length difference that is a multiple of
+  # it is a disagreement about copy number rather than about the event.
+  function period(seq,   n, p, i, ok) {
+    n = length(seq);
+    for (p = 1; p <= n / 2; p++) {
+      if (n % p != 0) continue;
+      ok = 1;
+      for (i = p + 1; i <= n; i++)
+        if (substr(seq, i, 1) != substr(seq, i - p, 1)) { ok = 0; break }
+      if (ok) return p;
+    }
+    return n;
+  }
+  function payload(ref, alt) {
+    # The inserted or deleted bases, without the anchoring base VCF carries.
+    return length(alt) > length(ref) ? substr(alt, 2) : substr(ref, 2);
+  }
   FNR == NR { truth[$1 SUBSEP $2 SUBSEP $3 SUBSEP $4] = $5; next }
   FILENAME == ARGV[2] { a[$1 SUBSEP $2 SUBSEP $3 SUBSEP $4] = 1; next }
   {
@@ -90,24 +108,67 @@ awk -F'\t' -v window="$WINDOW" -v examples="$EXAMPLES" -v out="$OUT" '
     for (key in truth) {
       if (!(key in a) || (key in b)) continue;
       lost++;
-      if (lost > examples) continue;
+      # Every lost indel is classified; only the first few are printed, so the
+      # distribution speaks for the whole set and the listing stays readable.
+      show = (lost <= examples);
       split(key, part, SUBSEP);
-      printf "%s:%s  truth %s>%s  (%s%d bp)\n", part[1], part[2], part[3], part[4],
-        (truth[key] > 0 ? "+" : ""), truth[key];
-      found = 0;
+      if (show)
+        printf "%s:%s  truth %s>%s  (%s%d bp)\n", part[1], part[2], part[3], part[4],
+          (truth[key] > 0 ? "+" : ""), truth[key];
+      matches = 0;
+      same_position = "";
       for (offset = -window; offset <= window; offset++) {
         probe = part[1] SUBSEP (part[2] + offset);
         if (probe in calls) {
-          printf "    B wrote %s at %+d bp: %s\n", part[1] ":" (part[2] + offset), offset, calls[probe];
-          found = 1;
+          if (show)
+            printf "    B wrote %s at %+d bp: %s\n", part[1] ":" (part[2] + offset), offset, calls[probe];
+          # One position can hold several calls; count them, not the positions.
+          matches += gsub(/;/, ";", calls[probe]) + 1;
+          if (offset == 0) same_position = calls[probe];
         }
       }
-      if (!found)
-        printf "    B wrote nothing within %d bases -- a miss or a filtered call, not a shift\n", window;
-      print part[1] "\t" part[2] > (out "/lost_sites.tsv");
-      print "";
+      if (matches == 0) {
+        if (show) printf "    -> MISSED: nothing within %d bases (never aligned, or filtered)\n", window;
+        missed++;
+      } else if (matches > 1) {
+        if (show) printf "    -> FRAGMENTED: %d separate calls where truth has one\n", matches;
+        fragmented++;
+      } else if (same_position != "") {
+        # One call, at the truth position: the boundary agrees and only the
+        # extent is disputed.
+        split(same_position, spelling, ">");
+        unit = period(payload(part[3], part[4]));
+        difference = truth[key] > 0 ? length(spelling[2]) - length(spelling[1]) : length(spelling[1]) - length(spelling[2]);
+        gap = (truth[key] > 0 ? truth[key] : -truth[key]) - (difference > 0 ? difference : -difference);
+        if (unit > 1 && gap != 0 && gap % unit == 0) {
+          if (show)
+            printf "    -> COPY NUMBER: same position, %d bp unit, %d copies short of truth\n",
+              unit, (gap > 0 ? gap : -gap) / unit;
+          copies++;
+        } else if (gap != 0) {
+          if (show) printf "    -> LENGTH: same position, %d bp against truth %d bp\n", difference, truth[key];
+          extent++;
+        } else {
+          if (show) printf "    -> SPELLING: same position and same length, different bases\n";
+          spelt++;
+        }
+      } else {
+        if (show) printf "    -> SHIFTED: one call, off the truth boundary\n";
+        shifted++;
+      }
+      if (show) {
+        print part[1] "\t" part[2] > (out "/lost_sites.tsv");
+        print "";
+      }
     }
     printf "%d truth indels A called and B did not\n", lost > "/dev/stderr";
+    printf "\nall %d, by how B disagrees:\n", lost;
+    printf "  %6d copy number   same position, a whole number of repeat units short\n", copies;
+    printf "  %6d length        same position, an extent no repeat unit explains\n", extent;
+    printf "  %6d spelling      same position and length, different bases\n", spelt;
+    printf "  %6d shifted       one call, off the truth boundary\n", shifted;
+    printf "  %6d fragmented    several calls where truth has one\n", fragmented;
+    printf "  %6d missed        nothing within %d bases at all\n", missed, window;
   }
 ' "$OUT/truth.tsv" "$OUT/a.tsv" "$OUT/b.tsv" > "$OUT/examples.txt"
 
