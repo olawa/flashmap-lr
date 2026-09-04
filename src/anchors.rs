@@ -1006,6 +1006,7 @@ fn find_anchors_with_seed_hits_depth(
         raw_anchors,
         candidate,
         anchor_policy.max_anchors_per_region,
+        anchor_policy.drop_single_axis_contained,
     ))
 }
 
@@ -1516,6 +1517,7 @@ fn deduplicate_anchors(
     mut anchors: Vec<Anchor>,
     candidate: &CandidateRegion,
     max_anchors: usize,
+    drop_single_axis_contained: bool,
 ) -> Vec<Anchor> {
     anchors.sort_by(|left, right| {
         right
@@ -1530,12 +1532,22 @@ fn deduplicate_anchors(
 
     let mut kept = Vec::with_capacity(anchors.len().min(max_anchors));
     for anchor in anchors {
-        if kept.iter().any(|kept: &Anchor| {
-            anchor.q_start >= kept.q_start
-                && anchor.q_end <= kept.q_end
-                && anchor.ref_start >= kept.ref_start
-                && anchor.ref_end <= kept.ref_end
-        }) {
+        // Anchors arrive longest first, so anything contained here is
+        // contained in something at least as good.
+        let covered = kept.iter().any(|kept: &Anchor| {
+            let in_query = anchor.q_start >= kept.q_start && anchor.q_end <= kept.q_end;
+            let in_reference = anchor.ref_start >= kept.ref_start && anchor.ref_end <= kept.ref_end;
+            if drop_single_axis_contained {
+                // A repeat-interior anchor is contained on the reference axis
+                // and not the query axis, because the read's extra copies
+                // pushed it past the flank anchor's query end. It explains no
+                // reference the flank does not already explain.
+                in_query || in_reference
+            } else {
+                in_query && in_reference
+            }
+        });
+        if covered {
             continue;
         }
         kept.push(anchor);
@@ -2178,5 +2190,72 @@ mod tests {
         .unwrap();
         assert_eq!(anchors.len(), 1);
         assert_eq!(anchors[0].ref_start, 0);
+    }
+}
+
+#[cfg(test)]
+mod containment_tests {
+    use super::*;
+
+    fn anchor(q_start: u32, q_end: u32, ref_start: u64, ref_end: u64) -> Anchor {
+        Anchor {
+            ref_id: crate::types::ContigId(0),
+            ref_start,
+            ref_end,
+            q_start,
+            q_end,
+            strand: Strand::Forward,
+            score: (q_end - q_start) as i32,
+        }
+    }
+
+    fn region() -> CandidateRegion {
+        CandidateRegion {
+            contig: crate::types::ContigId(0),
+            q_start: 0,
+            q_end: 1_200,
+            ref_start: 0,
+            ref_end: 4_000,
+            strand: Strand::Forward,
+            supporting_segments: 4,
+            unique_probes: 4,
+            mean_probe_frequency: 1.0,
+            best_probe_frequency: 1,
+            diagonal_mean: 0,
+            diagonal_median: 0.0,
+            score: 100,
+            endpoint_support: crate::candidates::EndpointSupport::BothEnds,
+        }
+    }
+
+    /// A repeat-interior anchor covers reference the flank anchor already
+    /// covers, on its own diagonal because the read's extra copies pushed its
+    /// query span past the flank's. The two-axis test cannot see that.
+    #[test]
+    fn a_repeat_interior_anchor_survives_the_two_axis_test() {
+        let anchors = vec![
+            anchor(0, 500, 0, 500),
+            anchor(560, 640, 200, 280),
+            anchor(700, 1_200, 500, 1_000),
+        ];
+        let kept = deduplicate_anchors(anchors.clone(), &region(), 512, false);
+        assert_eq!(kept.len(), 3, "nothing is contained on both axes");
+
+        let kept = deduplicate_anchors(anchors, &region(), 512, true);
+        assert_eq!(
+            kept.len(),
+            2,
+            "the interior anchor explains no new reference"
+        );
+        assert!(kept.iter().all(|a| a.q_start != 560));
+    }
+
+    /// The two flank anchors of an expansion also overlap on the reference,
+    /// but neither contains the other, so both must survive.
+    #[test]
+    fn the_two_flanks_of_an_expansion_both_survive() {
+        let anchors = vec![anchor(0, 600, 0, 600), anchor(400, 1_000, 300, 900)];
+        let kept = deduplicate_anchors(anchors, &region(), 512, true);
+        assert_eq!(kept.len(), 2);
     }
 }

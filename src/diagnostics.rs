@@ -114,6 +114,9 @@ pub struct ReadDiagnostics {
     /// Runs of chained anchors one continuous DP replaced, and how many
     /// anchors that cost. Zero means --dissolve-repeat-anchors changed
     /// nothing, whatever else moved.
+    /// Anchor bases handed back to the gap DP as context around a resolved
+    /// overlap. Zero means --overlap-flank changed nothing.
+    pub anchor_overlap_flanked_bases: u64,
     pub anchor_runs_dissolved: u64,
     pub anchors_dissolved: u64,
     pub stage_a_anchors: u32,

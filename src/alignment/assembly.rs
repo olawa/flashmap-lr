@@ -260,6 +260,7 @@ fn build_chain_cigar_with_policy(
     let mut overlaps = super::prepare::OverlapStats::default();
     let raw_anchors = normalize_anchor_overlaps_measured(
         orient_anchors(chain, read.sequence.len(), contig)?,
+        gap_policy.overlap_flank,
         &mut overlaps,
     );
     let raw_anchors = dissolve_indel_spanning_anchor_runs(
@@ -294,6 +295,9 @@ fn build_chain_cigar_with_policy(
         diagnostics.anchor_overlaps_removed = diagnostics
             .anchor_overlaps_removed
             .saturating_add(overlaps.removed);
+        diagnostics.anchor_overlap_flanked_bases = diagnostics
+            .anchor_overlap_flanked_bases
+            .saturating_add(overlaps.flanked);
         diagnostics.anchor_runs_dissolved = diagnostics
             .anchor_runs_dissolved
             .saturating_add(overlaps.dissolved_runs);

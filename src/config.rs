@@ -147,6 +147,9 @@ pub struct CandidateConfig {
     pub anchor_k: usize,
     pub min_anchor_length: usize,
     pub max_anchors_per_region: usize,
+    /// Drop anchors already covered on either the query or the reference
+    /// axis, not only those covered on both.
+    pub drop_single_axis_contained: bool,
     pub diagonal_tolerance: i32,
     /// Experimental SNP-tolerant bridge between equal-distance minimizers.
     /// Exact paired staging remains the quality-verified default.
@@ -175,6 +178,9 @@ pub struct AlignmentConfig {
     /// Zero leaves the behaviour unchanged; otherwise it is the longest run
     /// of anchors a single DP is allowed to replace.
     pub dissolve_repeat_run: usize,
+    /// Bases to pull both anchors back from a resolved overlap, so the gap DP
+    /// sees reference on both sides of the event instead of none.
+    pub overlap_flank: usize,
     pub bridge_flank: usize,
     pub bridge_max_gap: usize,
     /// Compatibility-only mode field.  New mapper construction uses the
@@ -208,6 +214,7 @@ impl Default for Config {
                 anchor_k: 15,
                 min_anchor_length: 30,
                 max_anchors_per_region: 512,
+                drop_single_axis_contained: false,
                 diagonal_tolerance: 2_000,
                 paired_emms: false,
                 emms_max_mismatch_run: 1,
@@ -217,6 +224,7 @@ impl Default for Config {
             alignment: AlignmentConfig {
                 island_chain_lookback: usize::MAX,
                 dissolve_repeat_run: 0,
+                overlap_flank: 0,
                 bridge_flank: 256,
                 bridge_max_gap: 5_000,
                 // Sensitive is the production default. The explicit Fast
@@ -370,6 +378,16 @@ pub(crate) struct AnchorPolicy {
     pub(crate) anchor_k: usize,
     pub(crate) min_anchor_length: usize,
     pub(crate) max_anchors_per_region: usize,
+    /// Drop an anchor whose span is already covered on either axis.
+    ///
+    /// Deduplication requires containment on both axes, so an anchor inside a
+    /// tandem repeat survives: it sits on a different diagonal than the flank
+    /// anchor that ran through the repeat, so the reference span is contained
+    /// but the query span is not. It explains no reference the flank does not
+    /// already explain, yet it reaches the chainer, pins a register, and the
+    /// gap DP is left with only what falls between. Single-axis containment
+    /// drops it and lets the expansion be one insertion.
+    pub(crate) drop_single_axis_contained: bool,
     pub(crate) reference_flank: usize,
     pub(crate) max_local_kmer_hits: usize,
     pub(crate) paired_emms: bool,
@@ -456,6 +474,16 @@ pub(crate) struct GapPolicy {
     /// Longest run of chained anchors one continuous DP may replace, when
     /// the span they sit in carries an indel. Zero disables the pass.
     pub(crate) dissolve_repeat_run: usize,
+    /// Bases to pull both anchors back from a resolved overlap.
+    ///
+    /// Resolving an overlap by trimming the left anchor leaves the gap DP a
+    /// reference span of zero, which is not a DP at all: the kernel emits the
+    /// query gap as a straight insertion and the length is taken on faith.
+    /// Backing both anchors off gives KSW2 real sequence on both sides of the
+    /// event, so where it sits and how long it is comes from the bases rather
+    /// than from where the extensions happened to stop. Zero is the old
+    /// behaviour.
+    pub(crate) overlap_flank: usize,
     pub(crate) recursive_split_min_gap: usize,
     pub(crate) recursive_split_max_depth: usize,
     pub(crate) recursive_split_max_gap: usize,
@@ -557,6 +585,7 @@ impl ResolvedMapperPolicy {
         let mut policy = Self::for_mode(config.alignment.mode, config.worker_pool.clone());
         policy.gaps.island_chain_lookback = config.alignment.island_chain_lookback;
         policy.gaps.dissolve_repeat_run = config.alignment.dissolve_repeat_run;
+        policy.gaps.overlap_flank = config.alignment.overlap_flank;
         policy.gaps.bridge_flank = config.alignment.bridge_flank;
         policy.gaps.bridge_max_gap = config.alignment.bridge_max_gap;
         policy.probes = ProbePolicy {
@@ -589,6 +618,7 @@ impl ResolvedMapperPolicy {
             anchor_k: config.candidates.anchor_k,
             min_anchor_length: config.candidates.min_anchor_length,
             max_anchors_per_region: config.candidates.max_anchors_per_region,
+            drop_single_axis_contained: config.candidates.drop_single_axis_contained,
             paired_emms: config.candidates.paired_emms,
             emms_max_mismatch_run: config.candidates.emms_max_mismatch_run,
             emms_relock_span: config.candidates.emms_relock_span,
@@ -669,6 +699,7 @@ impl ResolvedMapperPolicy {
                 AlignmentMode::Standard => 512,
                 AlignmentMode::Sensitive => 1_024,
             },
+            drop_single_axis_contained: false,
             reference_flank: 1_024,
             max_local_kmer_hits: match mode {
                 AlignmentMode::Fast => 4_000,
@@ -731,6 +762,7 @@ impl ResolvedMapperPolicy {
             recursive_split_k: 13,
             island_chain_lookback: usize::MAX,
             dissolve_repeat_run: 0,
+            overlap_flank: 0,
             recursive_split_min_gap: 13,
             recursive_split_max_depth: 8,
             recursive_split_max_gap: 1_000_000,
@@ -830,6 +862,7 @@ impl ResolvedMapperPolicy {
                 anchor_k: self.anchors.anchor_k,
                 min_anchor_length: self.anchors.min_anchor_length,
                 max_anchors_per_region: self.anchors.max_anchors_per_region,
+                drop_single_axis_contained: self.anchors.drop_single_axis_contained,
                 diagonal_tolerance: self.candidates.diagonal_tolerance,
                 paired_emms: self.anchors.paired_emms,
                 emms_max_mismatch_run: self.anchors.emms_max_mismatch_run,
@@ -839,6 +872,7 @@ impl ResolvedMapperPolicy {
             alignment: AlignmentConfig {
                 island_chain_lookback: self.gaps.island_chain_lookback,
                 dissolve_repeat_run: self.gaps.dissolve_repeat_run,
+                overlap_flank: self.gaps.overlap_flank,
                 bridge_flank: self.gaps.bridge_flank,
                 bridge_max_gap: self.gaps.bridge_max_gap,
                 mode: self.mode,

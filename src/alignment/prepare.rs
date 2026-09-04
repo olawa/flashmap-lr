@@ -74,6 +74,7 @@ pub(super) fn orient_anchors(
 #[derive(Default)]
 pub(super) struct OverlapStats {
     pub buckets: [u64; 7],
+    pub flanked: u64,
     pub dissolved_runs: u64,
     pub dissolved_anchors: u64,
     pub reference_only: u64,
@@ -83,13 +84,16 @@ pub(super) struct OverlapStats {
 
 #[cfg(test)]
 pub(super) fn normalize_anchor_overlaps(anchors: Vec<OrientedAnchor>) -> Vec<OrientedAnchor> {
-    normalize_anchor_overlaps_measured(anchors, &mut OverlapStats::default())
+    normalize_anchor_overlaps_measured(anchors, 0, &mut OverlapStats::default())
 }
 
 pub(super) fn normalize_anchor_overlaps_measured(
     mut anchors: Vec<OrientedAnchor>,
+    overlap_flank: usize,
     stats: &mut OverlapStats,
 ) -> Vec<OrientedAnchor> {
+    // What an anchor must keep to still be worth pinning.
+    const MIN_KEPT: usize = 16;
     // Removing an anchor can expose a second overlap between its predecessor
     // and successor.  Walk back after every removal so the final list is
     // genuinely monotonic; a single forward pass is insufficient for
@@ -142,6 +146,22 @@ pub(super) fn normalize_anchor_overlaps_measured(
             index = index.saturating_sub(1);
         } else {
             stats.trimmed = stats.trimmed.saturating_add(1);
+            if overlap_flank > 0 {
+                // The trim above put the two anchors end to end, which hands
+                // the DP a reference span of zero. Pull both back so it has
+                // sequence to decide with on either side of the event.
+                let left_len = anchors[index].q_end - anchors[index].q_start;
+                let back = overlap_flank.min(left_len.saturating_sub(MIN_KEPT));
+                anchors[index].q_end -= back;
+                anchors[index].ref_end -= back;
+
+                let right = &anchors[index + 1];
+                let right_len = right.q_end - right.q_start;
+                let forward = overlap_flank.min(right_len.saturating_sub(MIN_KEPT));
+                anchors[index + 1].q_start += forward;
+                anchors[index + 1].ref_start += forward;
+                stats.flanked = stats.flanked.saturating_add((back + forward) as u64);
+            }
             index += 1;
         }
     }
@@ -561,5 +581,64 @@ pub(crate) fn oriented_query(sequence: &[u8], strand: Strand) -> Vec<u8> {
                 _ => b'N',
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod overlap_flank_tests {
+    use super::*;
+
+    fn anchor(q_start: usize, q_end: usize, ref_start: usize, ref_end: usize) -> OrientedAnchor {
+        OrientedAnchor {
+            q_start,
+            q_end,
+            ref_start,
+            ref_end,
+        }
+    }
+
+    /// The two flanks of an expansion overlap on the reference. Trimming
+    /// leaves them end to end, so the gap DP is handed a reference span of
+    /// zero and emits the query gap as an insertion without ever running.
+    /// The flank buys it sequence on both sides.
+    #[test]
+    fn a_resolved_overlap_leaves_the_gap_dp_reference_to_work_with() {
+        let anchors = vec![anchor(0, 500, 0, 500), anchor(600, 1_100, 300, 800)];
+
+        let mut stats = OverlapStats::default();
+        let plain = normalize_anchor_overlaps_measured(anchors.clone(), 0, &mut stats);
+        assert_eq!(stats.flanked, 0);
+        assert_eq!(
+            plain[1].ref_start - plain[0].ref_end,
+            0,
+            "the trim puts them end to end, so the DP sees no reference"
+        );
+        let plain_query_gap = plain[1].q_start - plain[0].q_end;
+
+        let mut stats = OverlapStats::default();
+        let flanked = normalize_anchor_overlaps_measured(anchors, 64, &mut stats);
+        assert_eq!(stats.flanked, 128, "64 bases off each side");
+        assert_eq!(
+            flanked[1].ref_start - flanked[0].ref_end,
+            128,
+            "the DP now has reference on both sides"
+        );
+        assert_eq!(
+            flanked[1].q_start - flanked[0].q_end,
+            plain_query_gap + 128,
+            "and the same event, seen through a wider window"
+        );
+        // The anchors stay real anchors.
+        assert!(flanked.iter().all(|a| a.q_end - a.q_start >= 16));
+    }
+
+    /// A short anchor keeps its minimum rather than being flanked away.
+    #[test]
+    fn the_flank_never_consumes_an_anchor() {
+        let anchors = vec![anchor(0, 40, 0, 40), anchor(50, 90, 30, 70)];
+        let mut stats = OverlapStats::default();
+        let flanked = normalize_anchor_overlaps_measured(anchors, 1_000, &mut stats);
+        assert!(flanked.iter().all(|a| a.q_end - a.q_start >= 16));
+        assert!(flanked.iter().all(|a| a.q_start < a.q_end));
     }
 }

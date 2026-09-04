@@ -37,6 +37,8 @@ struct Options {
     map_window: usize,
     island_lookback: Option<usize>,
     dissolve_repeat_run: Option<usize>,
+    overlap_flank: Option<usize>,
+    drop_contained: bool,
     rarest_first: bool,
     diagonal_band: Option<i64>,
     near_exact: bool,
@@ -107,6 +109,8 @@ impl Options {
         let mut map_window = 1usize;
         let mut island_lookback: Option<usize> = None;
         let mut dissolve_repeat_run: Option<usize> = None;
+        let mut overlap_flank: Option<usize> = None;
+        let mut drop_contained = false;
         let mut rarest_first = false;
         let mut diagonal_band: Option<i64> = None;
         let mut near_exact_dp = false;
@@ -177,6 +181,15 @@ impl Options {
                         next_value(&mut args, &argument)?,
                         "island-lookback",
                     )?);
+                }
+                "--overlap-flank" => {
+                    overlap_flank = Some(parse_positive(
+                        next_value(&mut args, &argument)?,
+                        "overlap-flank",
+                    )?);
+                }
+                "--drop-contained-anchors" => {
+                    drop_contained = true;
                 }
                 "--dissolve-repeat-anchors" => {
                     dissolve_repeat_run = Some(parse_positive(
@@ -357,6 +370,8 @@ impl Options {
             map_window,
             island_lookback,
             dissolve_repeat_run,
+            overlap_flank,
+            drop_contained,
             rarest_first,
             diagonal_band,
             near_exact,
@@ -500,6 +515,8 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--map-window",
     "--island-lookback",
     "--dissolve-repeat-anchors",
+    "--overlap-flank",
+    "--drop-contained-anchors",
     "--rarest-first",
     "--diagonal-band",
     "--near-exact",
@@ -617,6 +634,14 @@ fn usage() -> &'static str {
         "      --island-lookback N   Predecessors the gap island chain DP examines per\n",
         "                            interval. Unbounded by default; a repetitive gap\n",
         "                            can otherwise reach 1663 intervals in one call\n",
+        "      --drop-contained-anchors\n",
+        "                            Drop an anchor already covered on either axis, not\n",
+        "                            only on both. A repeat-interior anchor covers no\n",
+        "                            new reference but sits on its own diagonal, so the\n",
+        "                            two-axis test keeps it (default: off)\n",
+        "      --overlap-flank N     Pull both anchors back N bases from a resolved\n",
+        "                            overlap, so the gap DP sees reference on both\n",
+        "                            sides of the event instead of none (default: 0)\n",
         "      --dissolve-repeat-anchors N\n",
         "                            Let one continuous DP replace a run of up to N\n",
         "                            chained anchors when the span they sit in carries\n",
@@ -1258,6 +1283,8 @@ fn execute_mapping(
         || options.map_window > 1
         || options.island_lookback.is_some()
         || options.dissolve_repeat_run.is_some()
+        || options.overlap_flank.is_some()
+        || options.drop_contained
         || options.rarest_first
         || options.diagonal_band.is_some()
     {
@@ -1280,6 +1307,7 @@ fn execute_mapping(
                 emms_max_mismatch_run: options.emms_max_mismatch_run,
                 emms_relock_span: options.emms_relock_span,
                 tiered_candidates: options.tiered_candidates,
+                drop_single_axis_contained: options.drop_contained,
                 ..defaults.candidates
             },
             alignment: rs_lra::AlignmentConfig {
@@ -1290,6 +1318,9 @@ fn execute_mapping(
                 dissolve_repeat_run: options
                     .dissolve_repeat_run
                     .unwrap_or(defaults.alignment.dissolve_repeat_run),
+                overlap_flank: options
+                    .overlap_flank
+                    .unwrap_or(defaults.alignment.overlap_flank),
                 ..defaults.alignment
             },
             worker_pool: mapper_config.runtime.clone(),
@@ -1465,6 +1496,7 @@ struct ProfileReporter {
     anchor_overlaps_reference_only: AtomicU64,
     anchor_overlaps_trimmed: AtomicU64,
     anchor_overlaps_removed: AtomicU64,
+    anchor_overlap_flanked_bases: AtomicU64,
     anchor_runs_dissolved: AtomicU64,
     anchors_dissolved: AtomicU64,
     chain_query_gap_buckets: [AtomicU64; 7],
@@ -1710,6 +1742,10 @@ impl DiagnosticsSink for ProfileReporter {
             (
                 &self.anchor_overlaps_removed,
                 diagnostics.anchor_overlaps_removed,
+            ),
+            (
+                &self.anchor_overlap_flanked_bases,
+                diagnostics.anchor_overlap_flanked_bases,
             ),
             (
                 &self.anchor_runs_dissolved,
@@ -1987,6 +2023,12 @@ impl ProfileReporter {
                 }
                 eprintln!("    {label:<10} {count:>12}");
             }
+        }
+        let flanked = self.anchor_overlap_flanked_bases.load(Ordering::Relaxed);
+        if flanked > 0 {
+            eprintln!(
+                "  Overlap flank:         {flanked} anchor bases handed to the gap DP as context"
+            );
         }
         let runs = self.anchor_runs_dissolved.load(Ordering::Relaxed);
         if runs > 0 {
