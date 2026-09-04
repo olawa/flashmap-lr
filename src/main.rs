@@ -595,7 +595,14 @@ fn usage() -> &'static str {
         "Input and output:\n",
         "  -i, --index PATH          Packed minimizer index (.fmi)\n",
         "  -r, --ref PATH            Reference FASTA, for small fixtures\n",
-        "  -q, --query PATH          FASTA or FASTQ reads\n",
+        "  -q, --query PATH          FASTA, FASTQ or BAM reads. A BAM is remapped:\n",
+        "                            its own alignments are ignored, reverse-strand\n",
+        "                            records are restored to the read's orientation,\n",
+        "                            and secondary and supplementary records are\n",
+        "                            skipped. Read groups, barcodes, methylation and\n",
+        "                            PacBio kinetics are carried; NM, MD, AS, SA and\n",
+        "                            the other tags describing the old placement are\n",
+        "                            not. Detected by content, not by file name\n",
         "  -o, --output PATH         SAM/BAM path, or - for stdout (default: -)\n",
         "                            A .bam name is sorted and indexed on the way out.\n",
         "      --decompress-with CMD Command to decompress gzip reads; the path is\n",
@@ -1344,8 +1351,31 @@ fn execute_mapping(
     };
     let pool = WorkerPool::new(runtime).map_err(|error| CliError::Pool(error.to_string()))?;
 
-    let reads = open_fastx_with_decompressor(&options.reads, decompressor.as_deref())
-        .map_err(CliError::Reads)?;
+    // BAM is detected by decompressing the first bytes, not by the file name:
+    // a uBAM is often named .bam but a .gz that is really FASTQ must not take
+    // this path, and vice versa.
+    let mut carried_header_lines: Vec<String> = Vec::new();
+    let reads: Box<dyn Iterator<Item = Result<rs_lra::OwnedRead, ReadSourceError>> + Send> =
+        if rs_lra::bam_reader::is_bam(&options.reads) {
+            let reader = rs_lra::bam_reader::open_bam(&options.reads)
+                .map_err(|error| CliError::Pool(error.to_string()))?;
+            carried_header_lines = reader
+                .carried_header_lines()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            if !options.quiet {
+                eprintln!(
+                    "[rs-lra] BAM input: remapping the reads, carrying {} header line(s)",
+                    carried_header_lines.len()
+                );
+            }
+            Box::new(reader.map(|record| record.map_err(ReadSourceError::Bam)))
+        } else {
+            let reader = open_fastx_with_decompressor(&options.reads, decompressor.as_deref())
+                .map_err(CliError::Reads)?;
+            Box::new(reader.map(|record| record.map_err(ReadSourceError::Fastx)))
+        };
     // `usize::MAX` leaves the stream untouched, so the benchmarking path and
     // the production path run the same iterator adapter.
     let reads = reads.take(options.limit.unwrap_or(usize::MAX));
@@ -1375,9 +1405,15 @@ fn execute_mapping(
     // records are already structured, so rendering them as text for it to parse
     // back costs the formatting, the parse and about twice the bytes.
     let encoder = if options.writes_bam() {
-        RecordEncoder::Bam(rs_lra::bam::BamRecordEncoder::from_contigs(metadata))
+        RecordEncoder::Bam(
+            rs_lra::bam::BamRecordEncoder::from_contigs(metadata)
+                .with_header_lines(carried_header_lines),
+        )
     } else {
-        RecordEncoder::Sam(rs_lra::SamRecordFormatter::from_contigs(metadata))
+        RecordEncoder::Sam(
+            rs_lra::SamRecordFormatter::from_contigs(metadata)
+                .with_header_lines(carried_header_lines),
+        )
     };
     let mut writer = ByteCountingSink::new(output);
     writer
@@ -2136,6 +2172,21 @@ impl ProfileReporter {
             );
         }
         eprintln!("======================================================================");
+    }
+}
+
+/// One error type for both read sources, so the mapping call is written once.
+enum ReadSourceError {
+    Fastx(rs_lra::io::FastxError),
+    Bam(rs_lra::bam_reader::BamError),
+}
+
+impl std::fmt::Display for ReadSourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fastx(error) => write!(f, "{error}"),
+            Self::Bam(error) => write!(f, "{error}"),
+        }
     }
 }
 

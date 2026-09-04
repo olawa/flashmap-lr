@@ -935,6 +935,7 @@ impl<'a> Aligner<'a> {
             sequence,
             qualities,
             tags,
+            aux,
         } = owned_read;
         let mapping = self.map(Read {
             name: &name,
@@ -947,6 +948,7 @@ impl<'a> Aligner<'a> {
             sequence,
             qualities,
             tags,
+            aux,
             mapping,
         })
     }

@@ -23,6 +23,13 @@ pub struct OwnedRead {
     pub sequence: Vec<u8>,
     pub qualities: Option<Vec<u8>>,
     pub tags: Option<String>,
+    /// Auxiliary fields carried verbatim from a BAM input.
+    ///
+    /// Held as the raw BAM encoding rather than as SAM text because a
+    /// per-base array -- PacBio kinetics, most of all -- is one value per
+    /// base, so a 20 kb read spells out as roughly 80 kB of text. These bytes
+    /// go straight back out to a BAM and are rendered only for a SAM.
+    pub aux: Option<Vec<u8>>,
 }
 
 impl OwnedRead {
@@ -32,6 +39,7 @@ impl OwnedRead {
             sequence: sequence.into(),
             qualities: None,
             tags: None,
+            aux: None,
         }
     }
 
@@ -45,6 +53,7 @@ impl OwnedRead {
             sequence: sequence.into(),
             qualities: Some(qualities.into()),
             tags: None,
+            aux: None,
         }
     }
 
@@ -59,6 +68,7 @@ impl OwnedRead {
             sequence: sequence.into(),
             qualities,
             tags,
+            aux: None,
         }
     }
 
@@ -620,6 +630,8 @@ pub struct MappedRead {
     pub sequence: Vec<u8>,
     pub qualities: Option<Vec<u8>>,
     pub tags: Option<String>,
+    /// Auxiliary fields carried verbatim from a BAM input.
+    pub aux: Option<Vec<u8>>,
     pub mapping: MappingResult,
 }
 

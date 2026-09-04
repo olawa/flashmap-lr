@@ -654,6 +654,7 @@ impl From<AlignmentError> for SamError {
 /// the write, not the formatting.
 pub struct SamRecordFormatter {
     reference: Vec<SamContig>,
+    carried_header_lines: Vec<String>,
 }
 
 impl SamRecordFormatter {
@@ -670,7 +671,21 @@ impl SamRecordFormatter {
                 length,
             })
             .collect();
-        Self { reference }
+        Self {
+            reference,
+            carried_header_lines: Vec::new(),
+        }
+    }
+
+    /// Header lines carried from a BAM input, `@RG` above all: a record's
+    /// `RG:Z` tag is only meaningful if the group it names is declared.
+    pub fn with_header_lines<I, L>(mut self, lines: I) -> Self
+    where
+        I: IntoIterator<Item = L>,
+        L: Into<String>,
+    {
+        self.carried_header_lines = lines.into_iter().map(Into::into).collect();
+        self
     }
 
     pub fn write_header<W: Write>(&self, out: &mut W) -> Result<(), SamError> {
@@ -678,6 +693,9 @@ impl SamRecordFormatter {
         for contig in &self.reference {
             ensure_sam_field(&contig.name, "reference name")?;
             writeln!(out, "@SQ\tSN:{}\tLN:{}", contig.name, contig.length)?;
+        }
+        for line in &self.carried_header_lines {
+            writeln!(out, "{line}")?;
         }
         Ok(())
     }
@@ -711,6 +729,7 @@ impl SamRecordFormatter {
             out.write_all(b"\t")?;
             write_sam_quality(out, mapped.qualities.as_deref(), false)?;
             write_optional_fields(out, mapped.tags.as_deref(), &[])?;
+            write_carried_aux(out, mapped.aux.as_deref())?;
             out.write_all(b"\n")?;
         }
         for supplementary in &mapped.mapping.supplementary {
@@ -759,6 +778,7 @@ impl SamRecordFormatter {
             alignment.edit_distance, alignment.score
         )?;
         write_optional_fields(out, mapped.tags.as_deref(), &["NM", "AS", "SA"])?;
+        write_carried_aux(out, mapped.aux.as_deref())?;
         self.write_sa_tag(out, mapped, alignment)?;
         writeln!(out)?;
         Ok(())
@@ -878,6 +898,94 @@ impl<W: Write> SamWriter<W> {
 
     pub fn into_inner(self) -> W {
         self.writer
+    }
+}
+
+/// Render auxiliary fields carried from a BAM input as SAM text.
+///
+/// The bytes are kept in BAM form because that is what the BAM writer wants
+/// and because a per-base array is expensive to spell out. A SAM output is the
+/// case that has to pay for it.
+fn write_carried_aux<W: Write>(writer: &mut W, aux: Option<&[u8]>) -> io::Result<()> {
+    let Some(mut aux) = aux else {
+        return Ok(());
+    };
+    while !aux.is_empty() {
+        let Some(len) = crate::bam_reader::aux_field_len(aux) else {
+            // A field whose length cannot be read makes the rest unreadable
+            // too; drop the remainder rather than emit a corrupt record.
+            return Ok(());
+        };
+        write_aux_field(writer, &aux[..len])?;
+        aux = &aux[len..];
+    }
+    Ok(())
+}
+
+fn write_aux_field<W: Write>(writer: &mut W, field: &[u8]) -> io::Result<()> {
+    let tag = std::str::from_utf8(&field[..2]).unwrap_or("??");
+    let value = &field[3..];
+    let integer = |bytes: &[u8]| -> i64 {
+        match field[2] {
+            b'c' => bytes[0] as i8 as i64,
+            b'C' => bytes[0] as i64,
+            b's' => i16::from_le_bytes([bytes[0], bytes[1]]) as i64,
+            b'S' => u16::from_le_bytes([bytes[0], bytes[1]]) as i64,
+            b'i' => i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64,
+            _ => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64,
+        }
+    };
+    match field[2] {
+        b'A' => write!(writer, "\t{tag}:A:{}", value[0] as char),
+        b'c' | b'C' | b's' | b'S' | b'i' | b'I' => {
+            write!(writer, "\t{tag}:i:{}", integer(value))
+        }
+        b'f' => {
+            let parsed = f32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+            write!(writer, "\t{tag}:f:{parsed}")
+        }
+        b'Z' | b'H' => {
+            let text = &value[..value.len().saturating_sub(1)];
+            write!(writer, "\t{tag}:{}:", field[2] as char)?;
+            writer.write_all(text)
+        }
+        b'B' => {
+            let element = value[0];
+            let count = u32::from_le_bytes([value[1], value[2], value[3], value[4]]) as usize;
+            let width = match element {
+                b'c' | b'C' => 1,
+                b's' | b'S' => 2,
+                _ => 4,
+            };
+            write!(writer, "\t{tag}:B:{}", element as char)?;
+            for index in 0..count {
+                let start = 5 + index * width;
+                let bytes = &value[start..start + width];
+                match element {
+                    b'c' => write!(writer, ",{}", bytes[0] as i8)?,
+                    b'C' => write!(writer, ",{}", bytes[0])?,
+                    b's' => write!(writer, ",{}", i16::from_le_bytes([bytes[0], bytes[1]]))?,
+                    b'S' => write!(writer, ",{}", u16::from_le_bytes([bytes[0], bytes[1]]))?,
+                    b'i' => write!(
+                        writer,
+                        ",{}",
+                        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                    )?,
+                    b'I' => write!(
+                        writer,
+                        ",{}",
+                        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                    )?,
+                    _ => write!(
+                        writer,
+                        ",{}",
+                        f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                    )?,
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1355,6 +1463,7 @@ mod tests {
             sequence: b"ACGT".to_vec(),
             qualities: Some(b"!!!!".to_vec()),
             tags: None,
+            aux: None,
             mapping: crate::MappingResult {
                 primary: Some(alignment),
                 supplementary: Vec::new(),
@@ -1371,6 +1480,7 @@ mod tests {
                 sequence: b"NN".to_vec(),
                 qualities: None,
                 tags: None,
+                aux: None,
                 mapping: crate::MappingResult::default(),
             })
             .unwrap();
@@ -1392,6 +1502,7 @@ mod tests {
             sequence: b"ACGA".to_vec(),
             qualities: Some(b"!\"#$".to_vec()),
             tags: None,
+            aux: None,
             mapping: crate::MappingResult {
                 primary: Some(alignment),
                 supplementary: Vec::new(),
@@ -1429,6 +1540,7 @@ mod tests {
             sequence: b"ACACCCCCAA".to_vec(),
             qualities: Some(b"IIIIIIIIII".to_vec()),
             tags: Some("MM:Z:C+m?,1,2; ML:B:C,100,200 RG:Z:sample1".to_owned()),
+            aux: None,
             mapping: crate::MappingResult {
                 primary: Some(alignment_fwd),
                 supplementary: Vec::new(),
@@ -1442,6 +1554,7 @@ mod tests {
             sequence: b"ACACCCCCAA".to_vec(),
             qualities: Some(b"IIIIIIIIII".to_vec()),
             tags: Some("MM:Z:C+m?,1,2; ML:B:C,100,200 RG:Z:sample1".to_owned()),
+            aux: None,
             mapping: crate::MappingResult {
                 primary: Some(alignment_rev),
                 supplementary: Vec::new(),
@@ -1480,6 +1593,7 @@ mod tests {
             sequence: b"ACGT".to_vec(),
             qualities: Some(b"IIII".to_vec()),
             tags: Some("MM:Z:C+m?,0; ML:B:C,200 RG:Z:sample".to_owned()),
+            aux: None,
             mapping: crate::MappingResult {
                 primary: Some(primary),
                 supplementary: vec![supplementary],
@@ -1519,6 +1633,7 @@ mod tests {
             sequence: b"ACGT".to_vec(),
             qualities: None,
             tags: None,
+            aux: None,
             mapping: crate::MappingResult {
                 primary: Some(alignment),
                 supplementary: Vec::new(),
@@ -1548,6 +1663,7 @@ mod tests {
             tags: Some(
                 "free comment NM:i:99 AS:i:-1 SA:Z:stale,1,+,4M,1,0; RG:Z:sample".to_owned(),
             ),
+            aux: None,
             mapping: crate::MappingResult {
                 primary: Some(alignment),
                 supplementary: Vec::new(),

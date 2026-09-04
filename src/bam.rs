@@ -140,6 +140,7 @@ pub struct BamRecordEncoder {
     contigs: Vec<BamContig>,
     /// Reference id per `ContigId`, so a record does not search the table.
     ref_ids: Vec<i32>,
+    carried_header_lines: Vec<String>,
 }
 
 impl BamRecordEncoder {
@@ -164,7 +165,19 @@ impl BamRecordEncoder {
                 .map(|(_, name, length)| BamContig { name, length })
                 .collect(),
             ref_ids,
+            carried_header_lines: Vec::new(),
         }
+    }
+
+    /// Header lines carried from a BAM input, `@RG` above all: a record's
+    /// `RG:Z` tag is only meaningful if the group it names is declared.
+    pub fn with_header_lines<I, L>(mut self, lines: I) -> Self
+    where
+        I: IntoIterator<Item = L>,
+        L: Into<String>,
+    {
+        self.carried_header_lines = lines.into_iter().map(Into::into).collect();
+        self
     }
 
     fn ref_id(&self, contig: ContigId) -> i32 {
@@ -176,6 +189,10 @@ impl BamRecordEncoder {
         let mut text = String::from("@HD\tVN:1.6\tSO:unknown\n");
         for contig in &self.contigs {
             text.push_str(&format!("@SQ\tSN:{}\tLN:{}\n", contig.name, contig.length));
+        }
+        for line in &self.carried_header_lines {
+            text.push_str(line);
+            text.push('\n');
         }
         let mut raw = Vec::with_capacity(text.len() + 16 * self.contigs.len() + 16);
         raw.extend_from_slice(b"BAM\x01");
@@ -295,6 +312,12 @@ impl BamRecordEncoder {
             if let Some(sa) = self.sa_tag(mapped, current) {
                 push_string_tag(raw, b"SA", &sa);
             }
+        }
+        // Auxiliary data carried from a BAM input is already in this encoding,
+        // and a per-base array is large enough that a round trip through text
+        // would cost more than the alignment did.
+        if let Some(aux) = mapped.aux.as_deref() {
+            raw.extend_from_slice(aux);
         }
 
         let block_size = (raw.len() - start - 4) as i32;

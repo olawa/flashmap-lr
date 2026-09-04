@@ -37,6 +37,7 @@ pub use diagnostics::{DiagnosticsSink, ReadDiagnostics};
 pub use dp::{align_full, align_local, LocalAlignment};
 pub use errors::MapError;
 pub mod bam;
+pub mod bam_reader;
 
 pub use minimizer_index::{IndexSummary, MinimizerContigInfo, MinimizerIndex, MinimizerIndexError};
 /// Compatibility alias for the persisted `.fmi` file-format name.
