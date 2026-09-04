@@ -181,6 +181,8 @@ pub struct AlignmentConfig {
     /// Bases to pull both anchors back from a resolved overlap, so the gap DP
     /// sees reference on both sides of the event instead of none.
     pub overlap_flank: usize,
+    /// Smallest overlap worth flanking; zero flanks every one.
+    pub overlap_flank_min: usize,
     pub bridge_flank: usize,
     pub bridge_max_gap: usize,
     /// Compatibility-only mode field.  New mapper construction uses the
@@ -225,6 +227,7 @@ impl Default for Config {
                 island_chain_lookback: usize::MAX,
                 dissolve_repeat_run: 0,
                 overlap_flank: 0,
+                overlap_flank_min: 0,
                 bridge_flank: 256,
                 bridge_max_gap: 5_000,
                 // Sensitive is the production default. The explicit Fast
@@ -484,6 +487,14 @@ pub(crate) struct GapPolicy {
     /// than from where the extensions happened to stop. Zero is the old
     /// behaviour.
     pub(crate) overlap_flank: usize,
+    /// Smallest overlap worth flanking.
+    ///
+    /// Overlaps are overwhelmingly tiny: on a HiFi subset, 99.75% of five
+    /// million were 64 bases or fewer and only 1160 exceeded 256. A four-base
+    /// overlap needs no context to resolve, but flanking it still turns a gap
+    /// the kernel answered without a DP into one that runs a DP. Zero flanks
+    /// every resolved overlap, which is what the first measurement did.
+    pub(crate) overlap_flank_min: usize,
     pub(crate) recursive_split_min_gap: usize,
     pub(crate) recursive_split_max_depth: usize,
     pub(crate) recursive_split_max_gap: usize,
@@ -586,6 +597,7 @@ impl ResolvedMapperPolicy {
         policy.gaps.island_chain_lookback = config.alignment.island_chain_lookback;
         policy.gaps.dissolve_repeat_run = config.alignment.dissolve_repeat_run;
         policy.gaps.overlap_flank = config.alignment.overlap_flank;
+        policy.gaps.overlap_flank_min = config.alignment.overlap_flank_min;
         policy.gaps.bridge_flank = config.alignment.bridge_flank;
         policy.gaps.bridge_max_gap = config.alignment.bridge_max_gap;
         policy.probes = ProbePolicy {
@@ -763,6 +775,7 @@ impl ResolvedMapperPolicy {
             island_chain_lookback: usize::MAX,
             dissolve_repeat_run: 0,
             overlap_flank: 0,
+            overlap_flank_min: 0,
             recursive_split_min_gap: 13,
             recursive_split_max_depth: 8,
             recursive_split_max_gap: 1_000_000,
@@ -873,6 +886,7 @@ impl ResolvedMapperPolicy {
                 island_chain_lookback: self.gaps.island_chain_lookback,
                 dissolve_repeat_run: self.gaps.dissolve_repeat_run,
                 overlap_flank: self.gaps.overlap_flank,
+                overlap_flank_min: self.gaps.overlap_flank_min,
                 bridge_flank: self.gaps.bridge_flank,
                 bridge_max_gap: self.gaps.bridge_max_gap,
                 mode: self.mode,

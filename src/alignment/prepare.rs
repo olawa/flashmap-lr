@@ -84,12 +84,13 @@ pub(super) struct OverlapStats {
 
 #[cfg(test)]
 pub(super) fn normalize_anchor_overlaps(anchors: Vec<OrientedAnchor>) -> Vec<OrientedAnchor> {
-    normalize_anchor_overlaps_measured(anchors, 0, &mut OverlapStats::default())
+    normalize_anchor_overlaps_measured(anchors, 0, 0, &mut OverlapStats::default())
 }
 
 pub(super) fn normalize_anchor_overlaps_measured(
     mut anchors: Vec<OrientedAnchor>,
     overlap_flank: usize,
+    overlap_flank_min: usize,
     stats: &mut OverlapStats,
 ) -> Vec<OrientedAnchor> {
     // What an anchor must keep to still be worth pinning.
@@ -146,7 +147,7 @@ pub(super) fn normalize_anchor_overlaps_measured(
             index = index.saturating_sub(1);
         } else {
             stats.trimmed = stats.trimmed.saturating_add(1);
-            if overlap_flank > 0 {
+            if overlap_flank > 0 && overlap >= overlap_flank_min {
                 // The trim above put the two anchors end to end, which hands
                 // the DP a reference span of zero. Pull both back so it has
                 // sequence to decide with on either side of the event.
@@ -606,7 +607,7 @@ mod overlap_flank_tests {
         let anchors = vec![anchor(0, 500, 0, 500), anchor(600, 1_100, 300, 800)];
 
         let mut stats = OverlapStats::default();
-        let plain = normalize_anchor_overlaps_measured(anchors.clone(), 0, &mut stats);
+        let plain = normalize_anchor_overlaps_measured(anchors.clone(), 0, 0, &mut stats);
         assert_eq!(stats.flanked, 0);
         assert_eq!(
             plain[1].ref_start - plain[0].ref_end,
@@ -616,7 +617,7 @@ mod overlap_flank_tests {
         let plain_query_gap = plain[1].q_start - plain[0].q_end;
 
         let mut stats = OverlapStats::default();
-        let flanked = normalize_anchor_overlaps_measured(anchors, 64, &mut stats);
+        let flanked = normalize_anchor_overlaps_measured(anchors, 64, 0, &mut stats);
         assert_eq!(stats.flanked, 128, "64 bases off each side");
         assert_eq!(
             flanked[1].ref_start - flanked[0].ref_end,
@@ -632,12 +633,31 @@ mod overlap_flank_tests {
         assert!(flanked.iter().all(|a| a.q_end - a.q_start >= 16));
     }
 
+    /// Nearly every overlap is a handful of bases, where the trim already
+    /// leaves the right answer. Flanking those turns a gap the kernel
+    /// resolved without a DP into one that runs a DP, for nothing.
+    #[test]
+    fn a_threshold_leaves_the_small_overlaps_alone() {
+        let small = vec![anchor(0, 500, 0, 500), anchor(500, 1_000, 496, 996)];
+        let mut stats = OverlapStats::default();
+        let untouched = normalize_anchor_overlaps_measured(small.clone(), 64, 64, &mut stats);
+        assert_eq!(stats.flanked, 0, "a 4 base overlap is below the threshold");
+        let flanked = normalize_anchor_overlaps_measured(small, 64, 0, &mut stats);
+        assert_eq!(stats.flanked, 128, "and is flanked without one");
+        assert_ne!(untouched[0].q_end, flanked[0].q_end);
+
+        let large = vec![anchor(0, 600, 0, 600), anchor(400, 1_000, 300, 900)];
+        let mut stats = OverlapStats::default();
+        normalize_anchor_overlaps_measured(large, 64, 64, &mut stats);
+        assert_eq!(stats.flanked, 128, "a 300 base overlap is above it");
+    }
+
     /// A short anchor keeps its minimum rather than being flanked away.
     #[test]
     fn the_flank_never_consumes_an_anchor() {
         let anchors = vec![anchor(0, 40, 0, 40), anchor(50, 90, 30, 70)];
         let mut stats = OverlapStats::default();
-        let flanked = normalize_anchor_overlaps_measured(anchors, 1_000, &mut stats);
+        let flanked = normalize_anchor_overlaps_measured(anchors, 1_000, 0, &mut stats);
         assert!(flanked.iter().all(|a| a.q_end - a.q_start >= 16));
         assert!(flanked.iter().all(|a| a.q_start < a.q_end));
     }

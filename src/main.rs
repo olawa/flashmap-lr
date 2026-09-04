@@ -38,6 +38,7 @@ struct Options {
     island_lookback: Option<usize>,
     dissolve_repeat_run: Option<usize>,
     overlap_flank: Option<usize>,
+    overlap_flank_min: Option<usize>,
     drop_contained: bool,
     rarest_first: bool,
     diagonal_band: Option<i64>,
@@ -110,6 +111,7 @@ impl Options {
         let mut island_lookback: Option<usize> = None;
         let mut dissolve_repeat_run: Option<usize> = None;
         let mut overlap_flank: Option<usize> = None;
+        let mut overlap_flank_min: Option<usize> = None;
         let mut drop_contained = false;
         let mut rarest_first = false;
         let mut diagonal_band: Option<i64> = None;
@@ -186,6 +188,12 @@ impl Options {
                     overlap_flank = Some(parse_positive(
                         next_value(&mut args, &argument)?,
                         "overlap-flank",
+                    )?);
+                }
+                "--overlap-flank-min" => {
+                    overlap_flank_min = Some(parse_positive(
+                        next_value(&mut args, &argument)?,
+                        "overlap-flank-min",
                     )?);
                 }
                 "--drop-contained-anchors" => {
@@ -371,6 +379,7 @@ impl Options {
             island_lookback,
             dissolve_repeat_run,
             overlap_flank,
+            overlap_flank_min,
             drop_contained,
             rarest_first,
             diagonal_band,
@@ -516,6 +525,7 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--island-lookback",
     "--dissolve-repeat-anchors",
     "--overlap-flank",
+    "--overlap-flank-min",
     "--drop-contained-anchors",
     "--rarest-first",
     "--diagonal-band",
@@ -649,6 +659,11 @@ fn usage() -> &'static str {
         "      --overlap-flank N     Pull both anchors back N bases from a resolved\n",
         "                            overlap, so the gap DP sees reference on both\n",
         "                            sides of the event instead of none (default: 0)\n",
+        "      --overlap-flank-min N Only flank overlaps of at least N bases. Overlaps\n",
+        "                            are overwhelmingly tiny -- 99.75% of five million\n",
+        "                            were 64 or fewer -- and flanking one turns a gap\n",
+        "                            the kernel answered without a DP into one that\n",
+        "                            runs a DP (default: 0, flank every one)\n",
         "      --dissolve-repeat-anchors N\n",
         "                            Let one continuous DP replace a run of up to N\n",
         "                            chained anchors when the span they sit in carries\n",
@@ -1291,6 +1306,7 @@ fn execute_mapping(
         || options.island_lookback.is_some()
         || options.dissolve_repeat_run.is_some()
         || options.overlap_flank.is_some()
+        || options.overlap_flank_min.is_some()
         || options.drop_contained
         || options.rarest_first
         || options.diagonal_band.is_some()
@@ -1328,6 +1344,9 @@ fn execute_mapping(
                 overlap_flank: options
                     .overlap_flank
                     .unwrap_or(defaults.alignment.overlap_flank),
+                overlap_flank_min: options
+                    .overlap_flank_min
+                    .unwrap_or(defaults.alignment.overlap_flank_min),
                 ..defaults.alignment
             },
             worker_pool: mapper_config.runtime.clone(),

@@ -261,6 +261,7 @@ fn build_chain_cigar_with_policy(
     let raw_anchors = normalize_anchor_overlaps_measured(
         orient_anchors(chain, read.sequence.len(), contig)?,
         gap_policy.overlap_flank,
+        gap_policy.overlap_flank_min,
         &mut overlaps,
     );
     let raw_anchors = dissolve_indel_spanning_anchor_runs(
