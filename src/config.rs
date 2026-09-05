@@ -75,6 +75,7 @@ impl Default for RuntimeConfig {
 pub struct MapperConfig {
     pub mode: AlignmentMode,
     pub runtime: RuntimeConfig,
+    pub dual_affine: bool,
 }
 
 impl Default for MapperConfig {
@@ -82,6 +83,7 @@ impl Default for MapperConfig {
         Self {
             mode: AlignmentMode::Standard,
             runtime: RuntimeConfig::default(),
+            dual_affine: false,
         }
     }
 }
@@ -229,6 +231,8 @@ pub struct AlignmentConfig {
     /// Compatibility-only mode field.  New mapper construction uses the
     /// top-level [`MapperConfig::mode`] and copies it into `GapPolicy`.
     pub mode: AlignmentMode,
+    /// Enable dual-affine gap dynamic programming with KSW2 extd2.
+    pub dual_affine: bool,
 }
 
 impl Default for Config {
@@ -280,6 +284,7 @@ impl Default for Config {
                 // Sensitive is the production default. The explicit Fast
                 // profile remains available for throughput experiments.
                 mode: AlignmentMode::Standard,
+                dual_affine: false,
             },
             worker_pool: WorkerPoolConfig::default(),
         }
@@ -561,6 +566,7 @@ pub(crate) struct GapPolicy {
     pub(crate) recursive_split_trigger_nm_permille: u16,
     pub(crate) flank_max: usize,
     pub(crate) flank_min: usize,
+    pub(crate) scoring: ScoringPolicy,
 }
 
 /// Startup-resolved terminal-rescue policy.
@@ -599,6 +605,81 @@ pub(crate) struct ScoringPolicy {
     pub(crate) mismatch_penalty: i8,
     pub(crate) gap_open: i8,
     pub(crate) gap_extend: i8,
+    pub(crate) gap_open2: i8,
+    pub(crate) gap_extend2: i8,
+    pub(crate) dual_affine: bool,
+}
+
+impl ScoringPolicy {
+    pub fn align_full(
+        &self,
+        query: &[u8],
+        reference: &[u8],
+        band_width: usize,
+    ) -> Option<crate::LocalAlignment> {
+        if self.dual_affine {
+            crate::dp::align_full_dual_affine_with_scoring(
+                query,
+                reference,
+                band_width,
+                self.gap_open,
+                self.gap_extend,
+                self.gap_open2,
+                self.gap_extend2,
+            )
+        } else {
+            crate::dp::align_full_with_scoring(
+                query,
+                reference,
+                band_width,
+                self.gap_open,
+                self.gap_extend,
+            )
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn align_local(
+        &self,
+        query: &[u8],
+        reference: &[u8],
+        band_width: usize,
+    ) -> Option<crate::LocalAlignment> {
+        if self.dual_affine {
+            crate::dp::align_local_dual_affine_with_scoring(
+                query,
+                reference,
+                band_width,
+                self.gap_open,
+                self.gap_extend,
+                self.gap_open2,
+                self.gap_extend2,
+            )
+        } else {
+            crate::dp::align_local(query, reference, band_width)
+        }
+    }
+
+    pub fn align_banded(
+        &self,
+        query: &[u8],
+        reference: &[u8],
+        band_width: usize,
+    ) -> Option<crate::LocalAlignment> {
+        if self.dual_affine {
+            crate::dp::align_banded_dual_affine_with_scoring(
+                query,
+                reference,
+                band_width,
+                self.gap_open,
+                self.gap_extend,
+                self.gap_open2,
+                self.gap_extend2,
+            )
+        } else {
+            crate::dp::align_banded(query, reference, band_width)
+        }
+    }
 }
 
 /// Read-level work budget and search-completeness policy.
@@ -651,12 +732,20 @@ pub(crate) struct ResolvedMapperPolicy {
 impl ResolvedMapperPolicy {
     pub(crate) fn from_mapper_config(config: &MapperConfig) -> Result<Self, ConfigError> {
         config.validate()?;
-        Ok(Self::for_mode(config.mode, config.runtime.clone()))
+        Ok(Self::for_mode(
+            config.mode,
+            config.runtime.clone(),
+            config.dual_affine,
+        ))
     }
 
     pub(crate) fn from_legacy_config(config: &Config) -> Result<Self, ConfigError> {
         config.validate()?;
-        let mut policy = Self::for_mode(config.alignment.mode, config.worker_pool.clone());
+        let mut policy = Self::for_mode(
+            config.alignment.mode,
+            config.worker_pool.clone(),
+            config.alignment.dual_affine,
+        );
         policy.gaps.island_chain_lookback = config.alignment.island_chain_lookback;
         policy.gaps.dissolve_repeat_run = config.alignment.dissolve_repeat_run;
         policy.gaps.overlap_flank = config.alignment.overlap_flank;
@@ -725,7 +814,7 @@ impl ResolvedMapperPolicy {
         Ok(policy)
     }
 
-    fn for_mode(mode: AlignmentMode, runtime: RuntimeConfig) -> Self {
+    fn for_mode(mode: AlignmentMode, runtime: RuntimeConfig, dual_affine: bool) -> Self {
         let probes = ProbePolicy {
             sampled_anchors: false,
             map_window: 1,
@@ -825,6 +914,27 @@ impl ResolvedMapperPolicy {
             max_supplementary_query_overlap_fraction: 0.20,
             max_supplementary_alignments: 4,
         };
+        let scoring = if dual_affine {
+            ScoringPolicy {
+                match_score: 2,
+                mismatch_penalty: 4,
+                gap_open: 6,
+                gap_extend: 2,
+                gap_open2: 24,
+                gap_extend2: 1,
+                dual_affine: true,
+            }
+        } else {
+            ScoringPolicy {
+                match_score: 2,
+                mismatch_penalty: 4,
+                gap_open: 6,
+                gap_extend: 1,
+                gap_open2: 0,
+                gap_extend2: 0,
+                dual_affine: false,
+            }
+        };
         // Gap resolution, terminal rescue, normalization, and scoring are
         // quality rules, not search budgets. All three tiers resolve a gap
         // the same way; they differ only in how much of the read's seed and
@@ -851,6 +961,7 @@ impl ResolvedMapperPolicy {
             recursive_split_trigger_nm_permille: 0,
             flank_max: 64,
             flank_min: 16,
+            scoring,
         };
         let terminal = TerminalPolicy {
             max_dp_query: 300,
@@ -874,12 +985,6 @@ impl ResolvedMapperPolicy {
             str_left_alignment_window: usize::MAX,
             phase_shift_window: 32,
             divergent_terminal_window: 32,
-        };
-        let scoring = ScoringPolicy {
-            match_score: 2,
-            mismatch_penalty: 4,
-            gap_open: 6,
-            gap_extend: 1,
         };
         let work_budget = WorkBudget {
             // Fast retains the existing eight-candidate ceiling. Sensitive
@@ -967,6 +1072,7 @@ impl ResolvedMapperPolicy {
                 bridge_flank: self.gaps.bridge_flank,
                 bridge_max_gap: self.gaps.bridge_max_gap,
                 mode: self.mode,
+                dual_affine: self.scoring.dual_affine,
             },
             worker_pool: self.runtime.clone(),
         }
@@ -1029,9 +1135,10 @@ mod tests {
     #[test]
     fn tiers_share_every_quality_rule_and_differ_only_in_search_budget() {
         let runtime = RuntimeConfig::default();
-        let fast = ResolvedMapperPolicy::for_mode(AlignmentMode::Fast, runtime.clone());
-        let standard = ResolvedMapperPolicy::for_mode(AlignmentMode::Standard, runtime.clone());
-        let sensitive = ResolvedMapperPolicy::for_mode(AlignmentMode::Sensitive, runtime);
+        let fast = ResolvedMapperPolicy::for_mode(AlignmentMode::Fast, runtime.clone(), false);
+        let standard =
+            ResolvedMapperPolicy::for_mode(AlignmentMode::Standard, runtime.clone(), false);
+        let sensitive = ResolvedMapperPolicy::for_mode(AlignmentMode::Sensitive, runtime, false);
 
         // How a gap, terminal, or base is resolved does not depend on the
         // tier. Fast trading DP depth for speed cost it aligned bases in the
@@ -1066,7 +1173,12 @@ mod tests {
         assert_eq!(policy.mode, AlignmentMode::Standard);
         assert_eq!(
             policy.gaps,
-            ResolvedMapperPolicy::for_mode(AlignmentMode::Standard, RuntimeConfig::default(),).gaps
+            ResolvedMapperPolicy::for_mode(
+                AlignmentMode::Standard,
+                RuntimeConfig::default(),
+                false
+            )
+            .gaps
         );
     }
 
@@ -1075,9 +1187,10 @@ mod tests {
         assert!(AlignmentMode::Fast < AlignmentMode::Standard);
         assert!(AlignmentMode::Standard < AlignmentMode::Sensitive);
         let runtime = RuntimeConfig::default();
-        let fast = ResolvedMapperPolicy::for_mode(AlignmentMode::Fast, runtime.clone());
-        let standard = ResolvedMapperPolicy::for_mode(AlignmentMode::Standard, runtime.clone());
-        let sensitive = ResolvedMapperPolicy::for_mode(AlignmentMode::Sensitive, runtime);
+        let fast = ResolvedMapperPolicy::for_mode(AlignmentMode::Fast, runtime.clone(), false);
+        let standard =
+            ResolvedMapperPolicy::for_mode(AlignmentMode::Standard, runtime.clone(), false);
+        let sensitive = ResolvedMapperPolicy::for_mode(AlignmentMode::Sensitive, runtime, false);
 
         // Fast is bounded by search budget, not by resolution.
         assert_eq!(fast.gaps, standard.gaps);

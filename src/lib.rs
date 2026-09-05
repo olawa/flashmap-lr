@@ -34,7 +34,10 @@ pub use config::{
     RuntimeConfig, SeedingConfig, WorkerPoolConfig,
 };
 pub use diagnostics::{DiagnosticsSink, ReadDiagnostics};
-pub use dp::{align_full, align_local, LocalAlignment};
+pub use dp::{
+    align_banded, align_banded_dual_affine, align_full, align_full_dual_affine, align_local,
+    align_local_dual_affine, LocalAlignment,
+};
 pub use errors::MapError;
 pub mod bam;
 pub mod bam_reader;

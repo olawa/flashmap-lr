@@ -304,6 +304,9 @@ pub(super) fn left_align_indels(
         mismatch_penalty: crate::dp::MISMATCH_PENALTY,
         gap_open: crate::dp::GAP_OPEN,
         gap_extend: crate::dp::GAP_EXTEND,
+        gap_open2: 0,
+        gap_extend2: 0,
+        dual_affine: false,
     };
     left_align_indels_with_policy(ops, reference, query, ref_start, &normalization, &scoring);
 }

@@ -75,6 +75,7 @@ impl<'a> Aligner<'a> {
                 let mapper_config = MapperConfig {
                     mode: policy.mode,
                     runtime: policy.runtime.clone(),
+                    dual_affine: policy.scoring.dual_affine,
                 };
                 (policy, mapper_config, config)
             }
@@ -1167,7 +1168,7 @@ impl<'a> Aligner<'a> {
         let band = drift.saturating_add(policy.near_exact_dp_band_slack);
 
         let started = phase_timer(profiling);
-        let aligned = crate::dp::align_banded(&oriented, window, band);
+        let aligned = self.policy.scoring.align_banded(&oriented, window, band);
         diagnostics.near_exact_dp_nanos = diagnostics
             .near_exact_dp_nanos
             .saturating_add(phase_nanos(started));
@@ -2199,6 +2200,7 @@ mod tests {
                 chunk_size: 3,
                 reader_batch_size: Some(6),
             },
+            dual_affine: false,
         };
         let aligner = Aligner::new(reference, index, config.clone()).unwrap();
         assert_eq!(aligner.mapper_config(), &config);

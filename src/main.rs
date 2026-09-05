@@ -50,6 +50,7 @@ struct Options {
     dp_band_slack: Option<usize>,
     dp_max_drift: Option<usize>,
     dp_min_drift: Option<usize>,
+    dual_affine: bool,
     limit: Option<usize>,
     decompress_with: Option<String>,
 }
@@ -128,6 +129,7 @@ impl Options {
         let mut dp_band_slack: Option<usize> = None;
         let mut dp_max_drift: Option<usize> = None;
         let mut dp_min_drift: Option<usize> = None;
+        let mut dual_affine = false;
         let mut limit: Option<usize> = None;
         let mut decompress_with: Option<String> = None;
         let mut explicit_mode = None;
@@ -259,6 +261,9 @@ impl Options {
                 "--near-exact-dp" => {
                     near_exact = true;
                     near_exact_dp = true;
+                }
+                "--dual-affine" => {
+                    dual_affine = true;
                 }
                 "--query-window" => {
                     query_window =
@@ -433,6 +438,7 @@ impl Options {
             dp_band_slack,
             dp_max_drift,
             dp_min_drift,
+            dual_affine,
             limit,
             decompress_with,
         })
@@ -588,6 +594,7 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--near-exact",
     "--near-exact-dp",
     "--lazy-seed-cache",
+    "--dual-affine",
     "--mapq-from-span",
     "--mapq-saturation",
     "--dp-band-slack",
@@ -702,6 +709,8 @@ fn usage() -> &'static str {
         "                            agree on one diagonal, skipping probe clustering\n",
         "      --near-exact-dp       As --near-exact, and align the locked region in\n",
         "                            one banded pass instead of finding anchors\n",
+        "      --dual-affine         Enable dual-affine gap DP (KSW2 extd2) with gap\n",
+        "                            penalties 6/2, 24/1 (default: off)\n",
         "      --mapq-saturation N   Score difference that settles a placement on its\n",
         "                            own. A chain score is the sum of its anchor\n",
         "                            lengths, so a 15 kb read scores in the thousands\n",
@@ -923,6 +932,7 @@ fn non_default_settings(options: &Options) -> Vec<String> {
     }
     flag(parts, options.paired_emms, "paired-emms");
     flag(parts, options.tiered_candidates, "tiered-candidates");
+    flag(parts, options.dual_affine, "dual-affine");
     flag(parts, options.mapq_from_span, "mapq-from-span");
     if let Some(saturation) = options.mapq_saturation {
         parts.push(format!("mapq-saturation {saturation}"));
@@ -1476,6 +1486,7 @@ fn execute_mapping(
     let mapper_config = MapperConfig {
         mode: options.mode,
         runtime: runtime.clone(),
+        dual_affine: options.dual_affine,
     };
     // Experimental phase switches remain an explicit compatibility escape
     // hatch for benchmark/debug runs.  The normal CLI path always constructs
@@ -1524,6 +1535,7 @@ fn execute_mapping(
             },
             alignment: rs_lra::AlignmentConfig {
                 mode: options.mode,
+                dual_affine: options.dual_affine,
                 island_chain_lookback: options
                     .island_lookback
                     .unwrap_or(defaults.alignment.island_chain_lookback),

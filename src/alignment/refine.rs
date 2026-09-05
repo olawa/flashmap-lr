@@ -6,12 +6,12 @@
 //! soft clips, trim a divergent terminal run only when an internal relock
 //! exists, and leave final edge/indel normalization to the CIGAR assembler.
 
-use crate::config::{GapPolicy, ResolvedMapperPolicy, TerminalPolicy};
+use crate::config::{GapPolicy, ResolvedMapperPolicy, ScoringPolicy, TerminalPolicy};
 use crate::dna::{encode_kmer, mismatch_count, mismatch_rate};
 use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt};
 use crate::types::{normalize_cigar_ops, query_consumed};
 
-use crate::{align_full, CigarOp, Config};
+use crate::{CigarOp, Config};
 
 #[derive(Clone, Copy)]
 struct TerminalPolicies {
@@ -307,6 +307,7 @@ fn terminal_dp_fill(
     side: TerminalSide,
     k: usize,
     max_nm_rate: f64,
+    scoring: &ScoringPolicy,
     diagnostics: Option<&mut crate::ReadDiagnostics>,
 ) -> Option<(Vec<CigarOp>, usize, usize)> {
     // Keep at least one query base outside the seed so a small terminal
@@ -326,7 +327,7 @@ fn terminal_dp_fill(
         .saturating_add(64)
         .max(64);
     let started = diagnostics.as_ref().map(|_| std::time::Instant::now());
-    let alignment = align_full(query, reference, band);
+    let alignment = scoring.align_full(query, reference, band);
     if let Some(stats) = diagnostics {
         stats.dp_calls = stats.dp_calls.saturating_add(1);
         stats.terminal_dp_calls = stats.terminal_dp_calls.saturating_add(1);
@@ -358,6 +359,7 @@ fn terminal_fill_with_diagnostics(
             side,
             terminal_policy.kmer,
             terminal_policy.max_nm_rate,
+            &gap_policy.scoring,
             reborrow_diagnostics(&mut diagnostics),
         )
     } else {

@@ -24,7 +24,7 @@ use crate::config::{
 };
 use crate::dna::base_code;
 use crate::{
-    align_full, Alignment, AlignmentError, Chain, Cigar, CigarError, CigarOp, Config, Contig, Read,
+    Alignment, AlignmentError, Chain, Cigar, CigarError, CigarOp, Config, Contig, Read,
 };
 
 /// Errors produced while converting a sparse chain into an alignment.
@@ -597,6 +597,7 @@ fn append_gap_recursive(
             reference_slice,
             band,
             GapDpKind::Small,
+            &gap_policy.scoring,
             reborrow_diagnostics(&mut diagnostics),
         ) {
             if gap_dp_requires_escalation(
@@ -666,6 +667,7 @@ fn append_gap_recursive(
             reference_slice,
             band,
             GapDpKind::Medium,
+            &gap_policy.scoring,
             reborrow_diagnostics(&mut diagnostics),
         ) {
             if gap_dp_requires_escalation(
@@ -739,6 +741,7 @@ fn append_gap_recursive(
             &reference[ref_start..ref_start + flank],
             flank_band,
             GapDpKind::Flank,
+            &gap_policy.scoring,
             reborrow_diagnostics(&mut diagnostics),
         );
         let right = run_gap_dp(
@@ -746,6 +749,7 @@ fn append_gap_recursive(
             &reference[ref_end - flank..ref_end],
             flank_band,
             GapDpKind::Flank,
+            &gap_policy.scoring,
             reborrow_diagnostics(&mut diagnostics),
         );
 
@@ -1153,13 +1157,14 @@ fn run_gap_dp(
     reference: &[u8],
     band: usize,
     kind: GapDpKind,
+    scoring: &ScoringPolicy,
     diagnostics: Option<&mut crate::ReadDiagnostics>,
 ) -> Option<crate::LocalAlignment> {
     if diagnostics.is_none() {
-        return align_full(query, reference, band);
+        return scoring.align_full(query, reference, band);
     }
     let started = std::time::Instant::now();
-    let result = align_full(query, reference, band);
+    let result = scoring.align_full(query, reference, band);
     let elapsed = crate::diagnostics::elapsed_nanos(started);
     if let Some(stats) = diagnostics {
         stats.dp_calls = stats.dp_calls.saturating_add(1);
