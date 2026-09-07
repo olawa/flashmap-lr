@@ -393,7 +393,7 @@ impl<'a> Aligner<'a> {
             .unwrap_or(false);
 
         for (idx, candidate) in candidates.iter().take(candidate_budget).enumerate() {
-            if idx > 0 && !placements.is_empty() {
+            if idx >= 2 && !placements.is_empty() {
                 // When the primary locus is anchored on both ends, internal-only
                 // repeat clusters cannot displace it unless they explain an
                 // uncovered split segment.
@@ -516,7 +516,7 @@ impl<'a> Aligner<'a> {
 
             // Early anchor coverage prune: if the best candidate already has high coverage
             // and this candidate's raw anchor span is far too small, skip chaining.
-            if idx > 0 && !placements.is_empty() {
+            if idx >= 2 && !placements.is_empty() {
                 let best_covered_fraction = placements
                     .iter()
                     .map(|p: &ChainPlacement| p.1.query_covered_fraction)
@@ -793,7 +793,8 @@ impl<'a> Aligner<'a> {
         // bounds every record the read produces, not only the primary.
         let confidence_cap = |mapq: u8| {
             let mut mapq = mapq;
-            if matches!(search_completeness, SearchCompleteness::Limited) {
+            if matches!(search_completeness, SearchCompleteness::Limited) && second_score.is_none()
+            {
                 mapq = mapq.min(self.policy.work_budget.limited_mapq_cap);
             }
             if ambiguity_limited {
