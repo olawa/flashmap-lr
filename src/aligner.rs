@@ -1817,9 +1817,16 @@ fn phase_nanos(started: Option<Instant>) -> u64 {
 /// Minimap2-calibrated mapping quality computation.
 ///
 /// For long reads, minimap2 does not penalize unambiguous alignments for anchor
+/// Minimap2-calibrated MAPQ calculation.
+///
+/// Unambiguous alignments earn MAPQ 60 without penalizing anchor
 /// sparsity as long as the chain spans the read and contains sufficient anchors.
-/// When competitors exist, confidence scales with the absolute score difference
-/// (Phred scaled ~ 3.0 * delta_score) with penalties for multiple suboptimal placements.
+/// When competitors exist, confidence is bounded by both:
+/// 1. The score difference term (Phred-scaled ~ 3.0 * delta_score, primary for short reads)
+/// 2. The competitor score ratio suppression term (40.0 * (1 - x^2) * ln(S_1), primary for long reads)
+/// following minimap2's dual-term formulation (hit.c:462-465).
+/// In close competitions (delta_score < 20), an additional penalty for multiple
+/// suboptimal competitors is applied.
 fn mapping_quality_minimap2(
     best_score: i32,
     second_score: Option<i32>,
@@ -1849,15 +1856,19 @@ fn mapping_quality_minimap2(
             if difference == 0 {
                 return 0;
             }
-            let diff_term = (3.0 * difference as f64).clamp(0.0, 60.0);
-            // In minimap2: a decisive score difference (>= 20) yields MAPQ 60 without suboptimal penalty.
-            // Suboptimal penalty only applies when competing placements are closely contested (< 20 score difference).
+            let diff_term = 3.0 * difference as f64;
+            let x = (second.max(0) as f64 / (best_score.max(1) as f64)).clamp(0.0, 1.0);
+            let log_sc = (best_score as f64).max(2.0).ln();
+            let ratio_term = 40.0 * (1.0 - x * x) * log_sc;
+            let base_term = ratio_term.min(diff_term).clamp(0.0, 60.0);
+
+            // In minimap2: suboptimal penalty applies when competing placements are closely contested (< 20 score difference).
             let sub_penalty = if difference < 20 && competing_count > 1 {
                 4.343 * (competing_count as f64).ln()
             } else {
                 0.0
             };
-            (diff_term - sub_penalty).clamp(0.0, 60.0)
+            (base_term - sub_penalty).clamp(0.0, 60.0)
         }
     };
 
@@ -2568,19 +2579,26 @@ mod tests {
         let short_repeat = mapping_quality_minimap2(500, None, 0.10, 5, 100, 0);
         assert!(short_repeat <= 10);
 
-        // 3. Competitor with large score difference (e.g. 500 score points) earns MAPQ 60
-        assert_eq!(mapping_quality_minimap2(15_000, Some(14_500), 1.0, 50, 1000, 1), 60);
+        // 3. Competitor with decisive score ratio difference (15,000 vs 13,500, 10% diff) earns MAPQ 60
+        assert_eq!(mapping_quality_minimap2(15_000, Some(13_500), 1.0, 50, 1000, 1), 60);
 
-        // 4. Competitor with 20 score points difference reaches MAPQ 60
-        assert_eq!(mapping_quality_minimap2(15_000, Some(14_980), 1.0, 50, 1000, 1), 60);
+        // 4. Competitor in long read with small relative difference (15,000 vs 14,980, 20 points diff, 0.13%)
+        // is suppressed by competitor ratio term to MAPQ 1 (minimap2 long-read repeat suppression)
+        assert_eq!(mapping_quality_minimap2(15_000, Some(14_980), 1.0, 50, 1000, 1), 1);
 
-        // 5. Competitor with small difference (5 score points) gets proportional MAPQ ~15
-        assert_eq!(mapping_quality_minimap2(15_000, Some(14_995), 1.0, 50, 1000, 1), 15);
+        // 5. Competitor with moderate ratio (15,000 vs 14,500, 3.3% diff) earns intermediate MAPQ 25
+        assert_eq!(mapping_quality_minimap2(15_000, Some(14_500), 1.0, 50, 1000, 1), 25);
 
-        // 6. Exact tie gets MAPQ 0
+        // 6. Short read with 20 score points difference (100 vs 80, 20% diff) earns MAPQ 60
+        assert_eq!(mapping_quality_minimap2(100, Some(80), 1.0, 10, 100, 1), 60);
+
+        // 7. Short read with small difference (100 vs 95, 5% diff) gets MAPQ 15
+        assert_eq!(mapping_quality_minimap2(100, Some(95), 1.0, 10, 100, 1), 15);
+
+        // 8. Exact tie gets MAPQ 0
         assert_eq!(mapping_quality_minimap2(15_000, Some(15_000), 1.0, 50, 1000, 1), 0);
 
-        // 7. Strictly better placement gets at least MAPQ 1
-        assert_eq!(mapping_quality_minimap2(15_000, Some(14_999), 1.0, 50, 1000, 1), 3);
+        // 9. Strictly better placement gets at least MAPQ 1
+        assert_eq!(mapping_quality_minimap2(15_000, Some(14_999), 1.0, 50, 1000, 1), 1);
     }
 }
