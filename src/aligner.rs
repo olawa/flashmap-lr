@@ -818,7 +818,7 @@ impl<'a> Aligner<'a> {
             MapqMode::Minimap2 => {
                 let span = chain.q_end.saturating_sub(chain.q_start) as f64;
                 let span_fraction = (span / read.sequence.len().max(1) as f64).clamp(0.0, 1.0);
-                let competing_count = placements
+                let placement_competitors = placements
                     .iter()
                     .filter(|(_, other, _)| {
                         !std::ptr::eq(other, chain)
@@ -831,6 +831,8 @@ impl<'a> Aligner<'a> {
                             )
                     })
                     .count();
+                let candidate_competitors = candidates.len().saturating_sub(1);
+                let competing_count = placement_competitors.max(candidate_competitors);
                 confidence_cap(mapping_quality_minimap2(
                     best_rank_score,
                     second_score,
@@ -1859,12 +1861,12 @@ fn mapping_quality_minimap2(
             }
             let diff_term = 3.0 * difference as f64;
             let x = (second.max(0) as f64 / (best_score.max(1) as f64)).clamp(0.0, 1.0);
-            let log_sc = (best_score as f64).max(2.0).ln();
+            let log_sc = ((best_score as f64) / 2.0).max(2.0).ln();
             let ratio_term = 40.0 * (1.0 - x * x) * log_sc;
-            let base_term = ratio_term.min(diff_term).clamp(0.0, 60.0);
+            let base_term = ratio_term.min(diff_term);
 
-            // In minimap2: suboptimal penalty applies when competing placements are closely contested (< 20 score difference).
-            let sub_penalty = if difference < 20 && competing_count > 1 {
+            // In minimap2: suboptimal penalty applies for competing loci across the genome.
+            let sub_penalty = if competing_count > 1 {
                 4.343 * (competing_count as f64).ln()
             } else {
                 0.0
@@ -2587,11 +2589,11 @@ mod tests {
         // is suppressed by competitor ratio term to MAPQ 1 (minimap2 long-read repeat suppression)
         assert_eq!(mapping_quality_minimap2(15_000, Some(14_980), 1.0, 50, 1000, 1), 1);
 
-        // 5. Competitor with moderate ratio (15,000 vs 14,500, 3.3% diff) earns intermediate MAPQ 25
-        assert_eq!(mapping_quality_minimap2(15_000, Some(14_500), 1.0, 50, 1000, 1), 25);
+        // 5. Competitor with moderate ratio (15,000 vs 14,500, 3.3% diff) earns intermediate MAPQ 23
+        assert_eq!(mapping_quality_minimap2(15_000, Some(14_500), 1.0, 50, 1000, 1), 23);
 
-        // 6. Short read with 20 score points difference (100 vs 80, 20% diff) earns MAPQ 60
-        assert_eq!(mapping_quality_minimap2(100, Some(80), 1.0, 10, 100, 1), 60);
+        // 6. Short read with 20 score points difference (100 vs 80, 20% diff) earns MAPQ 56
+        assert_eq!(mapping_quality_minimap2(100, Some(80), 1.0, 10, 100, 1), 56);
 
         // 7. Short read with small difference (100 vs 95, 5% diff) gets MAPQ 15
         assert_eq!(mapping_quality_minimap2(100, Some(95), 1.0, 10, 100, 1), 15);

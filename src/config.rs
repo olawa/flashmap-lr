@@ -1145,12 +1145,8 @@ impl ResolvedMapperPolicy {
             mapq_from_span: false,
             mapq_score_saturation: 0,
             mapq_mode: MapqMode::Minimap2,
-            ambiguity_score_fraction: 0.90,
-            ambiguity_candidate_count: if mode.resolves_full_depth() {
-                usize::MAX
-            } else {
-                4
-            },
+            ambiguity_score_fraction: 0.60,
+            ambiguity_candidate_count: 4,
             ambiguity_candidate_budget: 3,
             ambiguity_mapq_cap: 5,
         };
