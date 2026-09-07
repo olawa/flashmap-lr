@@ -1,0 +1,14 @@
+Reading 1 reference sequences...
+packed seed index: 1 distinct seeds, 0 inlined single-occurrence (0.00%), 1 hits stored, 1 capped
+Index build complete.
+CAP: raw=22 stored=1 capped=true (expected true)
+rs-lra lookup=SeedLookup { completeness: Sampled { stored: 1, total: None }, reported_hits: 1 } hits=([SeedHit { contig: ContigId(0), ref_pos: 0, strand: Forward }], SeedLookup { completeness: Sampled { stored: 1, total: None }, reported_hits: 1 })
+COLLISION codes=449396736,943947776 key=636675604
+Reading 2 reference sequences...
+packed seed index: 2 distinct seeds, 2 inlined single-occurrence (100.00%), 0 hits stored, 0 capped
+Index build complete.
+first lookup=Inline(PackedLocation(0))
+second lookup=Inline(PackedLocation(281474976710656))
+rs-lra lookup=SeedLookup { completeness: Complete, reported_hits: 1 } hits=([SeedHit { contig: ContigId(0), ref_pos: 0, strand: Forward }], SeedLookup { completeness: Complete, reported_hits: 1 })
+rs-lra lookup=SeedLookup { completeness: Complete, reported_hits: 1 } hits=([SeedHit { contig: ContigId(1), ref_pos: 0, strand: Forward }], SeedLookup { completeness: Complete, reported_hits: 1 })
+BAM actual_ops=65536 encoded_n_cigar=2 (expected placeholder 2 + CG)

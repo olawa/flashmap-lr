@@ -4,7 +4,6 @@ use super::assembly::{append_gap_with_policy, ChainCigarError};
 #[cfg(test)]
 use crate::config::ResolvedMapperPolicy;
 use crate::config::{GapPolicy, ScoringPolicy};
-use crate::dna::mismatch_count;
 #[cfg(test)]
 use crate::Config;
 use crate::{Chain, CigarOp, Contig, Strand};
@@ -210,40 +209,9 @@ fn score_cigar_ops(
     reference: &[u8],
     scoring: &ScoringPolicy,
 ) -> i32 {
-    let mut score = 0i32;
-    let mut q_pos = 0usize;
-    let mut r_pos = 0usize;
-    for &op in ops {
-        match op {
-            CigarOp::Match(len) => {
-                let l = len as usize;
-                if let (Some(q), Some(r)) =
-                    (query.get(q_pos..q_pos + l), reference.get(r_pos..r_pos + l))
-                {
-                    let nm = mismatch_count(q, r);
-                    let matches = l - nm;
-                    score += (matches as i32) * (scoring.match_score as i32)
-                        - (nm as i32) * (scoring.mismatch_penalty as i32);
-                }
-                q_pos += l;
-                r_pos += l;
-            }
-            CigarOp::Ins(len) => {
-                let l = len as usize;
-                score -= (scoring.gap_open as i32) + (l as i32) * (scoring.gap_extend as i32);
-                q_pos += l;
-            }
-            CigarOp::Del(len) => {
-                let l = len as usize;
-                score -= (scoring.gap_open as i32) + (l as i32) * (scoring.gap_extend as i32);
-                r_pos += l;
-            }
-            CigarOp::SoftClip(len) => {
-                q_pos += len as usize;
-            }
-        }
-    }
-    score
+    scoring
+        .cigar_score(ops, query, reference)
+        .unwrap_or(i32::MIN)
 }
 
 /// Replace a run of chained anchors with one continuous DP when the span they
@@ -273,6 +241,7 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
     gap_policy: &GapPolicy,
     scoring_policy: &ScoringPolicy,
     stats: &mut OverlapStats,
+    mut diagnostics: Option<&mut crate::ReadDiagnostics>,
 ) -> Vec<OrientedAnchor> {
     let max_run = gap_policy.dissolve_repeat_run;
     if max_run == 0 || anchors.len() < 3 {
@@ -325,7 +294,7 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                     cursor.1,
                     anchor.ref_start,
                     gap_policy,
-                    None,
+                    diagnostics.as_deref_mut(),
                 )
                 .is_err()
                 {
@@ -345,7 +314,7 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                     cursor.1,
                     flank_right.ref_start,
                     gap_policy,
-                    None,
+                    diagnostics.as_deref_mut(),
                 )
                 .is_err()
             {
@@ -362,7 +331,7 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                 flank_left.ref_end,
                 flank_right.ref_start,
                 gap_policy,
-                None,
+                diagnostics.as_deref_mut(),
             )
             .is_err()
             {
@@ -416,6 +385,7 @@ pub(super) fn unlock_register_shifted_str_anchors(
         reference,
         &policy.gaps,
         &policy.scoring,
+        None,
     )
 }
 
@@ -425,6 +395,7 @@ pub(super) fn unlock_register_shifted_str_anchors_with_policy(
     reference: &[u8],
     gap_policy: &GapPolicy,
     scoring_policy: &ScoringPolicy,
+    mut diagnostics: Option<&mut crate::ReadDiagnostics>,
 ) -> Vec<OrientedAnchor> {
     if anchors.len() < 3 {
         return anchors;
@@ -504,7 +475,7 @@ pub(super) fn unlock_register_shifted_str_anchors_with_policy(
             left.ref_end,
             mid.ref_start,
             gap_policy,
-            None,
+            diagnostics.as_deref_mut(),
         )
         .is_ok();
         if !gap1_ok {
@@ -521,7 +492,7 @@ pub(super) fn unlock_register_shifted_str_anchors_with_policy(
             mid.ref_end,
             right.ref_start,
             gap_policy,
-            None,
+            diagnostics.as_deref_mut(),
         )
         .is_ok();
         if !gap2_ok {
@@ -543,7 +514,7 @@ pub(super) fn unlock_register_shifted_str_anchors_with_policy(
             left.ref_end,
             right.ref_start,
             gap_policy,
-            None,
+            diagnostics.as_deref_mut(),
         )
         .is_ok();
         if !cont_ok {
@@ -568,20 +539,22 @@ pub(super) fn unlock_register_shifted_str_anchors_with_policy(
     anchors
 }
 
-pub(crate) fn oriented_query(sequence: &[u8], strand: Strand) -> Vec<u8> {
+pub(crate) fn oriented_query(sequence: &[u8], strand: Strand) -> std::borrow::Cow<'_, [u8]> {
     match strand {
-        Strand::Forward => sequence.to_vec(),
-        Strand::Reverse => sequence
-            .iter()
-            .rev()
-            .map(|base| match base.to_ascii_uppercase() {
-                b'A' => b'T',
-                b'C' => b'G',
-                b'G' => b'C',
-                b'T' => b'A',
-                _ => b'N',
-            })
-            .collect(),
+        Strand::Forward => std::borrow::Cow::Borrowed(sequence),
+        Strand::Reverse => std::borrow::Cow::Owned(
+            sequence
+                .iter()
+                .rev()
+                .map(|base| match base.to_ascii_uppercase() {
+                    b'A' => b'T',
+                    b'C' => b'G',
+                    b'G' => b'C',
+                    b'T' => b'A',
+                    _ => b'N',
+                })
+                .collect(),
+        ),
     }
 }
 

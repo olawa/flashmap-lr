@@ -23,9 +23,7 @@ use crate::config::{
     GapPolicy, NormalizationPolicy, ResolvedMapperPolicy, ScoringPolicy, TerminalPolicy,
 };
 use crate::dna::base_code;
-use crate::{
-    Alignment, AlignmentError, Chain, Cigar, CigarError, CigarOp, Config, Contig, Read,
-};
+use crate::{Alignment, AlignmentError, Chain, Cigar, CigarError, CigarOp, Config, Contig, Read};
 
 /// Errors produced while converting a sparse chain into an alignment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,15 +175,16 @@ pub(crate) fn build_chain_alignment_with_policy(
     let reference_end = ref_start
         .checked_add(cigar.reference_len() as usize)
         .ok_or(ChainCigarError::InvalidReferenceCoordinates)?;
-    let edit_distance = crate::types::cigar_edit_distance(
-        &cigar,
-        &oriented_query,
-        contig
-            .sequence
-            .get(ref_start..reference_end)
-            .ok_or(ChainCigarError::InvalidReferenceCoordinates)?,
-    )
-    .ok_or(ChainCigarError::InvalidReferenceCoordinates)?;
+    let (score, edit_distance) = scoring_policy
+        .cigar_metrics(
+            cigar.ops(),
+            &oriented_query,
+            contig
+                .sequence
+                .get(ref_start..reference_end)
+                .ok_or(ChainCigarError::InvalidReferenceCoordinates)?,
+        )
+        .ok_or(ChainCigarError::InvalidReferenceCoordinates)?;
 
     Alignment::new(
         contig.id,
@@ -193,7 +192,7 @@ pub(crate) fn build_chain_alignment_with_policy(
         chain_strand(chain)?,
         0,
         cigar,
-        chain.score,
+        score,
         mapq,
         edit_distance,
     )
@@ -222,6 +221,7 @@ pub fn build_chain_cigar(
         &policies.scoring,
         None,
     )
+    .map(|(cigar, start, query)| (cigar, start, query.into_owned()))
 }
 
 #[allow(dead_code)]
@@ -243,11 +243,12 @@ fn build_chain_cigar_with_diagnostics(
         &policies.scoring,
         diagnostics,
     )
+    .map(|(cigar, start, query)| (cigar, start, query.into_owned()))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_chain_cigar_with_policy(
-    read: Read<'_>,
+fn build_chain_cigar_with_policy<'a>(
+    read: Read<'a>,
     contig: Contig<'_>,
     chain: &Chain,
     gap_policy: &GapPolicy,
@@ -255,8 +256,9 @@ fn build_chain_cigar_with_policy(
     normalization_policy: &NormalizationPolicy,
     scoring_policy: &ScoringPolicy,
     mut diagnostics: Option<&mut crate::ReadDiagnostics>,
-) -> Result<(Cigar, usize, Vec<u8>), ChainCigarError> {
+) -> Result<(Cigar, usize, std::borrow::Cow<'a, [u8]>), ChainCigarError> {
     let oriented_query = oriented_query(read.sequence, chain_strand(chain)?);
+    let gap_cache_scope = super::gap_cache::Scope::new(&oriented_query, contig.sequence);
     let mut overlaps = super::prepare::OverlapStats::default();
     let raw_anchors = normalize_anchor_overlaps_measured(
         orient_anchors(chain, read.sequence.len(), contig)?,
@@ -271,6 +273,7 @@ fn build_chain_cigar_with_policy(
         gap_policy,
         scoring_policy,
         &mut overlaps,
+        diagnostics.as_deref_mut(),
     );
     let anchors = unlock_register_shifted_str_anchors_with_policy(
         raw_anchors,
@@ -278,7 +281,9 @@ fn build_chain_cigar_with_policy(
         contig.sequence,
         gap_policy,
         scoring_policy,
+        diagnostics.as_deref_mut(),
     );
+    gap_cache_scope.finish_recording();
     if let Some(diagnostics) = diagnostics.as_deref_mut() {
         for (slot, value) in diagnostics
             .anchor_overlap_buckets
@@ -408,10 +413,10 @@ fn build_chain_cigar_with_policy(
         contig.sequence,
         &oriented_query,
         &mut ref_start,
-        terminal_policy.match_score,
-        scoring_policy.mismatch_penalty,
-        scoring_policy.gap_open as i32,
-        scoring_policy.gap_extend as i32,
+        &ScoringPolicy {
+            match_score: terminal_policy.match_score,
+            ..*scoring_policy
+        },
         terminal_policy.clip_penalty,
         terminal_policy.min_clip_score_gain,
         terminal_policy.endpoint_search,
@@ -434,6 +439,7 @@ fn build_chain_cigar_with_policy(
     if cigar.query_len() as usize != oriented_query.len() {
         return Err(ChainCigarError::InvalidQueryCoordinates);
     }
+    drop(gap_cache_scope);
     Ok((cigar, ref_start, oriented_query))
 }
 
@@ -1161,12 +1167,25 @@ fn run_gap_dp(
     diagnostics: Option<&mut crate::ReadDiagnostics>,
 ) -> Option<crate::LocalAlignment> {
     if diagnostics.is_none() {
-        return scoring.align_full(query, reference, band);
+        return super::gap_cache::align(query, reference, band, scoring)
+            .1
+            .ok();
     }
     let started = std::time::Instant::now();
-    let result = scoring.align_full(query, reference, band);
+    let (cached, result) = super::gap_cache::align(query, reference, band, scoring);
     let elapsed = crate::diagnostics::elapsed_nanos(started);
     if let Some(stats) = diagnostics {
+        if cached {
+            stats.dp_cache_hits = stats.dp_cache_hits.saturating_add(1);
+            return result.ok();
+        }
+        match result.as_ref().err() {
+            Some(crate::dp::DpFailure::Budget) => stats.dp_budget_rejections += 1,
+            Some(crate::dp::DpFailure::ImpossibleBand) => stats.dp_impossible_band += 1,
+            Some(crate::dp::DpFailure::ZDrop) => stats.dp_zdrop_rejections += 1,
+            Some(_) => stats.dp_incomplete_rejections += 1,
+            None => {}
+        }
         stats.dp_calls = stats.dp_calls.saturating_add(1);
         match kind {
             GapDpKind::Small => {
@@ -1183,7 +1202,7 @@ fn run_gap_dp(
             }
         }
     }
-    result
+    result.ok()
 }
 
 fn to_u32(value: usize) -> Result<u32, ChainCigarError> {
@@ -1221,6 +1240,68 @@ mod tests {
                 b"ACGT"[((state >> 32) & 3) as usize]
             })
             .collect()
+    }
+
+    #[test]
+    fn str_repair_and_final_gap_share_the_selected_dp_result() {
+        let reference = b"AC".repeat(43);
+        let query = b"AC".repeat(41);
+        let policy = crate::config::ResolvedMapperPolicy::from_legacy_config(&config()).unwrap();
+        let assemble = |cache: bool| {
+            let _scope = cache.then(|| super::super::gap_cache::Scope::new(&query, &reference));
+            let anchors = vec![
+                OrientedAnchor {
+                    q_start: 0,
+                    q_end: 20,
+                    ref_start: 0,
+                    ref_end: 20,
+                },
+                OrientedAnchor {
+                    q_start: 20,
+                    q_end: 62,
+                    ref_start: 22,
+                    ref_end: 64,
+                },
+                OrientedAnchor {
+                    q_start: 62,
+                    q_end: 82,
+                    ref_start: 66,
+                    ref_end: 86,
+                },
+            ];
+            let mut stats = crate::ReadDiagnostics::default();
+            let unlocked = unlock_register_shifted_str_anchors_with_policy(
+                anchors,
+                &query,
+                &reference,
+                &policy.gaps,
+                &policy.scoring,
+                Some(&mut stats),
+            );
+            assert_eq!(unlocked.len(), 2);
+            if let Some(scope) = &_scope {
+                scope.finish_recording();
+            }
+            let mut ops = Vec::new();
+            append_gap_with_policy(
+                &mut ops,
+                &query,
+                &reference,
+                unlocked[0].q_end,
+                unlocked[1].q_start,
+                unlocked[0].ref_end,
+                unlocked[1].ref_start,
+                &policy.gaps,
+                Some(&mut stats),
+            )
+            .unwrap();
+            (ops, stats)
+        };
+        let plain = assemble(false);
+        let cached = assemble(true);
+        assert_eq!(plain.0, cached.0);
+        assert!(cached.1.dp_cache_hits > 0);
+        assert!(cached.1.dp_calls < plain.1.dp_calls);
     }
 
     #[test]
@@ -1671,10 +1752,15 @@ mod tests {
             reference,
             &read,
             &mut ref_start,
-            1,
-            4,
-            6,
-            1,
+            &ScoringPolicy {
+                match_score: 1,
+                mismatch_penalty: 4,
+                gap_open: 6,
+                gap_extend: 1,
+                gap_open2: 0,
+                gap_extend2: 0,
+                dual_affine: false,
+            },
             5,
             3,
             25,
@@ -1811,10 +1897,12 @@ mod tests {
             &dissolving_config(0),
             &scoring,
             &mut super::super::prepare::OverlapStats::default(),
+            None,
         );
         assert_eq!(untouched.len(), 4, "the pass is off by default");
 
         let mut stats = super::super::prepare::OverlapStats::default();
+        let mut diagnostics = crate::ReadDiagnostics::default();
         let dissolved = super::dissolve_indel_spanning_anchor_runs(
             anchors,
             &query,
@@ -1822,7 +1910,9 @@ mod tests {
             &dissolving_config(8),
             &scoring,
             &mut stats,
+            Some(&mut diagnostics),
         );
+        assert!(diagnostics.dp_calls > 0);
         assert!(dissolved.len() < 4, "the interior anchors survived the DP");
         assert_eq!(stats.dissolved_runs, 1);
         assert_eq!(stats.dissolved_anchors as usize, 4 - dissolved.len());

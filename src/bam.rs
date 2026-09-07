@@ -127,6 +127,50 @@ pub fn write_bgzf_eof<W: Write>(out: &mut W) -> io::Result<()> {
     out.write_all(&BGZF_EOF)
 }
 
+fn bam_cigar_word(op: CigarOp) -> u32 {
+    let code = match op {
+        CigarOp::Match(_) => 0,
+        CigarOp::Ins(_) => 1,
+        CigarOp::Del(_) => 2,
+        CigarOp::SoftClip(_) => 4,
+    };
+    (op.len() << 4) | code
+}
+
+fn validate_bam_read(mapped: &MappedRead) -> io::Result<()> {
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+    if mapped.name.is_empty() || mapped.name.len() > 254 || mapped.name.as_bytes().contains(&0) {
+        return Err(invalid(
+            "BAM read name must contain 1..=254 bytes without NUL",
+        ));
+    }
+    if mapped.sequence.len() > i32::MAX as usize {
+        return Err(invalid("BAM sequence exceeds signed 32-bit length"));
+    }
+    for a in mapped
+        .mapping
+        .primary
+        .iter()
+        .chain(&mapped.mapping.supplementary)
+        .chain(&mapped.mapping.secondary)
+    {
+        if a.ref_start > i32::MAX as u64
+            || a.cigar.ops().iter().any(|op| op.len() > 0x0fff_ffff)
+            || a.cigar.ops().len() > i32::MAX as usize
+        {
+            return Err(invalid("alignment exceeds BAM coordinate or CIGAR limits"));
+        }
+        if a.cigar.ops().len() > u16::MAX as usize
+            && (mapped.sequence.len() > 0x0fff_ffff || a.cigar.reference_len() > 0x0fff_ffff)
+        {
+            return Err(invalid(
+                "long CIGAR placeholder exceeds BAM operation length",
+            ));
+        }
+    }
+    Ok(())
+}
+
 struct BamContig {
     name: String,
     length: usize,
@@ -211,21 +255,29 @@ impl BamRecordEncoder {
     }
 
     /// Encode a batch into whole BGZF blocks appended to `out`.
-    pub fn encode_batch(&self, batch: &[MappedRead], out: &mut Vec<u8>) {
+    /// Reject unrepresentable names/coordinates/CIGARs before appending any bytes.
+    pub fn encode_batch(&self, batch: &[MappedRead], out: &mut Vec<u8>) -> io::Result<()> {
+        for mapped in batch {
+            validate_bam_read(mapped)?;
+        }
         let mut raw = Vec::with_capacity(batch.len() * 24 * 1024);
         for mapped in batch {
             self.encode_read(mapped, &mut raw);
         }
         write_bgzf(&raw, out);
+        Ok(())
     }
 
     fn encode_read(&self, mapped: &MappedRead, raw: &mut Vec<u8>) {
         match mapped.mapping.primary.as_ref() {
-            Some(primary) => self.encode_record(mapped, Some(primary), false, raw),
-            None => self.encode_record(mapped, None, false, raw),
+            Some(primary) => self.encode_record(mapped, Some(primary), 0, raw),
+            None => self.encode_record(mapped, None, 0, raw),
+        }
+        for secondary in &mapped.mapping.secondary {
+            self.encode_record(mapped, Some(secondary), 0x100, raw);
         }
         for supplementary in &mapped.mapping.supplementary {
-            self.encode_record(mapped, Some(supplementary), true, raw);
+            self.encode_record(mapped, Some(supplementary), 0x800, raw);
         }
     }
 
@@ -233,7 +285,7 @@ impl BamRecordEncoder {
         &self,
         mapped: &MappedRead,
         alignment: Option<&Alignment>,
-        supplementary: bool,
+        record_flag: u16,
         raw: &mut Vec<u8>,
     ) {
         let start = raw.len();
@@ -247,9 +299,7 @@ impl BamRecordEncoder {
             if reverse {
                 flag |= 0x10;
             }
-            if supplementary {
-                flag |= 0x800;
-            }
+            flag |= record_flag;
         }
 
         let (ref_id, pos, mapq, cigar) = match alignment {
@@ -262,6 +312,7 @@ impl BamRecordEncoder {
             None => (-1, -1, 0, None),
         };
         let ops: &[CigarOp] = cigar.map(Cigar::ops).unwrap_or(&[]);
+        let long_cigar = ops.len() > u16::MAX as usize;
         let name = mapped.name.as_bytes();
         let seq_len = mapped.sequence.len();
 
@@ -274,7 +325,7 @@ impl BamRecordEncoder {
             None => 4680,
         };
         raw.extend_from_slice(&bin.to_le_bytes());
-        raw.extend_from_slice(&(ops.len() as u16).to_le_bytes());
+        raw.extend_from_slice(&(if long_cigar { 2u16 } else { ops.len() as u16 }).to_le_bytes());
         raw.extend_from_slice(&flag.to_le_bytes());
         raw.extend_from_slice(&(seq_len as i32).to_le_bytes());
         raw.extend_from_slice(&(-1i32).to_le_bytes()); // next_refID
@@ -284,32 +335,41 @@ impl BamRecordEncoder {
         raw.extend_from_slice(name);
         raw.push(0);
 
-        for &operation in ops {
-            let (length, code) = match operation {
-                CigarOp::Match(length) => (length, 0u32),
-                CigarOp::Ins(length) => (length, 1),
-                CigarOp::Del(length) => (length, 2),
-                CigarOp::SoftClip(length) => (length, 4),
-            };
-            raw.extend_from_slice(&((length << 4) | code).to_le_bytes());
+        if long_cigar {
+            raw.extend_from_slice(&(((seq_len as u32) << 4) | 4).to_le_bytes());
+            raw.extend_from_slice(&((cigar.unwrap().reference_len() << 4) | 3).to_le_bytes());
+        } else {
+            for &operation in ops {
+                raw.extend_from_slice(&bam_cigar_word(operation).to_le_bytes());
+            }
         }
 
         encode_sequence(&mapped.sequence, reverse, raw);
         encode_qualities(mapped.qualities.as_deref(), seq_len, reverse, raw);
 
+        if long_cigar {
+            raw.extend_from_slice(b"CGBI");
+            raw.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+            for &operation in ops {
+                raw.extend_from_slice(&bam_cigar_word(operation).to_le_bytes());
+            }
+        }
         if let Some(alignment) = alignment {
             push_int_tag(raw, b"NM", alignment.edit_distance as i64);
             push_int_tag(raw, b"AS", alignment.score as i64);
         }
         if let Some(tags) = mapped.tags.as_deref() {
             let normalized =
-                crate::tags::normalize_optional_fields_excluding(tags, &["NM", "AS", "SA"]);
+                crate::tags::normalize_optional_fields_excluding(tags, &["NM", "AS", "SA", "CG"]);
             for field in normalized.split('\t').filter(|field| !field.is_empty()) {
                 push_sam_tag(raw, field);
             }
         }
         if let Some(current) = alignment {
-            if let Some(sa) = self.sa_tag(mapped, current) {
+            if let Some(sa) = (record_flag & 0x100 == 0)
+                .then(|| self.sa_tag(mapped, current))
+                .flatten()
+            {
                 push_string_tag(raw, b"SA", &sa);
             }
         }
@@ -461,6 +521,68 @@ fn push_sam_tag(raw: &mut Vec<u8>, field: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_cigar_has_placeholder_and_lossless_cg() {
+        use std::io::Read;
+        let ops: Vec<_> = (0..65_536)
+            .map(|i| {
+                if i % 2 == 0 {
+                    CigarOp::Match(1)
+                } else {
+                    CigarOp::Ins(1)
+                }
+            })
+            .collect();
+        let cigar = Cigar::new(ops.clone()).unwrap();
+        let a = Alignment::new(ContigId(0), 0, Strand::Forward, 0, cigar, 0, 60, 32768).unwrap();
+        let mut mapped = MappedRead {
+            name: "long".into(),
+            sequence: vec![b'A'; 65536],
+            qualities: None,
+            tags: None,
+            aux: None,
+            mapping: crate::MappingResult {
+                primary: Some(a),
+                ..Default::default()
+            },
+        };
+        let encoder = BamRecordEncoder::from_contigs([(ContigId(0), "ref", 100_000)]);
+        let mut packed = Vec::new();
+        encoder
+            .encode_batch(&[mapped.clone()], &mut packed)
+            .unwrap();
+        let mut raw = Vec::new();
+        flate2::read::MultiGzDecoder::new(&packed[..])
+            .read_to_end(&mut raw)
+            .unwrap();
+        assert_eq!(u16::from_le_bytes(raw[16..18].try_into().unwrap()), 2);
+        let cigar_start = 36 + 5;
+        assert_eq!(
+            u32::from_le_bytes(raw[cigar_start..cigar_start + 4].try_into().unwrap()),
+            (65536 << 4) | 4
+        );
+        assert_eq!(
+            u32::from_le_bytes(raw[cigar_start + 4..cigar_start + 8].try_into().unwrap()),
+            (32768 << 4) | 3
+        );
+        let cg = cigar_start + 8 + 32768 + 65536;
+        assert_eq!(&raw[cg..cg + 4], b"CGBI");
+        assert_eq!(
+            u32::from_le_bytes(raw[cg + 4..cg + 8].try_into().unwrap()),
+            65536
+        );
+        for (chunk, op) in raw[cg + 8..cg + 8 + 4 * 65536].chunks_exact(4).zip(ops) {
+            assert_eq!(
+                u32::from_le_bytes(chunk.try_into().unwrap()),
+                bam_cigar_word(op)
+            );
+        }
+        mapped.name = "x".repeat(255);
+        let mut out = vec![42];
+        assert!(encoder.encode_batch(&[mapped], &mut out).is_err());
+        assert_eq!(out, [42], "invalid batch must not append partial output");
+    }
 
     #[test]
     fn a_bgzf_block_carries_its_own_size_and_checksum() {

@@ -612,6 +612,8 @@ pub struct PlacementSearchResult {
 pub struct MappingResult {
     pub primary: Option<Alignment>,
     pub supplementary: Vec<Alignment>,
+    /// Alternative loci for the primary query segment; emitted with FLAG 0x100.
+    pub secondary: Vec<Alignment>,
     pub diagnostics: Option<crate::ReadDiagnostics>,
     pub placement_search: PlacementSearchResult,
 }

@@ -718,11 +718,16 @@ impl SamRecordFormatter {
             // an invalid supplementary cannot leave a partially written read.
             primary.validate()?;
             self.alignment_contig_name(primary)?;
-            for supplementary in &mapped.mapping.supplementary {
+            for supplementary in mapped
+                .mapping
+                .supplementary
+                .iter()
+                .chain(&mapped.mapping.secondary)
+            {
                 supplementary.validate()?;
                 self.alignment_contig_name(supplementary)?;
             }
-            self.write_alignment(out, mapped, primary, false)?;
+            self.write_alignment(out, mapped, primary, 0)?;
         } else {
             write!(out, "{}\t4\t*\t0\t0\t*\t*\t0\t0\t", mapped.name)?;
             write_sam_sequence(out, &mapped.sequence, false)?;
@@ -732,8 +737,11 @@ impl SamRecordFormatter {
             write_carried_aux(out, mapped.aux.as_deref())?;
             out.write_all(b"\n")?;
         }
+        for secondary in &mapped.mapping.secondary {
+            self.write_alignment(out, mapped, secondary, 0x100)?;
+        }
         for supplementary in &mapped.mapping.supplementary {
-            self.write_alignment(out, mapped, supplementary, true)?;
+            self.write_alignment(out, mapped, supplementary, 0x800)?;
         }
         Ok(())
     }
@@ -743,7 +751,7 @@ impl SamRecordFormatter {
         out: &mut W,
         mapped: &MappedRead,
         alignment: &Alignment,
-        supplementary: bool,
+        record_flag: u16,
     ) -> Result<(), SamError> {
         alignment.validate()?;
         let name = self.alignment_contig_name(alignment)?;
@@ -756,9 +764,7 @@ impl SamRecordFormatter {
         } else {
             0
         };
-        if supplementary {
-            flag |= 0x800;
-        }
+        flag |= record_flag;
         ensure_sam_field(name, "reference name")?;
         let reverse = alignment.strand == Strand::Reverse;
 
@@ -779,7 +785,9 @@ impl SamRecordFormatter {
         )?;
         write_optional_fields(out, mapped.tags.as_deref(), &["NM", "AS", "SA"])?;
         write_carried_aux(out, mapped.aux.as_deref())?;
-        self.write_sa_tag(out, mapped, alignment)?;
+        if record_flag & 0x100 == 0 {
+            self.write_sa_tag(out, mapped, alignment)?;
+        }
         writeln!(out)?;
         Ok(())
     }
@@ -1467,6 +1475,7 @@ mod tests {
             mapping: crate::MappingResult {
                 primary: Some(alignment),
                 supplementary: Vec::new(),
+                secondary: Vec::new(),
                 diagnostics: None,
                 placement_search: Default::default(),
             },
@@ -1506,6 +1515,7 @@ mod tests {
             mapping: crate::MappingResult {
                 primary: Some(alignment),
                 supplementary: Vec::new(),
+                secondary: Vec::new(),
                 diagnostics: None,
                 placement_search: Default::default(),
             },
@@ -1544,6 +1554,7 @@ mod tests {
             mapping: crate::MappingResult {
                 primary: Some(alignment_fwd),
                 supplementary: Vec::new(),
+                secondary: Vec::new(),
                 diagnostics: None,
                 placement_search: Default::default(),
             },
@@ -1558,6 +1569,7 @@ mod tests {
             mapping: crate::MappingResult {
                 primary: Some(alignment_rev),
                 supplementary: Vec::new(),
+                secondary: Vec::new(),
                 diagnostics: None,
                 placement_search: Default::default(),
             },
@@ -1597,6 +1609,7 @@ mod tests {
             mapping: crate::MappingResult {
                 primary: Some(primary),
                 supplementary: vec![supplementary],
+                secondary: Vec::new(),
                 diagnostics: None,
                 placement_search: Default::default(),
             },
@@ -1637,6 +1650,7 @@ mod tests {
             mapping: crate::MappingResult {
                 primary: Some(alignment),
                 supplementary: Vec::new(),
+                secondary: Vec::new(),
                 diagnostics: None,
                 placement_search: Default::default(),
             },
@@ -1667,6 +1681,7 @@ mod tests {
             mapping: crate::MappingResult {
                 primary: Some(alignment),
                 supplementary: Vec::new(),
+                secondary: Vec::new(),
                 diagnostics: None,
                 placement_search: Default::default(),
             },

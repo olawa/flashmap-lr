@@ -1,0 +1,23 @@
+{
+  "mapped": 600,
+  "unmapped": 0,
+  "errors": 200,
+  "raw_expected_errors": 400.0002,
+  "calibrated_expected_errors": 403.99052462993774,
+  "bins": [
+    {
+      "raw_mapq": 0,
+      "cap": 0,
+      "count": 400,
+      "errors": 200,
+      "error_upper_95": 0.548765495830291
+    },
+    {
+      "raw_mapq": 60,
+      "cap": 17,
+      "count": 200,
+      "errors": 0,
+      "error_upper_95": 0.018845326377266575
+    }
+  ]
+}

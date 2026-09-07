@@ -51,6 +51,8 @@ struct Options {
     dp_max_drift: Option<usize>,
     dp_min_drift: Option<usize>,
     dual_affine: bool,
+    max_secondary: usize,
+    mapq_calibration: Option<PathBuf>,
     limit: Option<usize>,
     decompress_with: Option<String>,
 }
@@ -130,6 +132,8 @@ impl Options {
         let mut dp_max_drift: Option<usize> = None;
         let mut dp_min_drift: Option<usize> = None;
         let mut dual_affine = false;
+        let mut max_secondary = 0usize;
+        let mut mapq_calibration = None;
         let mut limit: Option<usize> = None;
         let mut decompress_with: Option<String> = None;
         let mut explicit_mode = None;
@@ -261,6 +265,18 @@ impl Options {
                 "--near-exact-dp" => {
                     near_exact = true;
                     near_exact_dp = true;
+                }
+                "--secondary" => {
+                    let value = next_value(&mut args, &argument)?;
+                    max_secondary = value.parse::<usize>().ok().filter(|&n| n <= 64).ok_or(
+                        CliError::InvalidNumber {
+                            option: "secondary (0..64)",
+                            value,
+                        },
+                    )?;
+                }
+                "--mapq-calibration" => {
+                    mapq_calibration = Some(PathBuf::from(next_value(&mut args, &argument)?));
                 }
                 "--dual-affine" => {
                     dual_affine = true;
@@ -439,6 +455,8 @@ impl Options {
             dp_max_drift,
             dp_min_drift,
             dual_affine,
+            max_secondary,
+            mapq_calibration,
             limit,
             decompress_with,
         })
@@ -595,6 +613,8 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--near-exact-dp",
     "--lazy-seed-cache",
     "--dual-affine",
+    "--secondary",
+    "--mapq-calibration",
     "--mapq-from-span",
     "--mapq-saturation",
     "--dp-band-slack",
@@ -702,6 +722,8 @@ fn usage() -> &'static str {
         "      --fast                Bounded work budget for high throughput\n",
         "      --standard            Deep DP gaps and full STR left-alignment (default)\n",
         "      --sensitive           Standard plus a wider candidate and DP ceiling\n",
+        "  --secondary N            Emit up to N alternative loci (0..64; default 0)\n",
+        "  --mapq-calibration FILE  Conservative 61-row MAPQ cap table fitted to truth\n",
         "  -x, --preset NAME         One of: standard, fast, sensitive\n",
         "\n",
         "Search strategy:\n",
@@ -933,6 +955,12 @@ fn non_default_settings(options: &Options) -> Vec<String> {
     flag(parts, options.paired_emms, "paired-emms");
     flag(parts, options.tiered_candidates, "tiered-candidates");
     flag(parts, options.dual_affine, "dual-affine");
+    if options.max_secondary > 0 {
+        parts.push(format!("secondary={}", options.max_secondary));
+    }
+    if let Some(path) = &options.mapq_calibration {
+        parts.push(format!("mapq-calibration={}", path.display()));
+    }
     flag(parts, options.mapq_from_span, "mapq-from-span");
     if let Some(saturation) = options.mapq_saturation {
         parts.push(format!("mapq-saturation {saturation}"));
@@ -1039,6 +1067,9 @@ fn print_cap_distribution(index: &MinimizerIndex) {
                 let kept = match policy.plan(count, summary.max_freq) {
                     fmi::KeepPlan::All => count,
                     fmi::KeepPlan::None => 0,
+                    fmi::KeepPlan::Isolated { .. } => {
+                        unreachable!("adaptive policy cannot select isolated hits")
+                    }
                     fmi::KeepPlan::First(n) | fmi::KeepPlan::Spaced(n) => n.min(count),
                 };
                 if kept > 0 {
@@ -1096,10 +1127,9 @@ impl RecordEncoder {
                 }
                 Ok(())
             }
-            Self::Bam(encoder) => {
-                encoder.encode_batch(batch, out);
-                Ok(())
-            }
+            Self::Bam(encoder) => encoder
+                .encode_batch(batch, out)
+                .map_err(|error| rs_lra::MapError::Output(error.to_string())),
         }
     }
 
@@ -1483,10 +1513,18 @@ fn execute_mapping(
             );
         }
     }
+    let calibration = options
+        .mapq_calibration
+        .as_ref()
+        .map(rs_lra::MapqCalibration::open)
+        .transpose()
+        .map_err(|error| CliError::Pool(format!("MAPQ calibration: {error}")))?;
     let mapper_config = MapperConfig {
         mode: options.mode,
         runtime: runtime.clone(),
         dual_affine: options.dual_affine,
+        max_secondary: options.max_secondary,
+        mapq_calibration: calibration.clone(),
     };
     // Experimental phase switches remain an explicit compatibility escape
     // hatch for benchmark/debug runs.  The normal CLI path always constructs
@@ -1534,6 +1572,8 @@ fn execute_mapping(
                 ..defaults.candidates
             },
             alignment: rs_lra::AlignmentConfig {
+                max_secondary: options.max_secondary,
+                mapq_calibration: calibration,
                 mode: options.mode,
                 dual_affine: options.dual_affine,
                 island_chain_lookback: options
@@ -1689,6 +1729,10 @@ fn execute_mapping(
         // The collector is the only serial stage. Its wall time splits into
         // waiting for workers and pushing bytes at whatever consumes them, so
         // which half dominates says which side is the constraint.
+        eprintln!(
+            "  Pending batches:       {} peak / {} global in-flight limit",
+            stats.pending_batches_peak, stats.in_flight_batch_limit
+        );
         let wall = stats.collector_wall_nanos.max(1) as f64;
         eprintln!(
             "  Output collector:      {:.1}s wall -- {:.1}% waiting for workers, {:.1}% in the sink",
@@ -1715,7 +1759,13 @@ struct ProfileReporter {
     emms_anchor_mismatches: AtomicU64,
     structural_chain_bridges: AtomicU64,
     supplementary_alignments: AtomicU64,
+    secondary_alignments: AtomicU64,
     small_dp_calls: AtomicU64,
+    dp_cache_hits: AtomicU64,
+    dp_budget_rejections: AtomicU64,
+    dp_impossible_band: AtomicU64,
+    dp_zdrop_rejections: AtomicU64,
+    dp_incomplete_rejections: AtomicU64,
     small_dp_nanos: AtomicU64,
     medium_dp_calls: AtomicU64,
     medium_dp_nanos: AtomicU64,
@@ -1810,6 +1860,23 @@ impl DiagnosticsSink for ProfileReporter {
             .fetch_add(diagnostics.sparse_promotions as u64, Ordering::Relaxed);
         for (target, value) in [
             (&self.small_dp_calls, diagnostics.small_dp_calls as u64),
+            (&self.dp_cache_hits, diagnostics.dp_cache_hits as u64),
+            (
+                &self.dp_budget_rejections,
+                diagnostics.dp_budget_rejections as u64,
+            ),
+            (
+                &self.dp_impossible_band,
+                diagnostics.dp_impossible_band as u64,
+            ),
+            (
+                &self.dp_zdrop_rejections,
+                diagnostics.dp_zdrop_rejections as u64,
+            ),
+            (
+                &self.dp_incomplete_rejections,
+                diagnostics.dp_incomplete_rejections as u64,
+            ),
             (
                 &self.emms_pairs_considered,
                 diagnostics.emms_pairs_considered as u64,
@@ -1838,6 +1905,10 @@ impl DiagnosticsSink for ProfileReporter {
             (
                 &self.supplementary_alignments,
                 diagnostics.supplementary_alignments as u64,
+            ),
+            (
+                &self.secondary_alignments,
+                diagnostics.secondary_alignments as u64,
             ),
             (&self.small_dp_nanos, diagnostics.small_dp_nanos),
             (&self.medium_dp_calls, diagnostics.medium_dp_calls as u64),
@@ -2150,9 +2221,20 @@ impl ProfileReporter {
             },
         );
         eprintln!(
+            "  Secondary records:     {}",
+            self.secondary_alignments.load(Ordering::Relaxed)
+        );
+        eprintln!(
             "  Structural splits:     {} bridged / {} supplementary records",
             self.structural_chain_bridges.load(Ordering::Relaxed),
             self.supplementary_alignments.load(Ordering::Relaxed),
+        );
+        eprintln!("  Gap DP declined:       {} budget / {} impossible band / {} z-drop / {} incomplete or invalid",
+            self.dp_budget_rejections.load(Ordering::Relaxed), self.dp_impossible_band.load(Ordering::Relaxed),
+            self.dp_zdrop_rejections.load(Ordering::Relaxed), self.dp_incomplete_rejections.load(Ordering::Relaxed));
+        eprintln!(
+            "  Gap DP reused:         {}",
+            self.dp_cache_hits.load(Ordering::Relaxed)
         );
         eprintln!(
             "  Gap DP calls:          {} small ({:.3} s) / {} medium ({:.3} s) / {} flank ({:.3} s)",

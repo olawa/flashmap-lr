@@ -1,11 +1,12 @@
 //! Score-based clipping of divergent alignment endpoints.
 
+use crate::config::ScoringPolicy;
 use crate::types::{normalize_cigar_ops, query_consumed};
 use crate::CigarOp;
 
 #[derive(Clone, Copy, Debug)]
 enum AlignElem {
-    Match { exact: bool },
+    Match { exact: bool, score: i32 },
     Ins,
     Del,
 }
@@ -22,10 +23,7 @@ pub(crate) fn endpoint_score_clip(
     ref_seq: &[u8],
     read_seq: &[u8],
     ref_start: &mut usize,
-    match_score: i8,
-    mismatch_penalty: i8,
-    gap_open: i32,
-    gap_extend: i32,
+    scoring: &ScoringPolicy,
     terminal_clip_penalty: i32,
     min_terminal_clip_score_gain: i32,
     terminal_end_search: usize,
@@ -45,8 +43,9 @@ pub(crate) fn endpoint_score_clip(
         .saturating_add(protect_indel_support)
         .saturating_add(1)
         .min(n);
-    let left_window = expand_cigar_prefix(ops, ref_seq, read_seq, *ref_start, window_len)?;
-    let right_window = expand_cigar_suffix(ops, ref_seq, read_seq, *ref_start, window_len)?;
+    let left_window = expand_cigar_prefix(ops, ref_seq, read_seq, *ref_start, window_len, scoring)?;
+    let right_window =
+        expand_cigar_suffix(ops, ref_seq, read_seq, *ref_start, window_len, scoring)?;
     if left_window.is_empty() || right_window.is_empty() {
         return Ok(());
     }
@@ -74,13 +73,12 @@ pub(crate) fn endpoint_score_clip(
         let boundary = clip_len;
         if !matches!(
             left_window.get(boundary.saturating_sub(1)),
-            Some(AlignElem::Match { exact: true })
+            Some(AlignElem::Match { exact: true, .. })
         ) {
             continue;
         }
         let trimmed = &left_window[..clip_len];
-        let keep_score =
-            score_segment(trimmed, match_score, mismatch_penalty, gap_open, gap_extend);
+        let keep_score = score_segment(trimmed, scoring);
         let gain = (-terminal_clip_penalty) - keep_score;
         if gain >= min_terminal_clip_score_gain && gain > best_left_gain {
             best_left = Some(clip_len);
@@ -98,13 +96,12 @@ pub(crate) fn endpoint_score_clip(
     for clip_len in 1..=max_right {
         if !matches!(
             right_window.get(right_window.len().saturating_sub(clip_len)),
-            Some(AlignElem::Match { exact: true })
+            Some(AlignElem::Match { exact: true, .. })
         ) {
             continue;
         }
         let trimmed = &right_window[right_window.len() - clip_len..];
-        let keep_score =
-            score_segment(trimmed, match_score, mismatch_penalty, gap_open, gap_extend);
+        let keep_score = score_segment(trimmed, scoring);
         let gain = (-terminal_clip_penalty) - keep_score;
         if gain >= min_terminal_clip_score_gain && gain > best_right_gain {
             best_right = Some(clip_len);
@@ -188,7 +185,7 @@ fn left_protected_boundary(elems: &[AlignElem], protect_n: usize) -> usize {
             AlignElem::Ins | AlignElem::Del => {
                 let left_exact = (0..i)
                     .rev()
-                    .take_while(|&j| matches!(elems[j], AlignElem::Match { exact: true }))
+                    .take_while(|&j| matches!(elems[j], AlignElem::Match { exact: true, .. }))
                     .count();
                 let indel_end = {
                     let mut e = i;
@@ -198,7 +195,7 @@ fn left_protected_boundary(elems: &[AlignElem], protect_n: usize) -> usize {
                     e
                 };
                 let right_exact = (indel_end..elems.len())
-                    .take_while(|&j| matches!(elems[j], AlignElem::Match { exact: true }))
+                    .take_while(|&j| matches!(elems[j], AlignElem::Match { exact: true, .. }))
                     .count();
                 if left_exact >= protect_n && right_exact >= protect_n {
                     return i;
@@ -229,10 +226,10 @@ fn right_protected_boundary(elems: &[AlignElem], protect_n: usize) -> usize {
                 };
                 let left_exact = (0..indel_start)
                     .rev()
-                    .take_while(|&j| matches!(elems[j], AlignElem::Match { exact: true }))
+                    .take_while(|&j| matches!(elems[j], AlignElem::Match { exact: true, .. }))
                     .count();
                 let right_exact = (i + 1..elems.len())
-                    .take_while(|&j| matches!(elems[j], AlignElem::Match { exact: true }))
+                    .take_while(|&j| matches!(elems[j], AlignElem::Match { exact: true, .. }))
                     .count();
                 if left_exact >= protect_n && right_exact >= protect_n {
                     return i + 1;
@@ -248,34 +245,33 @@ fn right_protected_boundary(elems: &[AlignElem], protect_n: usize) -> usize {
     0
 }
 
-fn score_segment(
-    elems: &[AlignElem],
-    match_score: i8,
-    mismatch_penalty: i8,
-    gap_open: i32,
-    gap_extend: i32,
-) -> i32 {
-    let mut score = 0i32;
-    let mut in_gap = false;
+fn score_segment(elems: &[AlignElem], scoring: &ScoringPolicy) -> i32 {
+    let mut score = 0;
+    let mut gap: Option<(bool, usize)> = None;
     for elem in elems {
         match elem {
-            AlignElem::Match { exact } => {
-                in_gap = false;
-                if *exact {
-                    score += match_score as i32;
-                } else {
-                    score -= mismatch_penalty as i32;
+            AlignElem::Match { score: base, .. } => {
+                if let Some((_, len)) = gap.take() {
+                    score -= scoring.gap_cost(len);
                 }
+                score += base;
             }
             AlignElem::Ins | AlignElem::Del => {
-                if in_gap {
-                    score -= gap_extend;
-                } else {
-                    score -= gap_open + gap_extend;
-                    in_gap = true;
+                let insertion = matches!(elem, AlignElem::Ins);
+                match gap {
+                    Some((kind, len)) if kind == insertion => gap = Some((kind, len + 1)),
+                    _ => {
+                        if let Some((_, len)) = gap {
+                            score -= scoring.gap_cost(len);
+                        }
+                        gap = Some((insertion, 1));
+                    }
                 }
             }
         }
+    }
+    if let Some((_, len)) = gap {
+        score -= scoring.gap_cost(len);
     }
     score
 }
@@ -341,6 +337,7 @@ fn expand_cigar_prefix(
     read_seq: &[u8],
     ref_start: usize,
     limit: usize,
+    scoring: &ScoringPolicy,
 ) -> Result<Vec<AlignElem>, EndpointError> {
     let mut q_pos = 0usize;
     let mut r_pos = ref_start;
@@ -367,7 +364,9 @@ fn expand_cigar_prefix(
                         .get(r_pos + offset)
                         .ok_or(EndpointError::ReferenceOutOfBounds)?;
                     elems.push(AlignElem::Match {
-                        exact: q_base.eq_ignore_ascii_case(&r_base),
+                        exact: crate::dna::base_code(q_base).is_some()
+                            && q_base.eq_ignore_ascii_case(&r_base),
+                        score: scoring.base_score(q_base, r_base),
                     });
                 }
                 q_pos += length;
@@ -396,6 +395,7 @@ fn expand_cigar_suffix(
     read_seq: &[u8],
     ref_start: usize,
     limit: usize,
+    scoring: &ScoringPolicy,
 ) -> Result<Vec<AlignElem>, EndpointError> {
     let mut q_pos = query_consumed(ops);
     let mut r_pos = ref_start
@@ -435,7 +435,9 @@ fn expand_cigar_suffix(
                         .get(r_pos + offset)
                         .ok_or(EndpointError::ReferenceOutOfBounds)?;
                     reversed.push(AlignElem::Match {
-                        exact: q_base.eq_ignore_ascii_case(&r_base),
+                        exact: crate::dna::base_code(q_base).is_some()
+                            && q_base.eq_ignore_ascii_case(&r_base),
+                        score: scoring.base_score(q_base, r_base),
                     });
                 }
             }
@@ -518,4 +520,34 @@ fn trim_body_right(body: &mut Vec<CigarOp>, mut remaining: usize) {
 
 fn to_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod scoring_tests {
+    use super::*;
+    #[test]
+    fn clipping_counts_dual_gap_runs_and_opposing_gaps_separately() {
+        let policy =
+            crate::config::ResolvedMapperPolicy::from_mapper_config(&crate::config::MapperConfig {
+                dual_affine: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut elems = vec![AlignElem::Del; 100];
+        assert_eq!(score_segment(&elems, &policy.scoring), -124);
+        elems.push(AlignElem::Ins);
+        assert_eq!(score_segment(&elems, &policy.scoring), -132);
+        let mut ops = vec![CigarOp::Match(10), CigarOp::Del(30), CigarOp::Match(40)];
+        let q = vec![b'A'; 50];
+        let r = vec![b'A'; 80];
+        let mut start = 0;
+        endpoint_score_clip(&mut ops, &r, &q, &mut start, &policy.scoring, 40, 1, 40, 0).unwrap();
+        // The 10M30D prefix scores -34 with dual affine, but -46 with
+        // single affine. Only the latter would pay the clipping cost of 40.
+        assert_eq!(start, 0);
+        assert_eq!(
+            ops,
+            vec![CigarOp::Match(10), CigarOp::Del(30), CigarOp::Match(40)]
+        );
+    }
 }

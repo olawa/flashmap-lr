@@ -35,8 +35,8 @@ const FLAG_REVERSE: u16 = 0x10;
 /// score to a new placement. `SA`, `cs` and `cg` likewise describe the old
 /// CIGAR. Everything else -- read groups, barcodes, kinetics, methylation --
 /// belongs to the read and is carried.
-const STALE_TAGS: [&[u8; 2]; 12] = [
-    b"NM", b"MD", b"AS", b"XS", b"SA", b"cs", b"cg", b"MC", b"MQ", b"ms", b"nn", b"tp",
+const STALE_TAGS: [&[u8; 2]; 13] = [
+    b"NM", b"MD", b"AS", b"XS", b"SA", b"cs", b"cg", b"CG", b"MC", b"MQ", b"ms", b"nn", b"tp",
 ];
 
 #[derive(Debug)]
@@ -471,6 +471,7 @@ mod tests {
     #[test]
     fn stale_alignment_tags_are_dropped_and_the_rest_carried() {
         let mut aux = Vec::new();
+        aux.extend_from_slice(b"CGBI\x01\0\0\0\x30\0\0\0");
         aux.extend_from_slice(b"NMC\x05"); // NM:i:5, stale
         aux.extend_from_slice(b"RGZmovie1\0"); // read group, carried
         aux.extend_from_slice(b"npC\x0c"); // np:i:12, carried

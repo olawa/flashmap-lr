@@ -1,4 +1,4 @@
-//! Read-only adapter for FlashMap's v13 `.fmi` indexes.
+//! Read-only adapter for FlashMap's v14 `.fmi` indexes.
 //!
 //! RS-LRA deliberately does not depend on FlashMap as a crate.  This module is
 //! the small file-format boundary needed to run the extracted LR mapper on a
@@ -31,6 +31,7 @@ const SECTION_FOOTER_MAGIC: &[u8; 4] = b"FMST";
 const SECTION_PRIMARY_SEED_HITS: u32 = 11;
 const SECTION_PRIMARY_SEED_HASHES: u32 = 12;
 const SECTION_PRIMARY_SEED_RANGES: u32 = 14;
+const SECTION_PRIMARY_SEED_COLLISIONS: u32 = fmi::format::PRIMARY_COLLISIONS;
 
 const INLINE_BIT: u64 = 1 << 63;
 const CAPPED_BIT: u64 = 1 << 48;
@@ -122,7 +123,7 @@ impl FmiSeedShape {
     }
 }
 
-/// Exact v13 metadata field order.  Do not reorder fields: bincode serializes
+/// Exact v14 metadata field order.  Do not reorder fields: bincode serializes
 /// this as a positional sequence, just as FlashMap's private metadata struct.
 #[allow(dead_code)]
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -285,7 +286,7 @@ pub struct IndexSummary {
     pub hit_entries: usize,
 }
 
-/// A read-only FlashMap v13 packed minimizer index.
+/// A read-only FlashMap v14 packed minimizer index.
 pub struct MinimizerIndex {
     mmap: Arc<Mmap>,
     ref_names: Vec<String>,
@@ -297,6 +298,7 @@ pub struct MinimizerIndex {
     ranges: MmapSlice<u64>,
     hits: MmapSlice<u64>,
     prefix_table: OnceLock<Vec<u32>>,
+    collision_codes: Vec<(u64, u64)>,
     /// Capped metadata is small compared with the hit table.  Keep a sorted
     /// owned lookup vector because FlashMap's on-disk order is by residual
     /// hash/group and is not guaranteed to be sorted by full hash.
@@ -321,7 +323,7 @@ impl MinimizerIndex {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MinimizerIndexError> {
         if cfg!(target_endian = "big") {
             return Err(MinimizerIndexError::Unsupported(
-                "big-endian hosts are not supported by the packed v13 reader".to_owned(),
+                "big-endian hosts are not supported by the packed v14 reader".to_owned(),
             ));
         }
         let file = File::open(path).map_err(MinimizerIndexError::Io)?;
@@ -353,7 +355,7 @@ impl MinimizerIndex {
         let metadata: FmiMetadata = bincode::deserialize(&mmap[FMI_HEADER_LEN..meta_end])
             .map_err(|error| {
                 MinimizerIndexError::Metadata(format!(
-                    "cannot decode FlashMap v13 metadata ({error}); rebuild the index with current FlashMap"
+                    "cannot decode FlashMap v14 metadata ({error}); rebuild the index with current FlashMap"
                 ))
             })?;
         validate_metadata(&metadata)?;
@@ -473,6 +475,13 @@ impl MinimizerIndex {
             ));
         }
         validate_ranges(ranges.as_slice(), hits.len())?;
+        let section = required_section(&sections, SECTION_PRIMARY_SEED_COLLISIONS)?;
+        validate_scalar_section(section, 16)?;
+        let collision_codes = fmi::format::decode_collisions(
+            &mmap[section.offset..section.offset + section.byte_len],
+            ranges.len(),
+        )
+        .ok_or_else(|| MinimizerIndexError::Format("invalid collision table".into()))?;
         summary.seed_entries = hashes.len();
         summary.hit_entries = hits.len();
 
@@ -487,6 +496,7 @@ impl MinimizerIndex {
             ranges,
             hits,
             prefix_table: OnceLock::new(),
+            collision_codes,
             capped_metadata,
             summary,
         })
@@ -772,6 +782,13 @@ impl SeedIndex for MinimizerIndex {
         }
         for index in lo..hi {
             let range = self.ranges.as_slice()[index];
+            if self
+                .collision_codes
+                .binary_search_by_key(&(index as u64), |p| p.0)
+                .is_ok_and(|slot| self.collision_codes[slot].1 != code)
+            {
+                continue;
+            }
             if (range >> FINGERPRINT_SHIFT) & FINGERPRINT_MASK != code & FINGERPRINT_MASK {
                 continue;
             }
@@ -834,6 +851,13 @@ impl SeedIndex for MinimizerIndex {
         }
         for index in lo..hi {
             let range = self.ranges.as_slice()[index];
+            if self
+                .collision_codes
+                .binary_search_by_key(&(index as u64), |p| p.0)
+                .is_ok_and(|slot| self.collision_codes[slot].1 != code)
+            {
+                continue;
+            }
             if (range >> FINGERPRINT_SHIFT) & FINGERPRINT_MASK != code & FINGERPRINT_MASK {
                 continue;
             }
@@ -888,9 +912,9 @@ fn advise_random_access(mmap: &Mmap) {
 }
 
 fn validate_metadata(metadata: &FmiMetadata) -> Result<(), MinimizerIndexError> {
-    if metadata.index_format_version != 13 {
+    if metadata.index_format_version != fmi::format::VERSION {
         return Err(MinimizerIndexError::Unsupported(format!(
-            "format v{} is not the supported v13 packed format",
+            "format v{} is not the supported v14 packed format; rebuild with current flashmap index",
             metadata.index_format_version
         )));
     }
@@ -1340,7 +1364,7 @@ mod tests {
             w_max: 70,
             has_ref_orientation: true,
             repetitive_intervals: Vec::new(),
-            index_format_version: 13,
+            index_format_version: 14,
             index_kind: "single".to_owned(),
             flashmap_version: "fixture".to_owned(),
             created_at: "fixture".to_owned(),
@@ -1421,6 +1445,7 @@ mod tests {
         ));
 
         align16(&mut bytes);
+        entries.push((SECTION_PRIMARY_SEED_COLLISIONS, bytes.len(), 0, 0));
         let table_offset = bytes.len();
         let mut table_bytes = Vec::new();
         for &(kind, offset, byte_len, element_count) in &entries {
@@ -1438,6 +1463,17 @@ mod tests {
         put_u32(&mut bytes, 0);
         fs::write(path, &bytes).expect("write fixture index");
         reference
+    }
+
+    #[test]
+    fn rejects_old_indexes_that_cannot_preserve_capped_singleton_identity() {
+        let metadata = FmiMetadata {
+            index_format_version: 13,
+            ..Default::default()
+        };
+        let error = validate_metadata(&metadata).unwrap_err();
+        assert!(matches!(error, MinimizerIndexError::Unsupported(_)));
+        assert!(error.to_string().contains("v14"));
     }
 
     #[test]
@@ -1477,7 +1513,7 @@ mod tests {
         let metadata = FmiMetadata {
             k: 19,
             w: 6,
-            index_format_version: 13,
+            index_format_version: 14,
             seed_type: FmiSeedType::Minimizer,
             seed_shape: FmiSeedShape {
                 span: 19,
@@ -1491,10 +1527,10 @@ mod tests {
     }
 
     #[test]
-    fn opens_v13_fixture_and_round_trips_minimizer_hits() {
+    fn opens_v14_fixture_and_round_trips_minimizer_hits() {
         let path = fixture_path("open");
         let reference = write_minimizer_fixture(&path);
-        let index = MinimizerIndex::open(&path).expect("open generated v13 fixture");
+        let index = MinimizerIndex::open(&path).expect("open generated v14 fixture");
         assert_eq!(index.k(), 15);
         assert_eq!(index.window(), 5);
         assert_eq!(index.contig(ContigId(0)).unwrap().sequence, reference);
@@ -1540,7 +1576,7 @@ mod tests {
         // genuine hits. If it failed, the extra seeds would simply miss.
         let path = fixture_path("query-window");
         let reference = write_minimizer_fixture(&path);
-        let index = MinimizerIndex::open(&path).expect("open generated v13 fixture");
+        let index = MinimizerIndex::open(&path).expect("open generated v14 fixture");
 
         let dense: HashSet<(u32, SeedKey)> = index
             .query_seeds_with_window(&reference, 0)
@@ -1584,7 +1620,7 @@ mod tests {
         // agree for every seed.
         let path = fixture_path("lookup-agreement");
         let reference = write_minimizer_fixture(&path);
-        let index = MinimizerIndex::open(&path).expect("open generated v13 fixture");
+        let index = MinimizerIndex::open(&path).expect("open generated v14 fixture");
 
         let seeds = index.query_seeds(&reference);
         assert!(seeds.len() >= 2);

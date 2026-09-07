@@ -76,6 +76,9 @@ pub struct MapperConfig {
     pub mode: AlignmentMode,
     pub runtime: RuntimeConfig,
     pub dual_affine: bool,
+    /// Maximum secondary records; zero disables their refinement/emission.
+    pub max_secondary: usize,
+    pub mapq_calibration: Option<crate::MapqCalibration>,
 }
 
 impl Default for MapperConfig {
@@ -84,12 +87,17 @@ impl Default for MapperConfig {
             mode: AlignmentMode::Standard,
             runtime: RuntimeConfig::default(),
             dual_affine: false,
+            max_secondary: 0,
+            mapq_calibration: None,
         }
     }
 }
 
 impl MapperConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_secondary > 64 {
+            return Err(ConfigError::new("max_secondary must be <= 64"));
+        }
         validate_runtime(&self.runtime)
     }
 }
@@ -233,6 +241,9 @@ pub struct AlignmentConfig {
     pub mode: AlignmentMode,
     /// Enable dual-affine gap dynamic programming with KSW2 extd2.
     pub dual_affine: bool,
+    /// Maximum secondary records; zero disables their refinement/emission.
+    pub max_secondary: usize,
+    pub mapq_calibration: Option<crate::MapqCalibration>,
 }
 
 impl Default for Config {
@@ -285,6 +296,8 @@ impl Default for Config {
                 // profile remains available for throughput experiments.
                 mode: AlignmentMode::Standard,
                 dual_affine: false,
+                max_secondary: 0,
+                mapq_calibration: None,
             },
             worker_pool: WorkerPoolConfig::default(),
         }
@@ -293,6 +306,9 @@ impl Default for Config {
 
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.alignment.max_secondary > 64 {
+            return Err(ConfigError::new("max_secondary must be <= 64"));
+        }
         if self.seeding.segment_size == 0 {
             return Err(ConfigError::new(
                 "seeding.segment_size must be greater than zero",
@@ -611,6 +627,96 @@ pub(crate) struct ScoringPolicy {
 }
 
 impl ScoringPolicy {
+    pub(crate) fn gap_cost(&self, len: usize) -> i32 {
+        if len == 0 {
+            return 0;
+        }
+        let len = len as i64;
+        let first = i64::from(self.gap_open) + len * i64::from(self.gap_extend);
+        let cost = if self.dual_affine {
+            first.min(i64::from(self.gap_open2) + len * i64::from(self.gap_extend2))
+        } else {
+            first
+        };
+        cost.min(i64::from(i32::MAX)) as i32
+    }
+
+    /// Ambiguous comparisons contribute zero, including N/N; NM remains a
+    /// separate edit-distance quantity, not a substitute for this score.
+    pub(crate) fn base_score(&self, query: u8, reference: u8) -> i32 {
+        match (
+            crate::dna::base_code(query),
+            crate::dna::base_code(reference),
+        ) {
+            (Some(q), Some(r)) if q == r => i32::from(self.match_score),
+            (Some(_), Some(_)) => -i32::from(self.mismatch_penalty),
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn match_score_sum(&self, query: &[u8], reference: &[u8]) -> i32 {
+        query
+            .iter()
+            .zip(reference)
+            .map(|(&q, &r)| self.base_score(q, r))
+            .sum()
+    }
+
+    pub(crate) fn cigar_score(
+        &self,
+        ops: &[crate::CigarOp],
+        query: &[u8],
+        reference: &[u8],
+    ) -> Option<i32> {
+        self.cigar_metrics(ops, query, reference)
+            .map(|(score, _)| score)
+    }
+
+    /// Final alignment score and NM in one sequence traversal. Soft clips do
+    /// not contribute to either quantity. NM retains its existing byte-match semantics.
+    pub(crate) fn cigar_metrics(
+        &self,
+        ops: &[crate::CigarOp],
+        query: &[u8],
+        reference: &[u8],
+    ) -> Option<(i32, u32)> {
+        let (mut q, mut r, mut score, mut nm) = (0usize, 0usize, 0i64, 0u32);
+        for &op in ops {
+            let n = op.len() as usize;
+            match op {
+                crate::CigarOp::Match(_) => {
+                    for (&qb, &rb) in query
+                        .get(q..q.checked_add(n)?)?
+                        .iter()
+                        .zip(reference.get(r..r.checked_add(n)?)?)
+                    {
+                        score += i64::from(self.base_score(qb, rb));
+                        nm = nm.checked_add(u32::from(!qb.eq_ignore_ascii_case(&rb)))?;
+                    }
+                    q += n;
+                    r += n;
+                }
+                crate::CigarOp::Ins(_) => {
+                    query.get(q..q.checked_add(n)?)?;
+                    q += n;
+                    score -= i64::from(self.gap_cost(n));
+                    nm = nm.checked_add(op.len())?;
+                }
+                crate::CigarOp::Del(_) => {
+                    reference.get(r..r.checked_add(n)?)?;
+                    r += n;
+                    score -= i64::from(self.gap_cost(n));
+                    nm = nm.checked_add(op.len())?;
+                }
+                crate::CigarOp::SoftClip(_) => {
+                    query.get(q..q.checked_add(n)?)?;
+                    q += n;
+                }
+            }
+        }
+        Some((score.clamp(i32::MIN as i64, i32::MAX as i64) as i32, nm))
+    }
+
     pub fn align_full(
         &self,
         query: &[u8],
@@ -727,16 +833,17 @@ pub(crate) struct ResolvedMapperPolicy {
     pub(crate) work_budget: WorkBudget,
     pub(crate) mode: AlignmentMode,
     pub(crate) runtime: RuntimeConfig,
+    pub(crate) max_secondary: usize,
+    pub(crate) mapq_calibration: Option<crate::MapqCalibration>,
 }
 
 impl ResolvedMapperPolicy {
     pub(crate) fn from_mapper_config(config: &MapperConfig) -> Result<Self, ConfigError> {
         config.validate()?;
-        Ok(Self::for_mode(
-            config.mode,
-            config.runtime.clone(),
-            config.dual_affine,
-        ))
+        let mut policy = Self::for_mode(config.mode, config.runtime.clone(), config.dual_affine);
+        policy.max_secondary = config.max_secondary;
+        policy.mapq_calibration = config.mapq_calibration.clone();
+        Ok(policy)
     }
 
     pub(crate) fn from_legacy_config(config: &Config) -> Result<Self, ConfigError> {
@@ -747,6 +854,8 @@ impl ResolvedMapperPolicy {
             config.alignment.dual_affine,
         );
         policy.gaps.island_chain_lookback = config.alignment.island_chain_lookback;
+        policy.max_secondary = config.alignment.max_secondary;
+        policy.mapq_calibration = config.alignment.mapq_calibration.clone();
         policy.gaps.dissolve_repeat_run = config.alignment.dissolve_repeat_run;
         policy.gaps.overlap_flank = config.alignment.overlap_flank;
         policy.gaps.overlap_flank_min = config.alignment.overlap_flank_min;
@@ -1023,6 +1132,8 @@ impl ResolvedMapperPolicy {
             normalization,
             scoring,
             work_budget,
+            max_secondary: 0,
+            mapq_calibration: None,
             mode,
             runtime,
         }
@@ -1065,6 +1176,8 @@ impl ResolvedMapperPolicy {
                 tiered_candidates: self.work_budget.full_search_score_fraction > 0.0,
             },
             alignment: AlignmentConfig {
+                max_secondary: self.max_secondary,
+                mapq_calibration: self.mapq_calibration.clone(),
                 island_chain_lookback: self.gaps.island_chain_lookback,
                 dissolve_repeat_run: self.gaps.dissolve_repeat_run,
                 overlap_flank: self.gaps.overlap_flank,

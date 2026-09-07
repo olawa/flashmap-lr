@@ -7,6 +7,7 @@
 
 mod assembly;
 mod endpoint;
+mod gap_cache;
 mod normalize;
 mod phase;
 mod prepare;

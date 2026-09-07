@@ -24,6 +24,15 @@ use crate::config::WorkerPoolConfig;
 type RawQueue<R, E> = Arc<BoundedQueue<Result<ReadBatch<R>, E>>>;
 type MappedQueue<T, SE, ME> = Arc<BoundedQueue<Result<MappedBatch<T>, InternalFailure<SE, ME>>>>;
 
+struct CloseOnExit<F: FnOnce()>(Option<F>);
+impl<F: FnOnce()> Drop for CloseOnExit<F> {
+    fn drop(&mut self) {
+        if let Some(close) = self.0.take() {
+            close();
+        }
+    }
+}
+
 struct BoundedQueue<T> {
     state: Mutex<QueueState<T>>,
     not_empty: Condvar,
@@ -174,6 +183,10 @@ pub struct WorkerPoolStats {
     pub reader_batch_size: usize,
     /// Number of batches delivered to the ordered sink.
     pub batches_written: usize,
+    /// Highest number of completed batches waiting for ordered emission.
+    pub pending_batches_peak: usize,
+    /// Global limit across queued, running, and completed batches.
+    pub in_flight_batch_limit: usize,
     /// Number of mapped results delivered to the ordered sink.
     pub reads_written: usize,
     /// Nanoseconds the collector spent waiting for a batch to arrive.
@@ -366,18 +379,43 @@ impl WorkerPool {
             let mapped_queue = Arc::new(BoundedQueue::<
                 Result<MappedBatch<T>, InternalFailure<SE, ME>>,
             >::new(mapped_capacity));
+            // Credits are held from dispatch until ordered emission, including
+            // results removed from mapped_queue and waiting in pending.
+            let credits = Arc::new(BoundedQueue::new(raw_capacity));
+            for _ in 0..raw_capacity {
+                credits.push(()).unwrap();
+            }
+            let reader_credits = Arc::clone(&credits);
+            // Also run if the caller's sink panics: scoped thread joining must
+            // never wait forever for a reader blocked on an emission credit.
+            let _close_on_exit = CloseOnExit(Some(|| {
+                cancellation.store(true, Ordering::Release);
+                credits.close();
+                raw_queue.close();
+                mapped_queue.close();
+            }));
             let active_workers = Arc::new(AtomicUsize::new(worker_count));
 
             let reader_cancel = Arc::clone(&cancellation);
             let reader_raw = Arc::clone(&raw_queue);
+            let reader_panic_raw = Arc::clone(&raw_queue);
+            let reader_panic_mapped = Arc::clone(&mapped_queue);
             let reader_handle = scope.spawn(move || {
-                reader_loop(
-                    source,
-                    reader_raw,
-                    chunk_size,
-                    reader_batch_size,
-                    reader_cancel,
-                );
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    reader_loop(
+                        source,
+                        reader_raw,
+                        chunk_size,
+                        reader_batch_size,
+                        reader_cancel,
+                        reader_credits,
+                    )
+                }));
+                if let Err(payload) = outcome {
+                    reader_panic_raw.close();
+                    reader_panic_mapped.close();
+                    std::panic::resume_unwind(payload);
+                }
             });
 
             let mut worker_handles = Vec::with_capacity(worker_count);
@@ -389,14 +427,23 @@ impl WorkerPool {
                 let mapper_ref = &mapper;
                 let encoder_ref = &encoder;
                 worker_handles.push(scope.spawn(move || {
-                    worker_loop(
-                        raw_q,
-                        mapped_q,
-                        mapper_ref,
-                        encoder_ref,
-                        worker_cancel,
-                        workers_remaining,
-                    );
+                    let panic_raw = Arc::clone(&raw_q);
+                    let panic_mapped = Arc::clone(&mapped_q);
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        worker_loop(
+                            raw_q,
+                            mapped_q,
+                            mapper_ref,
+                            encoder_ref,
+                            worker_cancel,
+                            workers_remaining,
+                        )
+                    }));
+                    if let Err(payload) = outcome {
+                        panic_raw.close();
+                        panic_mapped.close();
+                        std::panic::resume_unwind(payload);
+                    }
                 }));
             }
 
@@ -404,6 +451,7 @@ impl WorkerPool {
                 workers: worker_count,
                 chunk_size,
                 reader_batch_size,
+                in_flight_batch_limit: raw_capacity,
                 ..WorkerPoolStats::default()
             };
             let mut pending = BTreeMap::<u64, MappedBatch<T>>::new();
@@ -430,6 +478,7 @@ impl WorkerPool {
                             break;
                         }
 
+                        stats.pending_batches_peak = stats.pending_batches_peak.max(pending.len());
                         while let Some(batch) = pending.remove(&next_batch_id) {
                             stats.batches_written += 1;
                             stats.reads_written += batch.results.len();
@@ -445,6 +494,7 @@ impl WorkerPool {
                                 sink_result = Err(error);
                                 break;
                             }
+                            let _ = credits.push(());
                             next_batch_id += 1;
                         }
                         if sink_result.is_err() {
@@ -461,6 +511,7 @@ impl WorkerPool {
                 }
             }
 
+            credits.close();
             stats.collector_wall_nanos = collector_started.elapsed().as_nanos() as u64;
             raw_queue.close();
             mapped_queue.close();
@@ -533,6 +584,7 @@ fn reader_loop<I, R, E>(
     chunk_size: usize,
     reader_batch_size: usize,
     cancellation: Arc<AtomicBool>,
+    credits: Arc<BoundedQueue<()>>,
 ) where
     I: IntoIterator<Item = Result<R, E>>,
 {
@@ -582,6 +634,10 @@ fn reader_loop<I, R, E>(
                 break;
             }
             if cancellation.load(Ordering::Acquire) {
+                raw_queue.close();
+                return;
+            }
+            if credits.pop().is_none() {
                 raw_queue.close();
                 return;
             }
@@ -704,6 +760,71 @@ mod tests {
             chunk_size,
             reader_batch_size,
         }
+    }
+
+    #[test]
+    fn panicking_sink_releases_reader_before_scoped_thread_join() {
+        let pool = WorkerPool::new(config(2, 1, None)).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            let _ = pool.run(
+                (0..10000).map(Ok::<_, Infallible>),
+                Ok::<_, Infallible>,
+                |_| -> Result<(), Infallible> { panic!("sink probe") },
+            );
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn panicking_source_or_mapper_does_not_leave_credit_waiters_blocked() {
+        let pool = WorkerPool::new(config(2, 1, None)).unwrap();
+        let failed = pool.run(
+            (0..100).map(Ok::<_, Infallible>),
+            |i| {
+                if i == 0 {
+                    panic!("mapper probe");
+                }
+                Ok::<_, Infallible>(i)
+            },
+            |_| Ok::<_, Infallible>(()),
+        );
+        assert!(matches!(failed, Err(WorkerPoolError::ThreadPanicked)));
+        let source = (0..100).map(|i| {
+            if i == 1 {
+                panic!("source probe");
+            }
+            Ok::<_, Infallible>(i)
+        });
+        let failed = pool.run(source, Ok::<_, Infallible>, |_| Ok::<_, Infallible>(()));
+        assert!(matches!(failed, Err(WorkerPoolError::ThreadPanicked)));
+    }
+
+    #[test]
+    fn stalled_first_batch_bounds_pending_work_and_sink_error_unblocks_reader() {
+        let pool = WorkerPool::new(config(2, 1, None)).unwrap();
+        let started = AtomicUsize::new(0);
+        let stats = pool
+            .run(
+                (0..1000).map(Ok::<_, Infallible>),
+                |i| {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    if i == 0 {
+                        thread::sleep(Duration::from_millis(50));
+                        assert!(started.load(Ordering::SeqCst) <= pool.queue_capacity);
+                    }
+                    Ok::<_, Infallible>(i)
+                },
+                |_| Ok::<_, Infallible>(()),
+            )
+            .unwrap();
+        assert_eq!(stats.reads_written, 1000);
+        assert!(stats.pending_batches_peak <= stats.in_flight_batch_limit);
+        let result = pool.run(
+            (0..10000).map(Ok::<_, Infallible>),
+            Ok::<_, Infallible>,
+            |_| Err("stop"),
+        );
+        assert!(matches!(result, Err(WorkerPoolError::Sink("stop"))));
     }
 
     #[test]

@@ -1,0 +1,86 @@
+[
+  {
+    "label": "corrected",
+    "workers": 1,
+    "rep": 0,
+    "seconds": 1.9271216669585556,
+    "sha256": "6d0f35ecd96c4c19c443ff4b4c75b384b014cf820a513b991e4b690e688c81ce"
+  },
+  {
+    "label": "optimized",
+    "workers": 1,
+    "rep": 0,
+    "seconds": 1.8765037920093164,
+    "sha256": "6d0f35ecd96c4c19c443ff4b4c75b384b014cf820a513b991e4b690e688c81ce"
+  },
+  {
+    "label": "corrected",
+    "workers": 1,
+    "rep": 1,
+    "seconds": 1.8937969169346616,
+    "sha256": "6d0f35ecd96c4c19c443ff4b4c75b384b014cf820a513b991e4b690e688c81ce"
+  },
+  {
+    "label": "optimized",
+    "workers": 1,
+    "rep": 1,
+    "seconds": 1.8796082499902695,
+    "sha256": "6d0f35ecd96c4c19c443ff4b4c75b384b014cf820a513b991e4b690e688c81ce"
+  },
+  {
+    "label": "corrected",
+    "workers": 1,
+    "rep": 2,
+    "seconds": 1.9376580000389367,
+    "sha256": "6d0f35ecd96c4c19c443ff4b4c75b384b014cf820a513b991e4b690e688c81ce"
+  },
+  {
+    "label": "optimized",
+    "workers": 1,
+    "rep": 2,
+    "seconds": 1.901701582944952,
+    "sha256": "6d0f35ecd96c4c19c443ff4b4c75b384b014cf820a513b991e4b690e688c81ce"
+  },
+  {
+    "label": "corrected",
+    "workers": 4,
+    "rep": 0,
+    "seconds": 0.5501424589892849,
+    "sha256": "6d0f35ecd96c4c19c443ff4b4c75b384b014cf820a513b991e4b690e688c81ce"
+  },
+  {
+    "label": "optimized",
+    "workers": 4,
+    "rep": 0,
+    "seconds": 0.5541506670415401,
+    "sha256": "6d0f35ecd96c4c19c443ff4b4c75b384b014cf820a513b991e4b690e688c81ce"
+  },
+  {
+    "label": "corrected",
+    "workers": 4,
+    "rep": 1,
+    "seconds": 0.5493807499296963,
+    "sha256": "6d0f35ecd96c4c19c443ff4b4c75b384b014cf820a513b991e4b690e688c81ce"
+  },
+  {
+    "label": "optimized",
+    "workers": 4,
+    "rep": 1,
+    "seconds": 0.5461386250099167,
+    "sha256": "6d0f35ecd96c4c19c443ff4b4c75b384b014cf820a513b991e4b690e688c81ce"
+  },
+  {
+    "label": "corrected",
+    "workers": 4,
+    "rep": 2,
+    "seconds": 0.5597077079582959,
+    "sha256": "6d0f35ecd96c4c19c443ff4b4c75b384b014cf820a513b991e4b690e688c81ce"
+  },
+  {
+    "label": "optimized",
+    "workers": 4,
+    "rep": 2,
+    "seconds": 0.5590957079548389,
+    "sha256": "6d0f35ecd96c4c19c443ff4b4c75b384b014cf820a513b991e4b690e688c81ce"
+  }
+]

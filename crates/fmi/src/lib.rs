@@ -4,8 +4,10 @@
 //! to agree bit for bit. Where they were separate implementations they drifted
 //! -- an inline hit's strand flag and a range's capped flag are the same bit,
 //! and reading one as the other silently returned the wrong positions. This
-//! crate is the single description both sides build on.
+//! crate shares cap policy, format version, and collision-record validation.
+//! The remaining metadata/POD layouts still live in their format adapters.
 
 pub mod cap_policy;
+pub mod format;
 
 pub use cap_policy::{selected_offsets, KeepPlan, SeedCapPolicy, UnknownCapPolicy};

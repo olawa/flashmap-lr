@@ -54,19 +54,23 @@ pub(super) fn largest_nm_preserving_shift(
     None
 }
 
-/// Compute the change in alignment score when merging two adjacent indels
-/// separated by a micro-match span:
-/// ΔScore = GAP_OPEN - ΔNM * (MATCH_SCORE + MISMATCH_PENALTY)
-/// A non-negative result means the merged CIGAR is score-neutral or score-improving
-/// and has 1 fewer gap open.
-fn merge_score_diff(orig_nm: usize, candidate_nm: usize, scoring: &ScoringPolicy) -> i32 {
-    if orig_nm == usize::MAX || candidate_nm == usize::MAX {
-        return i32::MIN;
+/// Score gain of merging two same-kind gaps, including the changed aligned span.
+fn merge_score_diff(
+    original: Option<i32>,
+    candidate: Option<i32>,
+    first: u32,
+    second: u32,
+    scoring: &ScoringPolicy,
+) -> i32 {
+    match (original, candidate) {
+        (Some(original), Some(candidate)) => {
+            scoring.gap_cost(first as usize) + scoring.gap_cost(second as usize)
+                - scoring.gap_cost(first as usize + second as usize)
+                + candidate
+                - original
+        }
+        _ => i32::MIN,
     }
-    let penalty_per_mismatch = (scoring.match_score as i32) + (scoring.mismatch_penalty as i32);
-    let gap_open_saved = scoring.gap_open as i32;
-    let nm_diff = (candidate_nm as i32) - (orig_nm as i32);
-    gap_open_saved - nm_diff * penalty_per_mismatch
 }
 
 /// Merge fragmented adjacent indels of the same type separated by a spurious
@@ -103,21 +107,18 @@ pub(super) fn merge_fragmented_indels(
                         reference.get(r_pos + total_d as usize..r_pos + total_d as usize + m_len);
                     let r_match_first = reference.get(r_pos..r_pos + m_len);
 
-                    let orig_nm = r_orig
-                        .map(|r| mismatch_count(q_bytes, r))
-                        .unwrap_or(usize::MAX);
-                    let del_first_nm = r_del_first
-                        .map(|r| mismatch_count(q_bytes, r))
-                        .unwrap_or(usize::MAX);
-                    let match_first_nm = r_match_first
-                        .map(|r| mismatch_count(q_bytes, r))
-                        .unwrap_or(usize::MAX);
+                    let orig_score = r_orig.map(|r| scoring.match_score_sum(q_bytes, r));
+                    let del_first_score = r_del_first.map(|r| scoring.match_score_sum(q_bytes, r));
+                    let match_first_score =
+                        r_match_first.map(|r| scoring.match_score_sum(q_bytes, r));
 
-                    let score_diff_match = merge_score_diff(orig_nm, match_first_nm, scoring);
-                    let score_diff_del = merge_score_diff(orig_nm, del_first_nm, scoring);
+                    let score_diff_match =
+                        merge_score_diff(orig_score, match_first_score, d1, d2, scoring);
+                    let score_diff_del =
+                        merge_score_diff(orig_score, del_first_score, d1, d2, scoring);
 
                     if score_diff_match >= 0
-                        && (match_first_nm <= del_first_nm || score_diff_del < 0)
+                        && (score_diff_match >= score_diff_del || score_diff_del < 0)
                     {
                         ops[i] = CigarOp::Match(m);
                         ops[i + 1] = CigarOp::Del(total_d);
@@ -145,21 +146,18 @@ pub(super) fn merge_fragmented_indels(
                         query.get(q_pos + total_i as usize..q_pos + total_i as usize + m_len);
                     let q_match_first = query.get(q_pos..q_pos + m_len);
 
-                    let orig_nm = q_orig
-                        .map(|q| mismatch_count(q, r_bytes))
-                        .unwrap_or(usize::MAX);
-                    let ins_first_nm = q_ins_first
-                        .map(|q| mismatch_count(q, r_bytes))
-                        .unwrap_or(usize::MAX);
-                    let match_first_nm = q_match_first
-                        .map(|q| mismatch_count(q, r_bytes))
-                        .unwrap_or(usize::MAX);
+                    let orig_score = q_orig.map(|q| scoring.match_score_sum(q, r_bytes));
+                    let ins_first_score = q_ins_first.map(|q| scoring.match_score_sum(q, r_bytes));
+                    let match_first_score =
+                        q_match_first.map(|q| scoring.match_score_sum(q, r_bytes));
 
-                    let score_diff_match = merge_score_diff(orig_nm, match_first_nm, scoring);
-                    let score_diff_ins = merge_score_diff(orig_nm, ins_first_nm, scoring);
+                    let score_diff_match =
+                        merge_score_diff(orig_score, match_first_score, i1, i2, scoring);
+                    let score_diff_ins =
+                        merge_score_diff(orig_score, ins_first_score, i1, i2, scoring);
 
                     if score_diff_match >= 0
-                        && (match_first_nm <= ins_first_nm || score_diff_ins < 0)
+                        && (score_diff_match >= score_diff_ins || score_diff_ins < 0)
                     {
                         ops[i] = CigarOp::Match(m);
                         ops[i + 1] = CigarOp::Ins(total_i);
@@ -589,4 +587,42 @@ pub(super) fn clean_cigar_edges(ops: &mut Vec<CigarOp>, ref_start: &mut usize) {
         }
     }
     normalize_cigar_ops(ops);
+}
+
+#[cfg(test)]
+mod dual_scoring_tests {
+    use super::*;
+    #[test]
+    fn long_gap_merge_can_pay_for_two_new_mismatches() {
+        let policy =
+            crate::config::ResolvedMapperPolicy::from_mapper_config(&crate::config::MapperConfig {
+                dual_affine: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut reference = vec![b'C'; 44];
+        reference[20..24].fill(b'A');
+        let query = b"AACC";
+        let mut ops = vec![CigarOp::Del(20), CigarOp::Match(4), CigarOp::Del(20)];
+        let before = policy.scoring.cigar_score(&ops, query, &reference).unwrap();
+        merge_fragmented_indels(
+            &mut ops,
+            &reference,
+            query,
+            0,
+            &policy.normalization,
+            &policy.scoring,
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, CigarOp::Del(_)))
+                .count(),
+            1
+        );
+        assert!(policy.scoring.cigar_score(&ops, query, &reference).unwrap() >= before);
+        assert_eq!(
+            merge_score_diff(Some(8), Some(-4), 20, 20, &policy.scoring),
+            12
+        );
+    }
 }

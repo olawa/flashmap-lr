@@ -76,6 +76,8 @@ impl<'a> Aligner<'a> {
                     mode: policy.mode,
                     runtime: policy.runtime.clone(),
                     dual_affine: policy.scoring.dual_affine,
+                    max_secondary: policy.max_secondary,
+                    mapq_calibration: policy.mapq_calibration.clone(),
                 };
                 (policy, mapper_config, config)
             }
@@ -133,6 +135,16 @@ impl<'a> Aligner<'a> {
     /// should wrap it in [`crate::WorkerPool`], which owns the reader,
     /// bounded batches, mapper workers, and ordered output sink.
     pub fn map(&self, read: Read<'_>) -> Result<MappingResult, MapError> {
+        let mut result = self.map_raw(read)?;
+        if let Some(table) = &self.policy.mapq_calibration {
+            for alignment in result.primary.iter_mut().chain(&mut result.supplementary) {
+                alignment.mapq = table.apply(alignment.mapq);
+            }
+        }
+        Ok(result)
+    }
+
+    fn map_raw(&self, read: Read<'_>) -> Result<MappingResult, MapError> {
         let profiling = self.diagnostics.is_some();
         let started = phase_timer(profiling);
         read.validate().map_err(MapError::InvalidRead)?;
@@ -183,6 +195,7 @@ impl<'a> Aligner<'a> {
             return Ok(MappingResult {
                 primary: Some(primary),
                 supplementary: Vec::new(),
+                secondary: Vec::new(),
                 diagnostics: self.diagnostics.map(|_| diagnostics),
                 placement_search: PlacementSearchResult {
                     primary_score: Some(chain.score),
@@ -275,6 +288,7 @@ impl<'a> Aligner<'a> {
                 return Ok(MappingResult {
                     primary: Some(primary),
                     supplementary: Vec::new(),
+                    secondary: Vec::new(),
                     diagnostics: self.diagnostics.map(|_| diagnostics),
                     placement_search: PlacementSearchResult {
                         primary_score: Some(saturating_i32(read.sequence.len())),
@@ -753,6 +767,7 @@ impl<'a> Aligner<'a> {
             return Ok(MappingResult {
                 primary: None,
                 supplementary: Vec::new(),
+                secondary: Vec::new(),
                 diagnostics: self.diagnostics.map(|_| diagnostics),
                 placement_search: PlacementSearchResult {
                     primary_score: None,
@@ -888,6 +903,50 @@ impl<'a> Aligner<'a> {
             .map_err(MapError::Cigar)?;
             supplementary.push(alignment);
         }
+        let mut secondary = Vec::new();
+        // Refinement is bounded independently of report success. Reporting
+        // does not alter the candidate search, primary selection, or its MAPQ.
+        for (alternative_contig, alternative_chain, _) in placements
+            .iter()
+            .skip(1)
+            .filter(|(_, other, _)| secondary_eligible(chain, other))
+            .filter(|(_, other, support)| {
+                i64::from(endpoint_rank_score(
+                    other.score,
+                    *support,
+                    read.sequence.len(),
+                )) * 5
+                    >= i64::from(best_rank_score.max(1)) * 4
+            })
+            .take(self.policy.max_secondary)
+        {
+            let contig = self
+                .reference
+                .contig(*alternative_contig)
+                .ok_or(MapError::Anchor(crate::AnchorError::MissingReference(
+                    *alternative_contig,
+                )))?;
+            let alignment = crate::alignment::build_chain_alignment_with_policy(
+                read,
+                contig,
+                alternative_chain,
+                0,
+                &self.policy.gaps,
+                &self.policy.terminal,
+                &self.policy.normalization,
+                &self.policy.scoring,
+                Some(&mut diagnostics),
+            )
+            .map_err(MapError::Cigar)?;
+            if !same_alignment_locus(&primary, &alignment)
+                && !secondary
+                    .iter()
+                    .any(|a| same_alignment_locus(a, &alignment))
+            {
+                secondary.push(alignment);
+            }
+        }
+        diagnostics.secondary_alignments = saturating_u32(secondary.len());
         diagnostics.supplementary_alignments = saturating_u32(supplementary.len());
         diagnostics.cigar_nanos = phase_nanos(phase_started);
         diagnostics.mapped_bases = primary
@@ -904,6 +963,7 @@ impl<'a> Aligner<'a> {
         Ok(MappingResult {
             primary: Some(primary),
             supplementary,
+            secondary,
             diagnostics: self.diagnostics.map(|_| diagnostics),
             placement_search: PlacementSearchResult {
                 primary_score: Some(best_rank_score),
@@ -1205,11 +1265,17 @@ impl<'a> Aligner<'a> {
             Err(_) => (aligned.cigar, banded_ref_start as u64),
         };
         let ref_end = ref_start + cigar.reference_len() as u64;
-        let edit_distance = contig
+        let Some((score, edit_distance)) = contig
             .sequence
             .get(ref_start as usize..ref_end as usize)
-            .and_then(|target| crate::types::cigar_edit_distance(&cigar, &oriented, target))
-            .unwrap_or(aligned.edit_distance);
+            .and_then(|target| {
+                self.policy
+                    .scoring
+                    .cigar_metrics(cigar.ops(), &oriented, target)
+            })
+        else {
+            return Ok(None);
+        };
 
         Ok(Some(crate::Alignment {
             contig: candidate.contig,
@@ -1218,7 +1284,7 @@ impl<'a> Aligner<'a> {
             query_start: 0,
             query_end: saturating_u32(query_len),
             strand: candidate.strand,
-            score: aligned.score,
+            score,
             mapq: near_exact_mapq(divergence, drift, locus.seed_frequency, policy),
             cigar,
             edit_distance,
@@ -1828,6 +1894,21 @@ fn bridge_structural_placements(
     bridges
 }
 
+fn same_alignment_locus(left: &crate::Alignment, right: &crate::Alignment) -> bool {
+    left.contig == right.contig
+        && left.strand == right.strand
+        && left.ref_start == right.ref_start
+        && left.ref_end == right.ref_end
+}
+fn secondary_eligible(primary: &Chain, other: &Chain) -> bool {
+    let overlap = interval_overlap(primary.q_start, primary.q_end, other.q_start, other.q_end);
+    let longer = primary
+        .q_end
+        .saturating_sub(primary.q_start)
+        .max(other.q_end.saturating_sub(other.q_start));
+    longer > 0 && u64::from(overlap) * 2 >= u64::from(longer)
+}
+
 fn chains_compete_for_query(left: &Chain, right: &Chain, max_split_overlap: f64) -> bool {
     let overlap = interval_overlap(left.q_start, left.q_end, right.q_start, right.q_end);
     let shorter_span = left
@@ -2201,6 +2282,7 @@ mod tests {
                 reader_batch_size: Some(6),
             },
             dual_affine: false,
+            ..MapperConfig::default()
         };
         let aligner = Aligner::new(reference, index, config.clone()).unwrap();
         assert_eq!(aligner.mapper_config(), &config);

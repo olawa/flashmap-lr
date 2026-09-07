@@ -19,6 +19,10 @@ pub enum KeepPlan {
     First(usize),
     /// Store `n` occurrences spread evenly across the group.
     Spaced(usize),
+    Isolated {
+        within: usize,
+        cap: usize,
+    },
 }
 
 /// How a build treats a seed above the frequency cap.
@@ -33,6 +37,8 @@ pub enum SeedCapPolicy {
     /// Keep `max_freq` occurrences spread evenly across the group, so the
     /// stored subset spans the whole repeat family.
     SampleSpaced,
+    /// Retain occurrences without a nearby independently placeable seed.
+    Isolated { within: usize, cap: usize },
     /// Graded by how repetitive the seed is: keep everything up to `medium`,
     /// spaced-sample up to `high`, store nothing above.
     ///
@@ -51,7 +57,7 @@ impl std::fmt::Display for UnknownCapPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "unknown cap policy {:?}; expected first, drop, sample, sample-spaced or adaptive",
+            "unknown cap policy {:?}; expected first, drop, sample, sample-spaced, isolated or adaptive",
             self.0
         )
     }
@@ -77,6 +83,10 @@ impl SeedCapPolicy {
             // `sample` was accepted historically and never distinguished from
             // the spaced variant; keep taking it rather than breaking scripts.
             "sample" | "sample-spaced" => Self::SampleSpaced,
+            "isolated" => Self::Isolated {
+                within: medium.unwrap_or(512),
+                cap: high.unwrap_or(max_freq),
+            },
             "adaptive" => Self::Adaptive {
                 medium: medium.unwrap_or(max_freq),
                 high: high.unwrap_or(usize::MAX),
@@ -92,6 +102,7 @@ impl SeedCapPolicy {
             Self::Drop => "drop",
             Self::SampleSpaced => "sample-spaced",
             Self::Adaptive { .. } => "adaptive",
+            Self::Isolated { .. } => "isolated",
         }
     }
 
@@ -104,6 +115,7 @@ impl SeedCapPolicy {
             Self::First => KeepPlan::First(max_freq),
             Self::Drop => KeepPlan::None,
             Self::SampleSpaced => KeepPlan::Spaced(max_freq),
+            Self::Isolated { within, cap } => KeepPlan::Isolated { within, cap },
             Self::Adaptive { medium, high } => {
                 if count <= medium {
                     KeepPlan::All
@@ -125,7 +137,7 @@ impl SeedCapPolicy {
 pub fn selected_offsets(plan: KeepPlan, count: usize) -> Vec<usize> {
     match plan {
         KeepPlan::All => (0..count).collect(),
-        KeepPlan::None => Vec::new(),
+        KeepPlan::None | KeepPlan::Isolated { .. } => Vec::new(),
         KeepPlan::First(n) => (0..n.min(count)).collect(),
         KeepPlan::Spaced(n) => {
             let n = n.min(count);
@@ -153,6 +165,25 @@ pub fn selected_offsets(plan: KeepPlan, count: usize) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iterator_preserves_legacy_selection_without_allocating() {
+        for count in [0, 1, 2, 15, 257, 65535, 100000] {
+            for n in [0, 1, 2, 16, 257, 65535] {
+                for plan in [
+                    KeepPlan::All,
+                    KeepPlan::None,
+                    KeepPlan::First(n),
+                    KeepPlan::Spaced(n),
+                ] {
+                    assert_eq!(
+                        selected_offsets_iter(plan, count).collect::<Vec<_>>(),
+                        selected_offsets(plan, count)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_seed_under_the_cap_is_stored_whole_by_every_policy() {
@@ -217,5 +248,49 @@ mod tests {
             assert_eq!(policy.name(), name);
         }
         assert!(SeedCapPolicy::parse("nonsense", 16, None, None).is_err());
+    }
+}
+
+/// Allocation-free counterpart of selected_offsets for the packed builder.
+/// Isolated selections depend on neighbouring seeds and remain builder-owned.
+#[derive(Clone)]
+pub struct OffsetIter {
+    next: usize,
+    end: usize,
+    count: usize,
+    step: f64,
+}
+impl Iterator for OffsetIter {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        if self.next == self.end {
+            return None;
+        }
+        let offset = ((self.next as f64 * self.step) as usize).min(self.count - 1);
+        self.next += 1;
+        Some(offset)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.end - self.next;
+        (n, Some(n))
+    }
+}
+impl ExactSizeIterator for OffsetIter {}
+pub fn selected_offsets_iter(plan: KeepPlan, count: usize) -> OffsetIter {
+    let end = match plan {
+        KeepPlan::All => count,
+        KeepPlan::First(n) | KeepPlan::Spaced(n) => n.min(count),
+        _ => 0,
+    };
+    let step = if matches!(plan, KeepPlan::Spaced(_)) && end > 0 {
+        count as f64 / end as f64
+    } else {
+        1.0
+    };
+    OffsetIter {
+        next: 0,
+        end,
+        count,
+        step,
     }
 }

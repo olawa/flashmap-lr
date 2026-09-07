@@ -241,18 +241,44 @@ fn union_query_bases(anchors: &[Anchor]) -> u64 {
     total
 }
 
-/// Local reference k-mer positions for one candidate window.
-///
-/// Stored as two parallel arrays sorted by `(code, position)` rather than a
-/// hash of per-code vectors: the window holds one entry per reference offset,
-/// so the map is rebuilt for every candidate and a bucket-per-k-mer layout
-/// costs thousands of small allocations and repeated rehashing per read.  The
-/// flat form is a single allocation and keeps each code's positions
-/// contiguous and in ascending order, which is what the scan below consumes.
+/// Sorted local k-mer positions. Packable windows retain one u64 per hit;
+/// large k/window combinations retain full (code, absolute position) pairs.
 #[derive(Default)]
 struct LocalKmerMap {
-    codes: Vec<u64>,
-    positions: Vec<u64>,
+    packed: Vec<u64>,
+    pairs: Vec<(u64, u64)>,
+    offset_bits: u32,
+    offset_mask: u64,
+    window_start: u64,
+}
+
+enum RefPositions<'a> {
+    Absolute(std::slice::Iter<'a, u64>),
+    Packed {
+        entries: std::slice::Iter<'a, u64>,
+        mask: u64,
+        base: u64,
+    },
+    Pairs(std::slice::Iter<'a, (u64, u64)>),
+}
+impl<'a> Iterator for RefPositions<'a> {
+    type Item = u64;
+    fn next(&mut self) -> Option<u64> {
+        match self {
+            Self::Absolute(entries) => entries.next().copied(),
+            Self::Packed {
+                entries,
+                mask,
+                base,
+            } => entries.next().map(|&x| *base + (x & *mask)),
+            Self::Pairs(entries) => entries.next().map(|&(_, pos)| pos),
+        }
+    }
+}
+impl Default for RefPositions<'_> {
+    fn default() -> Self {
+        Self::Absolute([].iter())
+    }
 }
 
 /// Visit the hash-minimizer of every `window` consecutive k-mers.
@@ -346,7 +372,7 @@ impl LocalKmerMap {
     /// stride -- and the index's own positions survive, since a minimizer of
     /// its wider window is a minimizer of this narrower one.
     fn build_minimizers(sequence: &[u8], window_start: usize, k: usize, window: usize) -> Self {
-        if sequence.len() < k || k > 32 {
+        if k == 0 || sequence.len() < k || k > 32 {
             return Self::default();
         }
         let offset_bits = 64 - 2 * k;
@@ -369,26 +395,15 @@ impl LocalKmerMap {
             }
         });
 
-        let mut codes;
-        let mut positions;
-        if packable {
-            packed.sort_unstable();
-            codes = Vec::with_capacity(packed.len());
-            positions = Vec::with_capacity(packed.len());
-            for entry in packed {
-                codes.push(entry >> offset_bits);
-                positions.push(window_start as u64 + (entry & offset_mask));
-            }
-        } else {
-            pairs.sort_unstable();
-            codes = Vec::with_capacity(pairs.len());
-            positions = Vec::with_capacity(pairs.len());
-            for (code, position) in pairs {
-                codes.push(code);
-                positions.push(position);
-            }
+        packed.sort_unstable();
+        pairs.sort_unstable();
+        Self {
+            packed,
+            pairs,
+            offset_bits: offset_bits as u32,
+            offset_mask,
+            window_start: window_start as u64,
         }
-        Self { codes, positions }
     }
 
     /// Return only non-repetitive local k-mer buckets.
@@ -396,14 +411,29 @@ impl LocalKmerMap {
     /// FlashMap's local map deliberately emits no positions when a bucket has
     /// more than 128 entries. A sampled subset of a repetitive k-mer is not
     /// safe evidence for a placement, so retain that invariant here.
-    fn positions(&self, code: u64) -> Option<&[u64]> {
-        let start = self.codes.partition_point(|&entry| entry < code);
-        if start == self.codes.len() || self.codes[start] != code {
-            return None;
+    fn positions(&self, code: u64) -> Option<RefPositions<'_>> {
+        if !self.packed.is_empty() {
+            let start = self
+                .packed
+                .partition_point(|&entry| entry >> self.offset_bits < code);
+            let end = start
+                + self.packed[start..].partition_point(|&entry| entry >> self.offset_bits == code);
+            if end == start || end - start > 128 {
+                return None;
+            }
+            Some(RefPositions::Packed {
+                entries: self.packed[start..end].iter(),
+                mask: self.offset_mask,
+                base: self.window_start,
+            })
+        } else {
+            let start = self.pairs.partition_point(|&(entry, _)| entry < code);
+            let end = start + self.pairs[start..].partition_point(|&(entry, _)| entry == code);
+            if end == start || end - start > 128 {
+                return None;
+            }
+            Some(RefPositions::Pairs(self.pairs[start..end].iter()))
         }
-        let end = start + self.codes[start..].partition_point(|&entry| entry == code);
-        let positions = &self.positions[start..end];
-        (positions.len() <= 128).then_some(positions)
     }
 }
 
@@ -798,9 +828,9 @@ fn find_anchors_with_seed_hits_depth(
             // first k bases are known to match. An index hit compared equal on
             // a hash and can still be a collision, so that one is verified.
             let mut verified = true;
-            let ref_positions: &[u64] = if let Some(positions) = paired_hits.get(&q_start) {
+            let ref_positions = if let Some(positions) = paired_hits.get(&q_start) {
                 verified = false;
-                positions.as_slice()
+                RefPositions::Absolute(positions.iter())
             } else {
                 if local_kmer_map.is_none() {
                     map_builds.set(map_builds.get().saturating_add(1));
@@ -829,10 +859,10 @@ fn find_anchors_with_seed_hits_depth(
                 local_kmer_map
                     .as_ref()
                     .and_then(|map| map.positions(code))
-                    .unwrap_or(&[])
+                    .unwrap_or_default()
             };
 
-            for &ref_start in ref_positions {
+            for ref_start in ref_positions {
                 if *kmer_hits >= max_kmer_hits {
                     break;
                 }
@@ -2422,5 +2452,44 @@ mod containment_tests {
         let anchors = vec![anchor(0, 600, 0, 600), anchor(400, 1_000, 300, 900)];
         let kept = deduplicate_anchors(anchors, &region(), 512, true);
         assert_eq!(kept.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod packed_map_tests {
+    use super::*;
+    #[test]
+    fn packed_and_wide_maps_preserve_all_positions_and_repeat_cap() {
+        let mut seed = 9u64;
+        let dna: Vec<u8> = (0..500)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                b"ACGT"[(seed >> 62) as usize]
+            })
+            .collect();
+        for k in [1, 15, 31, 32] {
+            for window in [1, 5] {
+                let map = LocalKmerMap::build_minimizers(&dna, 1234, k, window);
+                let mut expected = std::collections::BTreeMap::<u64, Vec<u64>>::new();
+                for_each_minimizer(&dna, k, window, |pos, code| {
+                    expected.entry(code).or_default().push(pos as u64 + 1234)
+                });
+                for (code, positions) in expected {
+                    let actual = map.positions(code).map(|iter| iter.collect::<Vec<_>>());
+                    assert_eq!(
+                        actual,
+                        if positions.len() <= 128 {
+                            Some(positions)
+                        } else {
+                            None
+                        }
+                    );
+                }
+            }
+        }
+        let repeat = vec![b'A'; 200];
+        assert!(LocalKmerMap::build_minimizers(&repeat, 0, 15, 1)
+            .positions(0)
+            .is_none());
     }
 }

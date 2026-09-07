@@ -45,6 +45,7 @@ pub struct LocalAlignment {
 
 /// Run the default KSW2 local extension over one bounded query/reference gap.
 ///
+/// This is forward extension anchored at the beginning of both slices.
 /// The returned coordinates are relative to the supplied slices.  KSW2's
 /// extension CIGAR is trimmed of trailing indels, matching FlashMap's LR
 /// adapter; callers must still validate that the resulting consumption fits
@@ -60,7 +61,7 @@ pub fn align_local(query: &[u8], reference: &[u8], band_width: usize) -> Option<
     }
 
     let band_width = band_width.clamp(1, MAX_WINDOW);
-    let (score, raw_cigar) = KSW2_ALIGNER.with(|aligner_cell| {
+    let ops = KSW2_ALIGNER.with(|aligner_cell| {
         QUERY_DNA5.with(|query_cell| {
             REFERENCE_DNA5.with(|reference_cell| {
                 let mut query_dna5 = query_cell.borrow_mut();
@@ -79,16 +80,15 @@ pub fn align_local(query: &[u8], reference: &[u8], band_width: usize) -> Option<
                     w: band_width as i32,
                     zdrop: 100,
                     end_bonus: 0,
-                    flag: ksw2rs::KSW_EZ_EXTZ_ONLY,
+                    flag: ksw2rs::KSW_EZ_EXTZ_ONLY | ksw2rs::KSW_EZ_LITERAL_N,
                 };
                 let mut aligner = aligner_cell.borrow_mut();
                 let extension = aligner.align(&input);
-                (extension.max, extension.cigar.clone())
+                raw_cigar_to_ops(&extension.cigar)
             })
         })
     });
 
-    let ops = raw_cigar_to_ops(&raw_cigar);
     if ops.is_empty() {
         return None;
     }
@@ -102,18 +102,28 @@ pub fn align_local(query: &[u8], reference: &[u8], band_width: usize) -> Option<
     {
         return None;
     }
-    let query_start = query.len() - query_consumed;
-    let ref_start = reference.len() - ref_consumed;
-    let query_slice = &query[query_start..];
-    let ref_slice = &reference[ref_start..];
+    let query_start = 0;
+    let ref_start = 0;
+    let query_slice = &query[..query_consumed];
+    let ref_slice = &reference[..ref_consumed];
+    let scoring = crate::config::ScoringPolicy {
+        match_score: MATCH_SCORE,
+        mismatch_penalty: MISMATCH_PENALTY,
+        gap_open: GAP_OPEN,
+        gap_extend: GAP_EXTEND,
+        gap_open2: 0,
+        gap_extend2: 0,
+        dual_affine: false,
+    };
+    let score = scoring.cigar_score(cigar.ops(), query_slice, ref_slice)?;
     let edit_distance = cigar_edit_distance(&cigar, query_slice, ref_slice)?;
 
     Some(LocalAlignment {
-        score: score as i32,
+        score,
         query_start,
-        query_end: query.len(),
+        query_end: query_consumed,
         ref_start,
-        ref_end: reference.len(),
+        ref_end: ref_consumed,
         cigar,
         edit_distance,
     })
@@ -156,7 +166,7 @@ pub fn align_local_dual_affine_with_scoring(
     }
 
     let band_width = band_width.clamp(1, MAX_WINDOW);
-    let (score, raw_cigar) = KSW2_ALIGNER.with(|aligner_cell| {
+    let ops = KSW2_ALIGNER.with(|aligner_cell| {
         QUERY_DNA5.with(|query_cell| {
             REFERENCE_DNA5.with(|reference_cell| {
                 let mut query_dna5 = query_cell.borrow_mut();
@@ -177,16 +187,15 @@ pub fn align_local_dual_affine_with_scoring(
                     w: band_width as i32,
                     zdrop: 100,
                     end_bonus: 0,
-                    flag: ksw2rs::KSW_EZ_EXTZ_ONLY,
+                    flag: ksw2rs::KSW_EZ_EXTZ_ONLY | ksw2rs::KSW_EZ_LITERAL_N,
                 };
                 let mut aligner = aligner_cell.borrow_mut();
                 let extension = aligner.align_extd2(&input);
-                (extension.max, extension.cigar.clone())
+                raw_cigar_to_ops(&extension.cigar)
             })
         })
     });
 
-    let ops = raw_cigar_to_ops(&raw_cigar);
     if ops.is_empty() {
         return None;
     }
@@ -200,18 +209,28 @@ pub fn align_local_dual_affine_with_scoring(
     {
         return None;
     }
-    let query_start = query.len() - query_consumed;
-    let ref_start = reference.len() - ref_consumed;
-    let query_slice = &query[query_start..];
-    let ref_slice = &reference[ref_start..];
+    let query_start = 0;
+    let ref_start = 0;
+    let query_slice = &query[..query_consumed];
+    let ref_slice = &reference[..ref_consumed];
+    let scoring = crate::config::ScoringPolicy {
+        match_score: MATCH_SCORE,
+        mismatch_penalty: MISMATCH_PENALTY,
+        gap_open,
+        gap_extend,
+        gap_open2,
+        gap_extend2,
+        dual_affine: true,
+    };
+    let score = scoring.cigar_score(cigar.ops(), query_slice, ref_slice)?;
     let edit_distance = cigar_edit_distance(&cigar, query_slice, ref_slice)?;
 
     Some(LocalAlignment {
-        score: score as i32,
+        score,
         query_start,
-        query_end: query.len(),
+        query_end: query_consumed,
         ref_start,
-        ref_end: reference.len(),
+        ref_end: ref_consumed,
         cigar,
         edit_distance,
     })
@@ -252,6 +271,7 @@ pub fn align_full_with_scoring(
         gap_open,
         gap_extend,
     )
+    .ok()
 }
 
 /// Run KSW2 dual-affine gap alignment consuming both supplied slices end-to-end.
@@ -298,6 +318,7 @@ pub fn align_full_dual_affine_with_scoring(
         gap_open2,
         gap_extend2,
     )
+    .ok()
 }
 
 /// Align a whole read against a known reference window inside a narrow band.
@@ -318,7 +339,7 @@ pub fn align_banded(query: &[u8], reference: &[u8], band_width: usize) -> Option
     if span.saturating_mul(band.saturating_mul(2).saturating_add(1)) > MAX_BANDED_CELLS {
         return None;
     }
-    run_extz2(query, reference, band, GAP_OPEN, GAP_EXTEND)
+    run_extz2(query, reference, band, GAP_OPEN, GAP_EXTEND).ok()
 }
 
 /// Align a whole read against a known reference window inside a narrow band using dual-affine gap penalties.
@@ -368,6 +389,47 @@ pub fn align_banded_dual_affine_with_scoring(
         gap_open2,
         gap_extend2,
     )
+    .ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DpFailure {
+    EmptyInput,
+    Budget,
+    ImpossibleBand,
+    ZDrop,
+    IncompleteTraceback,
+    InvalidCigar,
+}
+
+pub(crate) fn align_full_outcome(
+    query: &[u8],
+    reference: &[u8],
+    band: usize,
+    scoring: &crate::config::ScoringPolicy,
+) -> Result<LocalAlignment, DpFailure> {
+    if query.is_empty() || reference.is_empty() {
+        return Err(DpFailure::EmptyInput);
+    }
+    if query.len().max(reference.len()) > MAX_WINDOW
+        || query.len().saturating_mul(reference.len()) > MAX_CELLS
+    {
+        return Err(DpFailure::Budget);
+    }
+    let band = band.clamp(1, MAX_WINDOW);
+    if scoring.dual_affine {
+        run_extd2(
+            query,
+            reference,
+            band,
+            scoring.gap_open,
+            scoring.gap_extend,
+            scoring.gap_open2,
+            scoring.gap_extend2,
+        )
+    } else {
+        run_extz2(query, reference, band, scoring.gap_open, scoring.gap_extend)
+    }
 }
 
 /// Shared KSW2 extz2 call and CIGAR validation.
@@ -380,8 +442,12 @@ fn run_extz2(
     band_width: usize,
     gap_open: i8,
     gap_extend: i8,
-) -> Option<LocalAlignment> {
-    let (score, raw_cigar) = KSW2_ALIGNER.with(|aligner_cell| {
+) -> Result<LocalAlignment, DpFailure> {
+    // No end-to-end path exists outside the requested diagonal band.
+    if query.len().abs_diff(reference.len()) > band_width {
+        return Err(DpFailure::ImpossibleBand);
+    }
+    let (score, ops, z_dropped) = KSW2_ALIGNER.with(|aligner_cell| {
         QUERY_DNA5.with(|query_cell| {
             REFERENCE_DNA5.with(|reference_cell| {
                 let mut query_dna5 = query_cell.borrow_mut();
@@ -400,28 +466,37 @@ fn run_extz2(
                     w: band_width as i32,
                     zdrop: 100,
                     end_bonus: 0,
-                    flag: 0,
+                    flag: ksw2rs::KSW_EZ_LITERAL_N,
                 };
                 let mut aligner = aligner_cell.borrow_mut();
                 let extension = aligner.align(&input);
-                (extension.score, extension.cigar.clone())
+                (
+                    extension.score,
+                    raw_cigar_to_ops_full(&extension.cigar),
+                    extension.zdropped,
+                )
             })
         })
     });
 
-    let ops = raw_cigar_to_ops_full(&raw_cigar);
+    let incomplete = if z_dropped {
+        DpFailure::ZDrop
+    } else {
+        DpFailure::IncompleteTraceback
+    };
     if ops.is_empty() || ops.iter().any(|op| matches!(op, CigarOp::SoftClip(_))) {
-        return None;
+        return Err(incomplete);
     }
-    let cigar = Cigar::new(ops).ok()?;
+    let cigar = Cigar::new(ops).map_err(|_| DpFailure::InvalidCigar)?;
     if cigar.query_len() as usize != query.len()
         || cigar.reference_len() as usize != reference.len()
     {
-        return None;
+        return Err(incomplete);
     }
-    let edit_distance = cigar_edit_distance(&cigar, query, reference)?;
+    let edit_distance =
+        cigar_edit_distance(&cigar, query, reference).ok_or(DpFailure::InvalidCigar)?;
 
-    Some(LocalAlignment {
+    Ok(LocalAlignment {
         score,
         query_start: 0,
         query_end: query.len(),
@@ -441,8 +516,12 @@ fn run_extd2(
     gap_extend: i8,
     gap_open2: i8,
     gap_extend2: i8,
-) -> Option<LocalAlignment> {
-    let (score, raw_cigar) = KSW2_ALIGNER.with(|aligner_cell| {
+) -> Result<LocalAlignment, DpFailure> {
+    // No end-to-end path exists outside the requested diagonal band.
+    if query.len().abs_diff(reference.len()) > band_width {
+        return Err(DpFailure::ImpossibleBand);
+    }
+    let (score, ops, z_dropped) = KSW2_ALIGNER.with(|aligner_cell| {
         QUERY_DNA5.with(|query_cell| {
             REFERENCE_DNA5.with(|reference_cell| {
                 let mut query_dna5 = query_cell.borrow_mut();
@@ -463,28 +542,37 @@ fn run_extd2(
                     w: band_width as i32,
                     zdrop: 100,
                     end_bonus: 0,
-                    flag: 0,
+                    flag: ksw2rs::KSW_EZ_LITERAL_N,
                 };
                 let mut aligner = aligner_cell.borrow_mut();
                 let extension = aligner.align_extd2(&input);
-                (extension.score, extension.cigar.clone())
+                (
+                    extension.score,
+                    raw_cigar_to_ops_full(&extension.cigar),
+                    extension.zdropped,
+                )
             })
         })
     });
 
-    let ops = raw_cigar_to_ops_full(&raw_cigar);
+    let incomplete = if z_dropped {
+        DpFailure::ZDrop
+    } else {
+        DpFailure::IncompleteTraceback
+    };
     if ops.is_empty() || ops.iter().any(|op| matches!(op, CigarOp::SoftClip(_))) {
-        return None;
+        return Err(incomplete);
     }
-    let cigar = Cigar::new(ops).ok()?;
+    let cigar = Cigar::new(ops).map_err(|_| DpFailure::InvalidCigar)?;
     if cigar.query_len() as usize != query.len()
         || cigar.reference_len() as usize != reference.len()
     {
-        return None;
+        return Err(incomplete);
     }
-    let edit_distance = cigar_edit_distance(&cigar, query, reference)?;
+    let edit_distance =
+        cigar_edit_distance(&cigar, query, reference).ok_or(DpFailure::InvalidCigar)?;
 
-    Some(LocalAlignment {
+    Ok(LocalAlignment {
         score,
         query_start: 0,
         query_end: query.len(),
@@ -522,7 +610,10 @@ fn dna5_matrix() -> [i8; 25] {
         matrix[base * 5 + base] = MATCH_SCORE;
     }
     // Ambiguous bases neither reward nor penalize an aligned comparison.
-    matrix[24] = 0;
+    for base in 0..5 {
+        matrix[base * 5 + 4] = 0;
+        matrix[4 * 5 + base] = 0;
+    }
     matrix
 }
 
@@ -547,7 +638,7 @@ fn raw_cigar_to_ops_with_terminal_policy(raw: &[u32], trim_terminal_indels: bool
         }
     }
 
-    let mut ops = Vec::new();
+    let mut ops = Vec::with_capacity(end);
     for &packed in &raw[..end] {
         let len = packed >> 4;
         if len == 0 {
@@ -557,7 +648,9 @@ fn raw_cigar_to_ops_with_terminal_policy(raw: &[u32], trim_terminal_indels: bool
             0 => ops.push(CigarOp::Match(len)),
             1 => ops.push(CigarOp::Ins(len)),
             2 => ops.push(CigarOp::Del(len)),
-            3 => ops.push(CigarOp::SoftClip(len)),
+            // KSW op 3 is reference skip, not a soft clip; this adapter
+            // supports DNA alignment (M/I/D) only.
+            3 => return Vec::new(),
             _ => return Vec::new(),
         }
     }
@@ -567,6 +660,31 @@ fn raw_cigar_to_ops_with_terminal_policy(raw: &[u32], trim_terminal_indels: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_outcomes_distinguish_budget_geometry_and_zdrop() {
+        let scoring = crate::config::ResolvedMapperPolicy::from_mapper_config(
+            &crate::MapperConfig::default(),
+        )
+        .unwrap()
+        .scoring;
+        assert_eq!(
+            align_full_outcome(b"", b"A", 8, &scoring),
+            Err(DpFailure::EmptyInput)
+        );
+        assert_eq!(
+            align_full_outcome(&vec![b'A'; 8193], b"A", 8, &scoring),
+            Err(DpFailure::Budget)
+        );
+        assert_eq!(
+            align_full_outcome(b"AAAAAAAA", b"A", 2, &scoring),
+            Err(DpFailure::ImpossibleBand)
+        );
+        assert_eq!(
+            align_full_outcome(&[b'A'; 200], &[b'C'; 200], 64, &scoring),
+            Err(DpFailure::ZDrop)
+        );
+    }
 
     #[test]
     fn dna5_encoding_accepts_lowercase_and_n() {
@@ -685,5 +803,31 @@ mod band_tests {
         // asked for it is skipped and the gap falls through to a coarser one.
         assert_eq!(deletion(256), None, "a 256 band has no path to 400 bases");
         assert_eq!(deletion(432), Some(400), "a band above the delta has one");
+    }
+}
+
+#[cfg(test)]
+mod correctness_regressions {
+    use super::*;
+    #[test]
+    fn local_extension_coordinates_describe_the_matching_prefix() {
+        for align in [align_local, align_local_dual_affine] {
+            let a = align(b"ACGTACGTAAAAAAAA", b"ACGTACGTCCCCCCCC", 32).unwrap();
+            assert_eq!(
+                (a.query_start, a.query_end, a.ref_start, a.ref_end),
+                (0, 8, 0, 8)
+            );
+            assert_eq!((a.score, a.edit_distance), (16, 0));
+            assert_eq!(a.cigar.ops(), &[CigarOp::Match(8)]);
+        }
+    }
+    #[test]
+    fn ambiguous_bases_have_neutral_scores_in_both_engines() {
+        for align in [align_full, align_full_dual_affine] {
+            for reference in [b"ANA", b"ACA"] {
+                let a = align(b"ANA", reference, 16).unwrap();
+                assert_eq!(a.score, 4);
+            }
+        }
     }
 }
