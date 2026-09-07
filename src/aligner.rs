@@ -1852,7 +1852,7 @@ fn mapping_quality_minimap2(
     };
     let coverage_factor = span_factor * anchor_factor;
 
-    let raw_mapq = match second_score {
+    let raw_base = match second_score {
         None => 60.0,
         Some(second) => {
             let difference = best_score.saturating_sub(second).max(0);
@@ -1863,17 +1863,18 @@ fn mapping_quality_minimap2(
             let x = (second.max(0) as f64 / (best_score.max(1) as f64)).clamp(0.0, 1.0);
             let log_sc = ((best_score as f64) / 2.0).max(2.0).ln();
             let ratio_term = 40.0 * (1.0 - x * x) * log_sc;
-            let base_term = ratio_term.min(diff_term);
-
-            // In minimap2: suboptimal penalty applies for competing loci across the genome.
-            let sub_penalty = if competing_count > 1 {
-                4.343 * (competing_count as f64).ln()
-            } else {
-                0.0
-            };
-            (base_term - sub_penalty).clamp(0.0, 60.0)
+            ratio_term.min(diff_term)
         }
     };
+
+    // In minimap2: suboptimal penalty applies for competing loci across the genome,
+    // even when only a single placement or candidate is resolved in the primary pass.
+    let sub_penalty = if competing_count > 1 {
+        4.343 * (competing_count as f64).ln()
+    } else {
+        0.0
+    };
+    let raw_mapq = (raw_base - sub_penalty).clamp(0.0, 60.0);
 
     let mut mapq = (raw_mapq * coverage_factor).round().clamp(0.0, 60.0) as u8;
 
@@ -2581,6 +2582,9 @@ mod tests {
         // 2. Short repeat match (e.g. 10% span) is penalized
         let short_repeat = mapping_quality_minimap2(500, None, 0.10, 5, 100, 0);
         assert!(short_repeat <= 10);
+
+        // Competitor count dampens MAPQ even if second_score is None (suboptimal hits across genome)
+        assert_eq!(mapping_quality_minimap2(10_000, None, 1.0, 20, 500, 10), 50);
 
         // 3. Competitor with decisive score ratio difference (15,000 vs 13,500, 10% diff) earns MAPQ 60
         assert_eq!(mapping_quality_minimap2(15_000, Some(13_500), 1.0, 50, 1000, 1), 60);

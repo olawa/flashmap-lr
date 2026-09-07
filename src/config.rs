@@ -1141,7 +1141,7 @@ impl ResolvedMapperPolicy {
             max_candidates_without_placement: 3,
             high_coverage_fraction: 0.90,
             low_coverage_fraction: 0.40,
-            limited_mapq_cap: if mode.resolves_full_depth() { 60 } else { 50 },
+            limited_mapq_cap: if mode.is_sensitive() { 60 } else { 50 },
             mapq_from_span: false,
             mapq_score_saturation: 0,
             mapq_mode: MapqMode::Minimap2,
