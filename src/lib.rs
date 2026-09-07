@@ -32,7 +32,7 @@ pub use anchors::{find_anchors, Anchor, AnchorError};
 pub use candidates::{cluster_probe_hits, CandidateRegion, EndpointSupport};
 pub use chain::{chain_anchors, Chain, ChainSet, MAX_ITER as CHAIN_MAX_ITER};
 pub use config::{
-    AlignmentConfig, AlignmentMode, CandidateConfig, Config, ConfigError, MapperConfig,
+    AlignmentConfig, AlignmentMode, CandidateConfig, Config, ConfigError, MapperConfig, MapqMode,
     RuntimeConfig, SeedingConfig, WorkerPoolConfig,
 };
 pub use diagnostics::{DiagnosticsSink, ReadDiagnostics};

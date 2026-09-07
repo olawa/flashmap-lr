@@ -381,3 +381,54 @@ fn secondary_records_preserve_primary_and_calibration_caps_unique_mapq() {
     assert_eq!(unique_record.split('\t').nth(4), Some("12"));
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn mapq_mode_cli_flag_selects_calculation() {
+    let root = std::env::temp_dir().join(format!("rs-lra-mapq-mode-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let unique = String::from_utf8(pseudo_sequence(6000, 345)).unwrap();
+    fs::write(root.join("ref.fa"), format!(">chr1\n{unique}\n")).unwrap();
+    fs::write(
+        root.join("reads.fa"),
+        format!(">read1\n{}\n", &unique[200..3200]),
+    )
+    .unwrap();
+
+    let run = |flag: Option<&str>| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rs-lra"));
+        cmd.args([
+            "--reference",
+            root.join("ref.fa").to_str().unwrap(),
+            "--reads",
+            root.join("reads.fa").to_str().unwrap(),
+            "--output",
+            root.join("out.sam").to_str().unwrap(),
+            "--workers",
+            "1",
+        ]);
+        if let Some(f) = flag {
+            cmd.arg(f);
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "CLI failed with flag {flag:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let sam = fs::read_to_string(root.join("out.sam")).unwrap();
+        let record = sam.lines().find(|l| l.starts_with("read1\t")).unwrap().to_owned();
+        record.split('\t').nth(4).unwrap().parse::<u8>().unwrap()
+    };
+
+    let default_mapq = run(None);
+    let mm2_mapq = run(Some("--mm2-mapq"));
+    let legacy_mapq = run(Some("--legacy-mapq"));
+
+    assert_eq!(default_mapq, 60, "Default MAPQ should be 60 for unambiguous read");
+    assert_eq!(mm2_mapq, 60, "MM2 MAPQ should be 60 for unambiguous read");
+    // Legacy calculation also yields a valid mapq (<= 60)
+    assert!(legacy_mapq <= 60);
+
+    fs::remove_dir_all(root).unwrap();
+}
+

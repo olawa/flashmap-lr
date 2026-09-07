@@ -43,6 +43,31 @@ impl AlignmentMode {
     }
 }
 
+/// Mapping quality calculation mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MapqMode {
+    /// Minimap2-calibrated mapping quality (default).
+    /// Eliminates anchor density penalties on unambiguous reads
+    /// and uses Phred-scaled score differences for competitors.
+    #[default]
+    Minimap2,
+    /// Historical ratio-based mapping quality with anchor density penalty.
+    Legacy,
+}
+
+impl std::str::FromStr for MapqMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "mm2" | "minimap2" | "calibrated" => Ok(Self::Minimap2),
+            "legacy" | "strict" | "old" => Ok(Self::Legacy),
+            _ => Err(format!(
+                "unknown mapq mode '{s}', expected 'mm2' or 'legacy'"
+            )),
+        }
+    }
+}
+
 /// Runtime settings for the one supported worker-pool scheduler.
 ///
 /// Runtime settings are deliberately separate from algorithm policy.  The
@@ -79,6 +104,7 @@ pub struct MapperConfig {
     /// Maximum secondary records; zero disables their refinement/emission.
     pub max_secondary: usize,
     pub mapq_calibration: Option<crate::MapqCalibration>,
+    pub mapq_mode: MapqMode,
 }
 
 impl Default for MapperConfig {
@@ -89,6 +115,7 @@ impl Default for MapperConfig {
             dual_affine: false,
             max_secondary: 0,
             mapq_calibration: None,
+            mapq_mode: MapqMode::Minimap2,
         }
     }
 }
@@ -244,6 +271,7 @@ pub struct AlignmentConfig {
     /// Maximum secondary records; zero disables their refinement/emission.
     pub max_secondary: usize,
     pub mapq_calibration: Option<crate::MapqCalibration>,
+    pub mapq_mode: MapqMode,
 }
 
 impl Default for Config {
@@ -298,6 +326,7 @@ impl Default for Config {
                 dual_affine: false,
                 max_secondary: 0,
                 mapq_calibration: None,
+                mapq_mode: MapqMode::Minimap2,
             },
             worker_pool: WorkerPoolConfig::default(),
         }
@@ -805,6 +834,7 @@ pub(crate) struct WorkBudget {
     /// Score difference that settles a placement on its own, regardless of
     /// how large the scores themselves are. Zero is the ratio-only rule.
     pub(crate) mapq_score_saturation: i32,
+    pub(crate) mapq_mode: MapqMode,
     /// Fast-only coarse-candidate entropy guard. When at least this many
     /// candidates remain within `ambiguity_score_fraction` of the top probe
     /// score, only `ambiguity_candidate_budget` candidates are resolved and
@@ -843,6 +873,7 @@ impl ResolvedMapperPolicy {
         let mut policy = Self::for_mode(config.mode, config.runtime.clone(), config.dual_affine);
         policy.max_secondary = config.max_secondary;
         policy.mapq_calibration = config.mapq_calibration.clone();
+        policy.work_budget.mapq_mode = config.mapq_mode;
         Ok(policy)
     }
 
@@ -911,6 +942,7 @@ impl ResolvedMapperPolicy {
         policy.work_budget.max_candidates = config.candidates.max_regions.min(8);
         policy.work_budget.mapq_from_span = config.seeding.mapq_from_span;
         policy.work_budget.mapq_score_saturation = config.seeding.mapq_score_saturation;
+        policy.work_budget.mapq_mode = config.alignment.mapq_mode;
         // Tiered and EMMS switches are compatibility-only.  They are carried
         // into the resolved policy only when explicitly requested through the
         // legacy Config; MapperConfig itself cannot create these combinations.
@@ -1112,6 +1144,7 @@ impl ResolvedMapperPolicy {
             limited_mapq_cap: if mode.resolves_full_depth() { 60 } else { 50 },
             mapq_from_span: false,
             mapq_score_saturation: 0,
+            mapq_mode: MapqMode::Minimap2,
             ambiguity_score_fraction: 0.90,
             ambiguity_candidate_count: if mode.resolves_full_depth() {
                 usize::MAX
@@ -1178,6 +1211,7 @@ impl ResolvedMapperPolicy {
             alignment: AlignmentConfig {
                 max_secondary: self.max_secondary,
                 mapq_calibration: self.mapq_calibration.clone(),
+                mapq_mode: self.work_budget.mapq_mode,
                 island_chain_lookback: self.gaps.island_chain_lookback,
                 dissolve_repeat_run: self.gaps.dissolve_repeat_run,
                 overlap_flank: self.gaps.overlap_flank,

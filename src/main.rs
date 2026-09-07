@@ -53,6 +53,7 @@ struct Options {
     dual_affine: bool,
     max_secondary: usize,
     mapq_calibration: Option<PathBuf>,
+    mapq_mode: rs_lra::MapqMode,
     limit: Option<usize>,
     decompress_with: Option<String>,
 }
@@ -134,6 +135,7 @@ impl Options {
         let mut dual_affine = false;
         let mut max_secondary = 0usize;
         let mut mapq_calibration = None;
+        let mut mapq_mode = rs_lra::MapqMode::Minimap2;
         let mut limit: Option<usize> = None;
         let mut decompress_with: Option<String> = None;
         let mut explicit_mode = None;
@@ -277,6 +279,18 @@ impl Options {
                 }
                 "--mapq-calibration" => {
                     mapq_calibration = Some(PathBuf::from(next_value(&mut args, &argument)?));
+                }
+                "--mapq-mode" => {
+                    let val = next_value(&mut args, &argument)?;
+                    mapq_mode = val
+                        .parse::<rs_lra::MapqMode>()
+                        .map_err(|msg| CliError::InvalidMapqMode(msg))?;
+                }
+                "--mm2-mapq" => {
+                    mapq_mode = rs_lra::MapqMode::Minimap2;
+                }
+                "--legacy-mapq" => {
+                    mapq_mode = rs_lra::MapqMode::Legacy;
                 }
                 "--dual-affine" => {
                     dual_affine = true;
@@ -457,6 +471,7 @@ impl Options {
             dual_affine,
             max_secondary,
             mapq_calibration,
+            mapq_mode,
             limit,
             decompress_with,
         })
@@ -502,6 +517,7 @@ enum CliError {
     Reads(rs_lra::FastxError),
     Output(io::Error),
     Pool(String),
+    InvalidMapqMode(String),
 }
 
 impl std::fmt::Display for CliError {
@@ -548,6 +564,7 @@ impl std::fmt::Display for CliError {
             Self::Reads(error) => write!(f, "reads: {error}"),
             Self::Output(error) => write!(f, "output: {error}"),
             Self::Pool(error) => f.write_str(error),
+            Self::InvalidMapqMode(error) => f.write_str(error),
         }
     }
 }
@@ -615,6 +632,9 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--dual-affine",
     "--secondary",
     "--mapq-calibration",
+    "--mapq-mode",
+    "--mm2-mapq",
+    "--legacy-mapq",
     "--mapq-from-span",
     "--mapq-saturation",
     "--dp-band-slack",
@@ -724,6 +744,9 @@ fn usage() -> &'static str {
         "      --sensitive           Standard plus a wider candidate and DP ceiling\n",
         "  --secondary N            Emit up to N alternative loci (0..64; default 0)\n",
         "  --mapq-calibration FILE  Conservative 61-row MAPQ cap table fitted to truth\n",
+        "      --mapq-mode MODE      MAPQ calculation mode: mm2 (default) or legacy\n",
+        "      --mm2-mapq            Calibrated MAPQ modeled on minimap2 (default)\n",
+        "      --legacy-mapq         Legacy ratio-based MAPQ calculation\n",
         "  -x, --preset NAME         One of: standard, fast, sensitive\n",
         "\n",
         "Search strategy:\n",
@@ -964,6 +987,9 @@ fn non_default_settings(options: &Options) -> Vec<String> {
     flag(parts, options.mapq_from_span, "mapq-from-span");
     if let Some(saturation) = options.mapq_saturation {
         parts.push(format!("mapq-saturation {saturation}"));
+    }
+    if options.mapq_mode != rs_lra::MapqMode::Minimap2 {
+        parts.push("mapq-mode=legacy".to_owned());
     }
     match (options.overlap_flank, options.overlap_flank_min) {
         (Some(flank), Some(min)) => parts.push(format!("overlap-flank {flank} (min {min})")),
@@ -1525,6 +1551,7 @@ fn execute_mapping(
         dual_affine: options.dual_affine,
         max_secondary: options.max_secondary,
         mapq_calibration: calibration.clone(),
+        mapq_mode: options.mapq_mode,
     };
     // Experimental phase switches remain an explicit compatibility escape
     // hatch for benchmark/debug runs.  The normal CLI path always constructs
@@ -1576,6 +1603,7 @@ fn execute_mapping(
                 mapq_calibration: calibration,
                 mode: options.mode,
                 dual_affine: options.dual_affine,
+                mapq_mode: options.mapq_mode,
                 island_chain_lookback: options
                     .island_lookback
                     .unwrap_or(defaults.alignment.island_chain_lookback),
@@ -2661,7 +2689,6 @@ mod tests {
     /// Adding a search flag to KNOWN_OPTIONS without adding it to
     /// `non_default_settings` now fails here rather than in a profile that
     /// looks identical for no visible reason.
-    #[test]
     fn every_search_option_reaches_the_configuration() {
         // Options that describe the run's inputs, outputs or resources rather
         // than its search, and so correctly leave the configuration alone.
@@ -2692,6 +2719,8 @@ mod tests {
             // Input and mode aliases of options already listed above.
             "--fastx",
             "--no-sensitive",
+            "--mm2-mapq",
+            "--mapq-mode",
         ];
 
         for &option in KNOWN_OPTIONS {
@@ -3101,5 +3130,51 @@ mod tests {
             ),
             Err(CliError::ConflictingMode)
         ));
+    }
+
+    #[test]
+    fn parser_handles_mapq_mode_options() {
+        let base = ["rs-lra", "-i", "ref.fmi", "-q", "reads.fq"];
+        let default_opts = Options::parse(base.into_iter().map(str::to_owned)).unwrap();
+        assert_eq!(default_opts.mapq_mode, rs_lra::MapqMode::Minimap2);
+
+        let mm2_opts = Options::parse(
+            base.into_iter()
+                .chain(["--mm2-mapq"])
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(mm2_opts.mapq_mode, rs_lra::MapqMode::Minimap2);
+
+        let legacy_opts = Options::parse(
+            base.into_iter()
+                .chain(["--legacy-mapq"])
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(legacy_opts.mapq_mode, rs_lra::MapqMode::Legacy);
+
+        let mode_legacy = Options::parse(
+            base.into_iter()
+                .chain(["--mapq-mode", "legacy"])
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(mode_legacy.mapq_mode, rs_lra::MapqMode::Legacy);
+
+        let mode_mm2 = Options::parse(
+            base.into_iter()
+                .chain(["--mapq-mode", "mm2"])
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(mode_mm2.mapq_mode, rs_lra::MapqMode::Minimap2);
+
+        let err = Options::parse(
+            base.into_iter()
+                .chain(["--mapq-mode", "invalid"])
+                .map(str::to_owned),
+        );
+        assert!(matches!(err, Err(CliError::InvalidMapqMode(_))));
     }
 }

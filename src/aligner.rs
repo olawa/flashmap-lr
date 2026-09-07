@@ -9,8 +9,8 @@ use crate::anchors::{
 };
 use crate::candidates::{cluster_probe_hits_with_policy, EndpointSupport};
 use crate::config::{
-    AlignmentMode, Config, ConfigError, MapperConfig, ResolvedMapperPolicy, RuntimeConfig,
-    StructuralPolicy,
+    AlignmentMode, Config, ConfigError, MapperConfig, MapqMode, ResolvedMapperPolicy,
+    RuntimeConfig, StructuralPolicy,
 };
 use crate::probes::extract_read_probes_from_seeds;
 use crate::{
@@ -78,6 +78,7 @@ impl<'a> Aligner<'a> {
                     dual_affine: policy.scoring.dual_affine,
                     max_secondary: policy.max_secondary,
                     mapq_calibration: policy.mapq_calibration.clone(),
+                    mapq_mode: policy.work_budget.mapq_mode,
                 };
                 (policy, mapper_config, config)
             }
@@ -812,23 +813,52 @@ impl<'a> Aligner<'a> {
         // candidates outright -- 306645 of them on a whole-genome run -- so
         // handing those reads a span near 1.0 as well makes an unexamined
         // locus maximally confident. Keeping density there is what stops it.
-        let confidence_coverage =
-            if self.policy.work_budget.mapq_from_span && second_score.is_some() {
-                diagnostics.mapq_span_applied = 1;
+        let mapq = match self.policy.work_budget.mapq_mode {
+            MapqMode::Minimap2 => {
                 let span = chain.q_end.saturating_sub(chain.q_start) as f64;
-                (span / read.sequence.len().max(1) as f64).clamp(0.0, 1.0)
-            } else {
-                if self.policy.work_budget.mapq_from_span {
-                    diagnostics.mapq_span_withheld = 1;
-                }
-                chain.query_covered_fraction
-            };
-        let mapq = confidence_cap(mapping_quality_with_saturation(
-            best_rank_score,
-            second_score,
-            confidence_coverage,
-            self.policy.work_budget.mapq_score_saturation,
-        ));
+                let span_fraction = (span / read.sequence.len().max(1) as f64).clamp(0.0, 1.0);
+                let competing_count = placements
+                    .iter()
+                    .filter(|(_, other, _)| {
+                        !std::ptr::eq(other, chain)
+                            && chains_compete_for_query(
+                                chain,
+                                other,
+                                self.policy
+                                    .structural
+                                    .max_supplementary_query_overlap_fraction,
+                            )
+                    })
+                    .count();
+                confidence_cap(mapping_quality_minimap2(
+                    best_rank_score,
+                    second_score,
+                    span_fraction,
+                    chain.anchors.len(),
+                    chain.query_covered_bases,
+                    competing_count,
+                ))
+            }
+            MapqMode::Legacy => {
+                let confidence_coverage =
+                    if self.policy.work_budget.mapq_from_span && second_score.is_some() {
+                        diagnostics.mapq_span_applied = 1;
+                        let span = chain.q_end.saturating_sub(chain.q_start) as f64;
+                        (span / read.sequence.len().max(1) as f64).clamp(0.0, 1.0)
+                    } else {
+                        if self.policy.work_budget.mapq_from_span {
+                            diagnostics.mapq_span_withheld = 1;
+                        }
+                        chain.query_covered_fraction
+                    };
+                confidence_cap(mapping_quality_with_saturation(
+                    best_rank_score,
+                    second_score,
+                    confidence_coverage,
+                    self.policy.work_budget.mapq_score_saturation,
+                ))
+            }
+        };
         let contig = self.reference.contig(*contig_id).ok_or(MapError::Anchor(
             crate::AnchorError::MissingReference(*contig_id),
         ))?;
@@ -859,36 +889,65 @@ impl<'a> Aligner<'a> {
             // separate placement of a different part of the read: whether the
             // primary was unambiguous says nothing about whether this segment
             // is, and copying the value hides a segment that had a competitor.
-            let supplementary_mapq = confidence_cap(mapping_quality_with_saturation(
-                endpoint_rank_score(
-                    supplementary_chain.score,
-                    supplementary_support,
-                    read.sequence.len(),
-                ),
-                competing_rank_score(
-                    supplementary_chain,
-                    &placements,
-                    read.sequence.len(),
-                    self.policy
-                        .structural
-                        .max_supplementary_query_overlap_fraction,
-                ),
-                // Measure coverage against the segment's own span, not the
-                // whole read. The factor exists to distrust a chain built from
-                // sparse anchors; a supplementary explaining little of its
-                // read is the normal case for a split, not a warning sign, and
-                // scaling by the whole read caps every split segment low
-                // however unambiguous its locus is.
-                if self.policy.work_budget.mapq_from_span {
-                    // A supplementary already measures against its own span,
-                    // so under this rule it is by definition complete: its
-                    // confidence comes from the competitor term alone.
-                    1.0
-                } else {
-                    chain_span_coverage(supplementary_chain)
-                },
-                self.policy.work_budget.mapq_score_saturation,
-            ));
+            let supplementary_mapq = match self.policy.work_budget.mapq_mode {
+                MapqMode::Minimap2 => {
+                    let competing_count = placements
+                        .iter()
+                        .filter(|(_, other, _)| {
+                            !std::ptr::eq(other, supplementary_chain)
+                                && chains_compete_for_query(
+                                    supplementary_chain,
+                                    other,
+                                    self.policy
+                                        .structural
+                                        .max_supplementary_query_overlap_fraction,
+                                )
+                        })
+                        .count();
+                    confidence_cap(mapping_quality_minimap2(
+                        endpoint_rank_score(
+                            supplementary_chain.score,
+                            supplementary_support,
+                            read.sequence.len(),
+                        ),
+                        competing_rank_score(
+                            supplementary_chain,
+                            &placements,
+                            read.sequence.len(),
+                            self.policy
+                                .structural
+                                .max_supplementary_query_overlap_fraction,
+                        ),
+                        1.0,
+                        supplementary_chain.anchors.len(),
+                        supplementary_chain.query_covered_bases,
+                        competing_count,
+                    ))
+                }
+                MapqMode::Legacy => {
+                    confidence_cap(mapping_quality_with_saturation(
+                        endpoint_rank_score(
+                            supplementary_chain.score,
+                            supplementary_support,
+                            read.sequence.len(),
+                        ),
+                        competing_rank_score(
+                            supplementary_chain,
+                            &placements,
+                            read.sequence.len(),
+                            self.policy
+                                .structural
+                                .max_supplementary_query_overlap_fraction,
+                        ),
+                        if self.policy.work_budget.mapq_from_span {
+                            1.0
+                        } else {
+                            chain_span_coverage(supplementary_chain)
+                        },
+                        self.policy.work_budget.mapq_score_saturation,
+                    ))
+                }
+            };
             let alignment = crate::alignment::build_chain_alignment_with_policy(
                 read,
                 contig,
@@ -1755,8 +1814,57 @@ fn phase_nanos(started: Option<Instant>) -> u64 {
 ///
 /// `saturation` is the difference that counts as decisive on its own. The
 /// default is the score a both-ends endpoint match is already worth in the
-/// ranking, so a rival a full endpoint's worth behind is beaten -- a unit the
-/// ranking trusts elsewhere rather than a fresh guess.
+/// Minimap2-calibrated mapping quality computation.
+///
+/// For long reads, minimap2 does not penalize unambiguous alignments for anchor
+/// sparsity as long as the chain spans the read and contains sufficient anchors.
+/// When competitors exist, confidence scales with the absolute score difference
+/// (Phred scaled ~ 3.0 * delta_score) with penalties for multiple suboptimal placements.
+fn mapping_quality_minimap2(
+    best_score: i32,
+    second_score: Option<i32>,
+    span_fraction: f64,
+    n_anchors: usize,
+    query_covered_bases: u32,
+    competing_count: usize,
+) -> u8 {
+    const SPAN_KNEE: f64 = 0.80;
+    let span_factor = (span_fraction.clamp(0.0, 1.0) / SPAN_KNEE).min(1.0);
+    let anchor_factor = if n_anchors >= 10 || query_covered_bases >= 200 {
+        1.0
+    } else {
+        (n_anchors as f64 / 10.0).clamp(0.1, 1.0)
+    };
+    let coverage_factor = span_factor * anchor_factor;
+
+    let raw_mapq = match second_score {
+        None => 60.0,
+        Some(second) => {
+            let difference = best_score.saturating_sub(second).max(0);
+            if difference == 0 {
+                return 0;
+            }
+            let diff_term = (3.0 * difference as f64).clamp(0.0, 60.0);
+            let sub_penalty = if competing_count > 1 {
+                4.343 * (competing_count as f64).ln()
+            } else {
+                0.0
+            };
+            (diff_term - sub_penalty).clamp(0.0, 60.0)
+        }
+    };
+
+    let mut mapq = (raw_mapq * coverage_factor).round().clamp(0.0, 60.0) as u8;
+
+    if let Some(second) = second_score {
+        if best_score > second && mapq == 0 {
+            mapq = 1;
+        }
+    }
+
+    mapq
+}
+
 fn mapping_quality_with_saturation(
     best_score: i32,
     second_score: Option<i32>,
@@ -2441,5 +2549,31 @@ mod tests {
         assert_eq!(mapping_quality(100, None, 0.80), 60);
         assert_eq!(mapping_quality(100, None, 0.40), 30);
         assert_eq!(mapping_quality(100, Some(99), 1.0), 1);
+    }
+
+    #[test]
+    fn minimap2_mapq_calibrated_behavior() {
+        // 1. Unambiguous full-length read earns MAPQ 60 even with sparse minimizers
+        assert_eq!(mapping_quality_minimap2(10_000, None, 0.95, 20, 500, 0), 60);
+        assert_eq!(mapping_quality_minimap2(10_000, None, 0.80, 10, 200, 0), 60);
+
+        // 2. Short repeat match (e.g. 10% span) is penalized
+        let short_repeat = mapping_quality_minimap2(500, None, 0.10, 5, 100, 0);
+        assert!(short_repeat <= 10);
+
+        // 3. Competitor with large score difference (e.g. 500 score points) earns MAPQ 60
+        assert_eq!(mapping_quality_minimap2(15_000, Some(14_500), 1.0, 50, 1000, 1), 60);
+
+        // 4. Competitor with 20 score points difference reaches MAPQ 60
+        assert_eq!(mapping_quality_minimap2(15_000, Some(14_980), 1.0, 50, 1000, 1), 60);
+
+        // 5. Competitor with small difference (5 score points) gets proportional MAPQ ~15
+        assert_eq!(mapping_quality_minimap2(15_000, Some(14_995), 1.0, 50, 1000, 1), 15);
+
+        // 6. Exact tie gets MAPQ 0
+        assert_eq!(mapping_quality_minimap2(15_000, Some(15_000), 1.0, 50, 1000, 1), 0);
+
+        // 7. Strictly better placement gets at least MAPQ 1
+        assert_eq!(mapping_quality_minimap2(15_000, Some(14_999), 1.0, 50, 1000, 1), 3);
     }
 }
