@@ -1828,8 +1828,13 @@ fn mapping_quality_minimap2(
     query_covered_bases: u32,
     competing_count: usize,
 ) -> u8 {
-    const SPAN_KNEE: f64 = 0.80;
-    let span_factor = (span_fraction.clamp(0.0, 1.0) / SPAN_KNEE).min(1.0);
+    // Like minimap2 pen_cm: if n_anchors >= 10 || query_covered_bases >= 200, anchor factor is 1.0.
+    // For span, penalize only if very short partial matches (e.g. < 50% of read and covered bases < 1000).
+    let span_factor = if span_fraction >= 0.50 || query_covered_bases >= 1000 {
+        1.0
+    } else {
+        (span_fraction / 0.50).clamp(0.1, 1.0)
+    };
     let anchor_factor = if n_anchors >= 10 || query_covered_bases >= 200 {
         1.0
     } else {
@@ -1845,7 +1850,9 @@ fn mapping_quality_minimap2(
                 return 0;
             }
             let diff_term = (3.0 * difference as f64).clamp(0.0, 60.0);
-            let sub_penalty = if competing_count > 1 {
+            // In minimap2: a decisive score difference (>= 20) yields MAPQ 60 without suboptimal penalty.
+            // Suboptimal penalty only applies when competing placements are closely contested (< 20 score difference).
+            let sub_penalty = if difference < 20 && competing_count > 1 {
                 4.343 * (competing_count as f64).ln()
             } else {
                 0.0
