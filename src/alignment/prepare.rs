@@ -97,6 +97,8 @@ pub(super) struct OverlapStats {
     pub dissolved_runs: u64,
     pub dissolved_anchors: u64,
     pub repeat_ambiguous_anchors_dissolved: u64,
+    pub dissolution_span_attempted: [u64; 6],
+    pub dissolution_span_dissolved: [u64; 6],
     pub reference_only: u64,
     pub trimmed: u64,
     pub removed: u64,
@@ -464,6 +466,16 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
     let mut repeat_memo = RepeatMemo::new();
     let mut gap_cache = GapResolutionCache::new();
 
+    let span_bucket =
+        |query_span: usize, reference_span: usize| match query_span.max(reference_span) {
+            0..=32 => 0,
+            33..=64 => 1,
+            65..=100 => 2,
+            101..=256 => 3,
+            257..=1_024 => 4,
+            _ => 5,
+        };
+
     let mut left = 0usize;
     while left + 2 < anchors.len() {
         let limit = (left + 1 + max_run).min(anchors.len() - 1);
@@ -537,6 +549,9 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                         if continuous.score > bound
                             || (continuous.score == bound && continuous.gap_opens < min_gaps)
                         {
+                            let bucket = span_bucket(query_span, reference_span);
+                            stats.dissolution_span_attempted[bucket] += 1;
+                            stats.dissolution_span_dissolved[bucket] += 1;
                             stats.early_repeat_accepted += 1;
                             stats.candidate_runs_dp_attempted += 1;
                             stats.repeat_source_attempted[repeat_source as usize] += 1;
@@ -654,6 +669,9 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
             }
 
             stats.candidate_runs_dp_attempted = stats.candidate_runs_dp_attempted.saturating_add(1);
+            let span_bucket = span_bucket(query_span, reference_span);
+            stats.dissolution_span_attempted[span_bucket] =
+                stats.dissolution_span_attempted[span_bucket].saturating_add(1);
             stats.repeat_source_attempted[repeat_source as usize] =
                 stats.repeat_source_attempted[repeat_source as usize].saturating_add(1);
             let interior_bucket = (right - left - 1).saturating_sub(1).min(2);
@@ -707,6 +725,8 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
             if continuous_score > split_score
                 || (continuous_score == split_score && continuous.gap_opens < split_gaps)
             {
+                stats.dissolution_span_dissolved[span_bucket] =
+                    stats.dissolution_span_dissolved[span_bucket].saturating_add(1);
                 stats.dissolved_runs = stats.dissolved_runs.saturating_add(1);
                 stats.dissolved_anchors = stats
                     .dissolved_anchors

@@ -370,6 +370,14 @@ fn build_chain_cigar_with_policy<'a>(
         diagnostics.repeat_ambiguous_anchors_dissolved = diagnostics
             .repeat_ambiguous_anchors_dissolved
             .saturating_add(overlaps.repeat_ambiguous_anchors_dissolved);
+        for index in 0..6 {
+            diagnostics.dissolution_span_attempted[index] = diagnostics.dissolution_span_attempted
+                [index]
+                .saturating_add(overlaps.dissolution_span_attempted[index]);
+            diagnostics.dissolution_span_dissolved[index] = diagnostics.dissolution_span_dissolved
+                [index]
+                .saturating_add(overlaps.dissolution_span_dissolved[index]);
+        }
     }
 
     let first = anchors.first().ok_or(ChainCigarError::EmptyChain)?;
@@ -1990,6 +1998,8 @@ mod tests {
         assert_eq!(stats.dissolved_runs, 1);
         assert_eq!(stats.dissolved_anchors as usize, 4 - dissolved.len());
         assert_eq!(stats.repeat_ambiguous_anchors_dissolved, 2);
+        assert_eq!(stats.dissolution_span_attempted[2], 1);
+        assert_eq!(stats.dissolution_span_dissolved[2], 1);
         // The flanks are never candidates for removal.
         assert_eq!(dissolved.first().map(|a| a.q_start), Some(0));
         assert_eq!(dissolved.last().map(|a| a.q_end), Some(120));

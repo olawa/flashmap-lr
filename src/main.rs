@@ -1797,6 +1797,8 @@ struct ProfileReporter {
     repeat_ambiguous_anchors_discovered: AtomicU64,
     repeat_ambiguous_anchors_chained: AtomicU64,
     repeat_ambiguous_anchors_dissolved: AtomicU64,
+    dissolution_span_attempted: [AtomicU64; 6],
+    dissolution_span_dissolved: [AtomicU64; 6],
     chain_query_gap_buckets: [AtomicU64; 7],
     stage_a_anchors: AtomicU64,
     stage_bc_anchors: AtomicU64,
@@ -2193,6 +2195,16 @@ impl DiagnosticsSink for ProfileReporter {
                 Ordering::Relaxed,
             );
         }
+        for index in 0..6 {
+            self.dissolution_span_attempted[index].fetch_add(
+                diagnostics.dissolution_span_attempted[index],
+                Ordering::Relaxed,
+            );
+            self.dissolution_span_dissolved[index].fetch_add(
+                diagnostics.dissolution_span_dissolved[index],
+                Ordering::Relaxed,
+            );
+        }
         self.best_skipped_candidate_score.fetch_max(
             diagnostics.best_skipped_candidate_score.max(0) as u64,
             Ordering::Relaxed,
@@ -2535,6 +2547,24 @@ impl ProfileReporter {
                 100.0 * ambiguous_dissolved as f64 / dissolved.max(1) as f64,
                 100.0 * ambiguous_dissolved as f64 / ambiguous_chained.max(1) as f64,
             );
+            let span_attempted = std::array::from_fn::<_, 6, _>(|index| {
+                self.dissolution_span_attempted[index].load(Ordering::Relaxed)
+            });
+            let span_dissolved = std::array::from_fn::<_, 6, _>(|index| {
+                self.dissolution_span_dissolved[index].load(Ordering::Relaxed)
+            });
+            eprintln!("                         continuous span (attempted/dissolved):");
+            for (index, label) in ["<=32", "33-64", "65-100", "101-256", "257-1k", ">1k"]
+                .iter()
+                .enumerate()
+            {
+                eprintln!(
+                    "                           {label:<8} {:>10} / {:>8} ({:.2}%)",
+                    span_attempted[index],
+                    span_dissolved[index],
+                    100.0 * span_dissolved[index] as f64 / span_attempted[index].max(1) as f64,
+                );
+            }
             let repeat_attempted = std::array::from_fn::<_, 3, _>(|index| {
                 self.repeat_source_attempted[index].load(Ordering::Relaxed)
             });

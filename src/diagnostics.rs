@@ -152,6 +152,9 @@ pub struct ReadDiagnostics {
     pub repeat_ambiguous_anchors_discovered: u64,
     pub repeat_ambiguous_anchors_chained: u64,
     pub repeat_ambiguous_anchors_dissolved: u64,
+    /// Maximum query/reference span of continuous repeat-DP candidates.
+    pub dissolution_span_attempted: [u64; 6],
+    pub dissolution_span_dissolved: [u64; 6],
     pub stage_a_anchors: u32,
     pub stage_bc_anchors: u32,
     pub stage_a_query_bases: u64,
