@@ -878,9 +878,16 @@ impl<'a> Aligner<'a> {
             Some(&mut diagnostics),
         )
         .map_err(MapError::Cigar)?;
+        let mut primary = primary;
+        primary.mapq = calibrate_mapq_with_alignment(
+            primary.mapq,
+            primary.score,
+            primary.edit_distance,
+            &primary.cigar,
+        );
         let mut supplementary = Vec::new();
         for (supplementary_contig, supplementary_chain, supplementary_support) in
-            select_supplementary_chains(chain, placements.iter().skip(1), &self.policy.structural)
+            select_supplementary_chains(*contig_id, chain, placements.iter().skip(1), &self.policy.structural)
         {
             let contig = self
                 .reference
@@ -907,6 +914,11 @@ impl<'a> Aligner<'a> {
                                 )
                         })
                         .count();
+                    let span = supplementary_chain
+                        .q_end
+                        .saturating_sub(supplementary_chain.q_start) as f64;
+                    let span_fraction =
+                        (span / read.sequence.len().max(1) as f64).clamp(0.0, 1.0);
                     confidence_cap(mapping_quality_minimap2(
                         endpoint_rank_score(
                             supplementary_chain.score,
@@ -921,7 +933,7 @@ impl<'a> Aligner<'a> {
                                 .structural
                                 .max_supplementary_query_overlap_fraction,
                         ),
-                        1.0,
+                        span_fraction,
                         supplementary_chain.anchors.len(),
                         supplementary_chain.query_covered_bases,
                         competing_count,
@@ -951,7 +963,7 @@ impl<'a> Aligner<'a> {
                     ))
                 }
             };
-            let alignment = crate::alignment::build_chain_alignment_with_policy(
+            let mut alignment = crate::alignment::build_chain_alignment_with_policy(
                 read,
                 contig,
                 supplementary_chain,
@@ -963,6 +975,12 @@ impl<'a> Aligner<'a> {
                 Some(&mut diagnostics),
             )
             .map_err(MapError::Cigar)?;
+            alignment.mapq = calibrate_mapq_with_alignment(
+                alignment.mapq,
+                alignment.score,
+                alignment.edit_distance,
+                &alignment.cigar,
+            );
             supplementary.push(alignment);
         }
         let mut secondary = Vec::new();
@@ -2048,18 +2066,86 @@ fn chains_compete_for_query(left: &Chain, right: &Chain, max_split_overlap: f64)
     shorter_span == 0 || overlap as f64 / shorter_span as f64 > max_split_overlap
 }
 
+fn chains_compete_for_reference(
+    primary_contig: crate::ContigId,
+    primary: &Chain,
+    candidate_contig: crate::ContigId,
+    candidate: &Chain,
+    max_ref_overlap: f64,
+) -> bool {
+    if primary_contig != candidate_contig {
+        return false;
+    }
+    let Some(p_anc) = primary.anchors.first() else {
+        return false;
+    };
+    let Some(c_anc) = candidate.anchors.first() else {
+        return false;
+    };
+    if p_anc.strand != c_anc.strand {
+        return false;
+    }
+    let overlap = interval_overlap(
+        primary.ref_start as u32,
+        primary.ref_end as u32,
+        candidate.ref_start as u32,
+        candidate.ref_end as u32,
+    );
+    let shorter_ref_span = primary
+        .ref_end
+        .saturating_sub(primary.ref_start)
+        .min(candidate.ref_end.saturating_sub(candidate.ref_start)) as u32;
+    shorter_ref_span == 0 || overlap as f64 / shorter_ref_span as f64 > max_ref_overlap
+}
+
+fn calibrate_mapq_with_alignment(
+    raw_mapq: u8,
+    score: i32,
+    edit_distance: u32,
+    cigar: &crate::Cigar,
+) -> u8 {
+    if raw_mapq == 0 || score <= 0 {
+        return 0;
+    }
+    let aligned_len: u32 = cigar
+        .ops()
+        .iter()
+        .filter(|op| matches!(op, crate::CigarOp::Match(_) | crate::CigarOp::Ins(_) | crate::CigarOp::Del(_)))
+        .map(|op| op.len())
+        .sum();
+    if aligned_len == 0 {
+        return 0;
+    }
+    let divergence = edit_distance as f64 / aligned_len as f64;
+    let identity = (1.0 - divergence).clamp(0.0, 1.0);
+    if divergence > 0.02 {
+        let factor = (identity / 0.98).powi(2);
+        (raw_mapq as f64 * factor).round().clamp(0.0, 60.0) as u8
+    } else {
+        raw_mapq
+    }
+}
+
 fn select_supplementary_chains<'a>(
+    primary_contig: crate::ContigId,
     primary: &Chain,
     candidates: impl Iterator<Item = &'a ChainPlacement>,
     policy: &StructuralPolicy,
 ) -> Vec<(crate::ContigId, &'a Chain, EndpointSupport)> {
     let mut candidates = candidates
-        .filter(|(_, chain, _)| {
+        .filter(|(contig, chain, _)| {
             chain.query_covered_bases >= policy.min_supplementary_bases
                 && !chains_compete_for_query(
                     primary,
                     chain,
                     policy.max_supplementary_query_overlap_fraction,
+                )
+                && !chains_compete_for_reference(
+                    primary_contig,
+                    primary,
+                    *contig,
+                    chain,
+                    0.20,
                 )
         })
         .collect::<Vec<_>>();
@@ -2074,11 +2160,17 @@ fn select_supplementary_chains<'a>(
 
     let mut selected: Vec<(crate::ContigId, &'a Chain, EndpointSupport)> = Vec::new();
     for candidate in candidates {
-        if selected.iter().any(|(_, selected_chain, _)| {
+        if selected.iter().any(|(selected_contig, selected_chain, _)| {
             chains_compete_for_query(
                 selected_chain,
                 &candidate.1,
                 policy.max_supplementary_query_overlap_fraction,
+            ) || chains_compete_for_reference(
+                *selected_contig,
+                selected_chain,
+                candidate.0,
+                &candidate.1,
+                0.20,
             )
         }) {
             continue;
@@ -2320,11 +2412,45 @@ mod tests {
         let candidates = [disjoint, competing];
 
         let selected =
-            select_supplementary_chains(&primary, candidates.iter(), &structural_policy());
+            select_supplementary_chains(ContigId(0), &primary, candidates.iter(), &structural_policy());
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].0, ContigId(1));
         assert_eq!(selected[0].1.q_start, 0);
         assert_eq!(selected[0].1.q_end, 1_000);
+    }
+
+    #[test]
+    fn supplementary_selection_rejects_same_locus_tandem_repeats() {
+        let primary = placement_chain(ContigId(0), 0, 3_000, 10_000, Strand::Forward, 10_000);
+        // Tandem repeat unit in read (query 4000..7000) mapping to the same reference locus (ref 10050..13050)
+        let tandem_repeat = (
+            ContigId(0),
+            placement_chain(ContigId(0), 4_000, 7_000, 10_050, Strand::Forward, 10_000),
+            EndpointSupport::BothEnds,
+        );
+        let candidates = [tandem_repeat];
+        let selected =
+            select_supplementary_chains(ContigId(0), &primary, candidates.iter(), &structural_policy());
+        assert_eq!(selected.len(), 0, "tandem repeat matching same reference locus must not be supplementary");
+    }
+
+    #[test]
+    fn mapq_calibration_zeroes_negative_scores_and_dampens_divergence() {
+        let clean_cigar = crate::Cigar::new([crate::CigarOp::Match(10_000)]).unwrap();
+        // Negative score -> 0 MAPQ
+        assert_eq!(calibrate_mapq_with_alignment(60, -100, 50, &clean_cigar), 0);
+        assert_eq!(calibrate_mapq_with_alignment(50, 0, 50, &clean_cigar), 0);
+
+        // Clean read divergence <= 2% -> no penalty
+        assert_eq!(calibrate_mapq_with_alignment(60, 5000, 100, &clean_cigar), 60);
+
+        // Divergent read (10% mismatch) -> MAPQ dampened
+        let mapq_div10 = calibrate_mapq_with_alignment(60, 5000, 1000, &clean_cigar);
+        assert!(mapq_div10 < 60 && mapq_div10 > 40, "expected dampened MAPQ, got {mapq_div10}");
+
+        // Highly divergent read (30% mismatch) -> MAPQ heavily dampened
+        let mapq_div30 = calibrate_mapq_with_alignment(60, 5000, 3000, &clean_cigar);
+        assert!(mapq_div30 <= 32, "expected heavily dampened MAPQ, got {mapq_div30}");
     }
 
     #[test]
