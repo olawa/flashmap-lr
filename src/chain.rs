@@ -525,6 +525,7 @@ mod tests {
             q_end,
             strand,
             score,
+            repeat_ambiguous: false,
         }
     }
 

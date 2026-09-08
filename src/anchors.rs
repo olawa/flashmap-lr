@@ -34,6 +34,10 @@ pub struct Anchor {
     pub q_end: u32,
     pub strand: Strand,
     pub score: i32,
+    /// Another exact extension covers the same query sequence on a different
+    /// repeat-compatible diagonal. This is diagnostic metadata for now: it
+    /// does not change chaining, scoring, or alignment assembly.
+    pub repeat_ambiguous: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1095,12 +1099,28 @@ fn find_anchors_with_seed_hits_depth(
             .read_bases_scanned
             .saturating_add(read.sequence.len() as u64);
     }
-    Ok(deduplicate_anchors(
+    let mut anchors = deduplicate_anchors(
         raw_anchors,
         candidate,
         anchor_policy.max_anchors_per_region,
         anchor_policy.drop_single_axis_contained,
-    ))
+    );
+    if diagnostics
+        .as_deref()
+        .is_some_and(|diagnostics| diagnostics.profiling)
+    {
+        mark_repeat_register_ambiguity(&mut anchors, read.sequence);
+        if let Some(stats) = diagnostics {
+            stats.repeat_ambiguous_anchors_discovered =
+                stats.repeat_ambiguous_anchors_discovered.saturating_add(
+                    anchors
+                        .iter()
+                        .filter(|anchor| anchor.repeat_ambiguous)
+                        .count() as u64,
+                );
+        }
+    }
+    Ok(anchors)
 }
 
 /// Longest hit list a complete lookup will walk.
@@ -1485,6 +1505,7 @@ fn build_paired_emms_anchor(
             q_end: q_end as u32,
             strand: candidate.strand,
             score: length.saturating_sub(mismatches).min(i32::MAX as usize) as i32,
+            repeat_ambiguous: false,
         },
         mismatches,
     ))
@@ -1603,6 +1624,62 @@ fn extend_exact_anchor(request: ExactAnchorRequest<'_>) -> Option<Anchor> {
         q_end: q_end as u32,
         strand,
         score: length.min(i32::MAX as usize) as i32,
+        repeat_ambiguous: false,
+    })
+}
+
+/// Mark exact extensions whose query overlap can be placed on more than one
+/// repeat-compatible diagonal inside this candidate. A single extension
+/// cannot establish register ambiguity; the competing extension is the
+/// evidence, so this runs after discovery and before chaining.
+fn mark_repeat_register_ambiguity(anchors: &mut [Anchor], query: &[u8]) {
+    for left in 0..anchors.len() {
+        for right in left + 1..anchors.len() {
+            if anchors[right].q_start >= anchors[left].q_end {
+                break;
+            }
+            let overlap_start = anchors[left].q_start.max(anchors[right].q_start) as usize;
+            let overlap_end = anchors[left].q_end.min(anchors[right].q_end) as usize;
+            let overlap = overlap_end.saturating_sub(overlap_start);
+            let shorter = (anchors[left].q_end - anchors[left].q_start)
+                .min(anchors[right].q_end - anchors[right].q_start)
+                as usize;
+            if overlap < 6 || overlap.saturating_mul(2) < shorter {
+                continue;
+            }
+
+            let diagonal_delta =
+                anchor_diagonal(&anchors[left]).abs_diff(anchor_diagonal(&anchors[right]));
+            if diagonal_delta == 0 {
+                continue;
+            }
+            let Some(period) = repeat_period(&query[overlap_start..overlap_end]) else {
+                continue;
+            };
+            if !diagonal_delta.is_multiple_of(period as u64) {
+                continue;
+            }
+            anchors[left].repeat_ambiguous = true;
+            anchors[right].repeat_ambiguous = true;
+        }
+    }
+}
+
+fn repeat_period(sequence: &[u8]) -> Option<usize> {
+    if sequence.len() < 6 {
+        return None;
+    }
+    (1..=8).find(|&period| {
+        if sequence.len() <= period {
+            return false;
+        }
+        let total = sequence.len() - period;
+        let matches = sequence[period..]
+            .iter()
+            .zip(&sequence[..total])
+            .filter(|(left, right)| left.eq_ignore_ascii_case(right))
+            .count();
+        matches.saturating_mul(100) / total >= 75
     })
 }
 
@@ -2401,6 +2478,7 @@ mod containment_tests {
             q_end,
             strand: Strand::Forward,
             score: (q_end - q_start) as i32,
+            repeat_ambiguous: false,
         }
     }
 
@@ -2421,6 +2499,26 @@ mod containment_tests {
             score: 100,
             endpoint_support: crate::candidates::EndpointSupport::BothEnds,
         }
+    }
+
+    #[test]
+    fn marks_repeat_extensions_that_compete_on_different_diagonals() {
+        let query = b"ACACACACACACACACACACACAC";
+        let mut anchors = vec![anchor(0, 20, 100, 120), anchor(4, 24, 106, 126)];
+
+        mark_repeat_register_ambiguity(&mut anchors, query);
+
+        assert!(anchors.iter().all(|anchor| anchor.repeat_ambiguous));
+    }
+
+    #[test]
+    fn does_not_mark_different_diagonals_in_unique_sequence() {
+        let query = b"ACGTTGCACTGATCGTACGATGCA";
+        let mut anchors = vec![anchor(0, 20, 100, 120), anchor(4, 24, 106, 126)];
+
+        mark_repeat_register_ambiguity(&mut anchors, query);
+
+        assert!(anchors.iter().all(|anchor| !anchor.repeat_ambiguous));
     }
 
     /// A repeat-interior anchor covers reference the flank anchor already

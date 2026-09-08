@@ -146,6 +146,12 @@ pub struct ReadDiagnostics {
     pub dissolution_dp_nanos: u64,
     pub anchor_runs_dissolved: u64,
     pub anchors_dissolved: u64,
+    /// Shadow classifier counts for exact anchors that have a competing,
+    /// repeat-compatible extension on another diagonal. These flags do not
+    /// affect alignment output.
+    pub repeat_ambiguous_anchors_discovered: u64,
+    pub repeat_ambiguous_anchors_chained: u64,
+    pub repeat_ambiguous_anchors_dissolved: u64,
     pub stage_a_anchors: u32,
     pub stage_bc_anchors: u32,
     pub stage_a_query_bases: u64,

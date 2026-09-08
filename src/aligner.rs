@@ -1505,6 +1505,7 @@ fn try_exact_unique_chain(
                 q_end: read.len() as u32,
                 strand,
                 score: read.len().min(i32::MAX as usize) as i32,
+                repeat_ambiguous: false,
             };
             let chain = crate::chain::chain_anchors(vec![anchor], read.len(), 0).primary?;
             return Some((hit.contig, chain));
@@ -2384,6 +2385,7 @@ mod tests {
                 q_end,
                 strand,
                 score: length as i32,
+                repeat_ambiguous: false,
             }],
             read_len,
             0,

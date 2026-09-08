@@ -15,6 +15,7 @@ pub(super) struct OrientedAnchor {
     pub(super) q_end: usize,
     pub(super) ref_start: usize,
     pub(super) ref_end: usize,
+    pub(super) repeat_ambiguous: bool,
 }
 
 pub(super) fn chain_strand(chain: &Chain) -> Result<Strand, ChainCigarError> {
@@ -60,6 +61,7 @@ pub(super) fn orient_anchors(
             q_end,
             ref_start: anchor.ref_start as usize,
             ref_end: anchor.ref_end as usize,
+            repeat_ambiguous: anchor.repeat_ambiguous,
         });
     }
     oriented.sort_by_key(|anchor| (anchor.q_start, anchor.q_end, anchor.ref_start));
@@ -94,6 +96,7 @@ pub(super) struct OverlapStats {
     pub dissolution_dp_nanos: u64,
     pub dissolved_runs: u64,
     pub dissolved_anchors: u64,
+    pub repeat_ambiguous_anchors_dissolved: u64,
     pub reference_only: u64,
     pub trimmed: u64,
     pub removed: u64,
@@ -543,6 +546,11 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                             stats.interior_count_dissolved[bucket] += 1;
                             stats.dissolved_runs += 1;
                             stats.dissolved_anchors += (right - left - 1) as u64;
+                            stats.repeat_ambiguous_anchors_dissolved += anchors[left + 1..right]
+                                .iter()
+                                .filter(|anchor| anchor.repeat_ambiguous)
+                                .count()
+                                as u64;
                             if let Some(t0) = t0 {
                                 stats.dissolution_dp_nanos += t0.elapsed().as_nanos() as u64;
                             }
@@ -703,6 +711,13 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                 stats.dissolved_anchors = stats
                     .dissolved_anchors
                     .saturating_add((right - left - 1) as u64);
+                stats.repeat_ambiguous_anchors_dissolved =
+                    stats.repeat_ambiguous_anchors_dissolved.saturating_add(
+                        anchors[left + 1..right]
+                            .iter()
+                            .filter(|anchor| anchor.repeat_ambiguous)
+                            .count() as u64,
+                    );
                 if split_gap_segments == 1 {
                     stats.candidate_runs_single_gap_segment_dissolved = stats
                         .candidate_runs_single_gap_segment_dissolved
@@ -973,6 +988,7 @@ mod overlap_flank_tests {
             q_end,
             ref_start,
             ref_end,
+            repeat_ambiguous: false,
         }
     }
 

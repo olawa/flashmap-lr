@@ -1794,6 +1794,9 @@ struct ProfileReporter {
     dissolution_dp_nanos: AtomicU64,
     anchor_runs_dissolved: AtomicU64,
     anchors_dissolved: AtomicU64,
+    repeat_ambiguous_anchors_discovered: AtomicU64,
+    repeat_ambiguous_anchors_chained: AtomicU64,
+    repeat_ambiguous_anchors_dissolved: AtomicU64,
     chain_query_gap_buckets: [AtomicU64; 7],
     stage_a_anchors: AtomicU64,
     stage_bc_anchors: AtomicU64,
@@ -2157,6 +2160,18 @@ impl DiagnosticsSink for ProfileReporter {
                 diagnostics.anchor_runs_dissolved,
             ),
             (&self.anchors_dissolved, diagnostics.anchors_dissolved),
+            (
+                &self.repeat_ambiguous_anchors_discovered,
+                diagnostics.repeat_ambiguous_anchors_discovered,
+            ),
+            (
+                &self.repeat_ambiguous_anchors_chained,
+                diagnostics.repeat_ambiguous_anchors_chained,
+            ),
+            (
+                &self.repeat_ambiguous_anchors_dissolved,
+                diagnostics.repeat_ambiguous_anchors_dissolved,
+            ),
         ] {
             target.fetch_add(value, Ordering::Relaxed);
         }
@@ -2498,6 +2513,15 @@ impl ProfileReporter {
                 .load(Ordering::Relaxed);
             let runs = self.anchor_runs_dissolved.load(Ordering::Relaxed);
             let dissolved = self.anchors_dissolved.load(Ordering::Relaxed);
+            let ambiguous_discovered = self
+                .repeat_ambiguous_anchors_discovered
+                .load(Ordering::Relaxed);
+            let ambiguous_chained = self
+                .repeat_ambiguous_anchors_chained
+                .load(Ordering::Relaxed);
+            let ambiguous_dissolved = self
+                .repeat_ambiguous_anchors_dissolved
+                .load(Ordering::Relaxed);
             let nanos = self.dissolution_dp_nanos.load(Ordering::Relaxed);
             let secs = nanos as f64 / 1e9;
             eprintln!(
@@ -2505,6 +2529,11 @@ impl ProfileReporter {
             );
             eprintln!(
                 "                         continuous cache hits: {continuous_cache_hits}; one gap-bearing segment: {one_segment_attempted} attempted / {one_segment_dissolved} dissolved"
+            );
+            eprintln!(
+                "                         extension shadow: {ambiguous_discovered} ambiguous discovered, {ambiguous_chained} chained, {ambiguous_dissolved}/{dissolved} dissolved anchors predicted ({:.1}% anchor recall, {:.1}% chained precision)",
+                100.0 * ambiguous_dissolved as f64 / dissolved.max(1) as f64,
+                100.0 * ambiguous_dissolved as f64 / ambiguous_chained.max(1) as f64,
             );
             let repeat_attempted = std::array::from_fn::<_, 3, _>(|index| {
                 self.repeat_source_attempted[index].load(Ordering::Relaxed)

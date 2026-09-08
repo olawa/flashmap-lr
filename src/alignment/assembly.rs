@@ -257,6 +257,16 @@ fn build_chain_cigar_with_policy<'a>(
     scoring_policy: &ScoringPolicy,
     mut diagnostics: Option<&mut crate::ReadDiagnostics>,
 ) -> Result<(Cigar, usize, std::borrow::Cow<'a, [u8]>), ChainCigarError> {
+    if let Some(stats) = diagnostics.as_deref_mut() {
+        stats.repeat_ambiguous_anchors_chained =
+            stats.repeat_ambiguous_anchors_chained.saturating_add(
+                chain
+                    .anchors
+                    .iter()
+                    .filter(|anchor| anchor.repeat_ambiguous)
+                    .count() as u64,
+            );
+    }
     let oriented_query = oriented_query(read.sequence, chain_strand(chain)?);
     let gap_cache_scope = super::gap_cache::Scope::new(&oriented_query, contig.sequence);
     let mut overlaps = super::prepare::OverlapStats::default();
@@ -357,6 +367,9 @@ fn build_chain_cigar_with_policy<'a>(
         diagnostics.anchors_dissolved = diagnostics
             .anchors_dissolved
             .saturating_add(overlaps.dissolved_anchors);
+        diagnostics.repeat_ambiguous_anchors_dissolved = diagnostics
+            .repeat_ambiguous_anchors_dissolved
+            .saturating_add(overlaps.repeat_ambiguous_anchors_dissolved);
     }
 
     let first = anchors.first().ok_or(ChainCigarError::EmptyChain)?;
@@ -1275,6 +1288,7 @@ mod tests {
             q_end,
             strand,
             score: (q_end - q_start) as i32,
+            repeat_ambiguous: false,
         }
     }
 
@@ -1302,18 +1316,21 @@ mod tests {
                     q_end: 20,
                     ref_start: 0,
                     ref_end: 20,
+                    repeat_ambiguous: false,
                 },
                 OrientedAnchor {
                     q_start: 20,
                     q_end: 62,
                     ref_start: 22,
                     ref_end: 64,
+                    repeat_ambiguous: false,
                 },
                 OrientedAnchor {
                     q_start: 62,
                     q_end: 82,
                     ref_start: 66,
                     ref_end: 86,
+                    repeat_ambiguous: false,
                 },
             ];
             let mut stats = crate::ReadDiagnostics::default();
@@ -1491,18 +1508,21 @@ mod tests {
                 q_end: 20,
                 ref_start: 0,
                 ref_end: 20,
+                repeat_ambiguous: false,
             },
             OrientedAnchor {
                 q_start: 20,
                 q_end: 30,
                 ref_start: 100,
                 ref_end: 110,
+                repeat_ambiguous: false,
             },
             OrientedAnchor {
                 q_start: 30,
                 q_end: 40,
                 ref_start: 10,
                 ref_end: 20,
+                repeat_ambiguous: false,
             },
         ];
         let normalized = crate::alignment::prepare::normalize_anchor_overlaps(anchors);
@@ -1514,12 +1534,14 @@ mod tests {
                     q_end: 10,
                     ref_start: 0,
                     ref_end: 10,
+                    repeat_ambiguous: false,
                 },
                 OrientedAnchor {
                     q_start: 30,
                     q_end: 40,
                     ref_start: 10,
                     ref_end: 20,
+                    repeat_ambiguous: false,
                 },
             ]
         );
@@ -1916,24 +1938,28 @@ mod tests {
                 q_end: 30,
                 ref_start: 0,
                 ref_end: 30,
+                repeat_ambiguous: false,
             },
             OrientedAnchor {
                 q_start: 40,
                 q_end: 60,
                 ref_start: 34,
                 ref_end: 54,
+                repeat_ambiguous: true,
             },
             OrientedAnchor {
                 q_start: 70,
                 q_end: 90,
                 ref_start: 58,
                 ref_end: 78,
+                repeat_ambiguous: true,
             },
             OrientedAnchor {
                 q_start: 100,
                 q_end: 120,
                 ref_start: 80,
                 ref_end: 100,
+                repeat_ambiguous: false,
             },
         ];
 
@@ -1963,6 +1989,7 @@ mod tests {
         assert!(dissolved.len() < 4, "the interior anchors survived the DP");
         assert_eq!(stats.dissolved_runs, 1);
         assert_eq!(stats.dissolved_anchors as usize, 4 - dissolved.len());
+        assert_eq!(stats.repeat_ambiguous_anchors_dissolved, 2);
         // The flanks are never candidates for removal.
         assert_eq!(dissolved.first().map(|a| a.q_start), Some(0));
         assert_eq!(dissolved.last().map(|a| a.q_end), Some(120));
@@ -1980,18 +2007,21 @@ mod tests {
                 q_end: 20,
                 ref_start: 0,
                 ref_end: 20,
+                repeat_ambiguous: false,
             },
             OrientedAnchor {
                 q_start: 20,
                 q_end: 62,
                 ref_start: 22,
                 ref_end: 64,
+                repeat_ambiguous: true,
             },
             OrientedAnchor {
                 q_start: 62,
                 q_end: 82,
                 ref_start: 66,
                 ref_end: 86,
+                repeat_ambiguous: false,
             },
         ];
 
