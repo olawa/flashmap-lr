@@ -444,6 +444,15 @@ fn build_chain_cigar_with_policy<'a>(
         ref_start,
         reborrow_diagnostics(&mut diagnostics),
     );
+    polish_fragmented_indel_windows(
+        &mut repaired_ops,
+        &oriented_query,
+        contig.sequence,
+        ref_start,
+        gap_policy,
+        scoring_policy,
+        reborrow_diagnostics(&mut diagnostics),
+    );
     super::refine::deep_terminal_softclip_divergent_ends(
         &mut repaired_ops,
         &oriented_query,
@@ -1230,6 +1239,7 @@ enum GapDpKind {
     Small,
     Medium,
     Flank,
+    Polish,
 }
 
 fn run_gap_dp(
@@ -1274,9 +1284,220 @@ fn run_gap_dp(
                 stats.flank_dp_calls = stats.flank_dp_calls.saturating_add(1);
                 stats.flank_dp_nanos = stats.flank_dp_nanos.saturating_add(elapsed);
             }
+            GapDpKind::Polish => {}
         }
     }
     result.ok()
+}
+
+/// Realign only CIGAR windows that already exhibit a fragmented same-type
+/// indel in repeat sequence. Unlike anchor dissolution, this classifier runs
+/// after the ordinary gap path exists and therefore does no speculative DP
+/// for spans whose CIGAR contains no fragmentation.
+fn polish_fragmented_indel_windows(
+    ops: &mut Vec<CigarOp>,
+    query: &[u8],
+    reference: &[u8],
+    ref_start: usize,
+    gap_policy: &GapPolicy,
+    scoring: &ScoringPolicy,
+    mut diagnostics: Option<&mut crate::ReadDiagnostics>,
+) {
+    let max_matches = gap_policy.fragmented_indel_polish_window;
+    if max_matches == 0 || ops.len() < 5 {
+        return;
+    }
+    const FLANK: usize = 32;
+    const MIN_INDEL: usize = 4;
+    let started = diagnostics.is_some().then(std::time::Instant::now);
+    let mut first = 1usize;
+
+    while first + 2 < ops.len() {
+        let first_is_ins = match ops[first] {
+            CigarOp::Ins(_) => true,
+            CigarOp::Del(_) => false,
+            _ => {
+                first += 1;
+                continue;
+            }
+        };
+        if !matches!(ops[first - 1], CigarOp::Match(_)) {
+            first += 1;
+            continue;
+        }
+
+        let mut matched = 0usize;
+        let mut last = None;
+        let mut repeat_evidence = false;
+        let mut q_cursor = ops[..first]
+            .iter()
+            .filter(|op| op.consumes_query())
+            .map(|op| op.len() as usize)
+            .sum::<usize>();
+        let mut r_cursor = ref_start
+            + ops[..first]
+                .iter()
+                .filter(|op| op.consumes_reference())
+                .map(|op| op.len() as usize)
+                .sum::<usize>();
+        if first_is_ins {
+            q_cursor += ops[first].len() as usize;
+        } else {
+            r_cursor += ops[first].len() as usize;
+        }
+
+        let mut scan = first + 1;
+        while scan < ops.len() {
+            match ops[scan] {
+                CigarOp::Match(length) => {
+                    let length = length as usize;
+                    matched = matched.saturating_add(length);
+                    if matched > max_matches {
+                        break;
+                    }
+                    repeat_evidence |= query
+                        .get(q_cursor..q_cursor.saturating_add(length))
+                        .is_some_and(super::prepare::is_low_complexity_str)
+                        || reference
+                            .get(r_cursor..r_cursor.saturating_add(length))
+                            .is_some_and(super::prepare::is_low_complexity_str);
+                    q_cursor += length;
+                    r_cursor += length;
+                }
+                CigarOp::Ins(length) if first_is_ins => {
+                    q_cursor += length as usize;
+                    last = Some(scan);
+                }
+                CigarOp::Del(length) if !first_is_ins => {
+                    r_cursor += length as usize;
+                    last = Some(scan);
+                }
+                _ => break,
+            }
+            scan += 1;
+        }
+
+        let Some(last) = last.filter(|&last| {
+            ops[first..=last]
+                .iter()
+                .filter(|op| matches!(op, CigarOp::Ins(_) | CigarOp::Del(_)))
+                .map(|op| op.len() as usize)
+                .sum::<usize>()
+                >= MIN_INDEL
+                && repeat_evidence
+                && last + 1 < ops.len()
+                && matches!(ops[last + 1], CigarOp::Match(_))
+        }) else {
+            first += 1;
+            continue;
+        };
+        if let Some(stats) = diagnostics.as_deref_mut() {
+            stats.fragmented_polish_candidates =
+                stats.fragmented_polish_candidates.saturating_add(1);
+        }
+
+        let before = ops[first - 1].len() as usize;
+        let after = ops[last + 1].len() as usize;
+        let flank = FLANK.min(before).min(after);
+        if flank == 0 {
+            first += 1;
+            continue;
+        }
+        let q_before = ops[..first]
+            .iter()
+            .filter(|op| op.consumes_query())
+            .map(|op| op.len() as usize)
+            .sum::<usize>();
+        let r_before = ref_start
+            + ops[..first]
+                .iter()
+                .filter(|op| op.consumes_reference())
+                .map(|op| op.len() as usize)
+                .sum::<usize>();
+        let inner_q = ops[first..=last]
+            .iter()
+            .filter(|op| op.consumes_query())
+            .map(|op| op.len() as usize)
+            .sum::<usize>();
+        let inner_r = ops[first..=last]
+            .iter()
+            .filter(|op| op.consumes_reference())
+            .map(|op| op.len() as usize)
+            .sum::<usize>();
+        let q_start = q_before.saturating_sub(flank);
+        let r_start = r_before.saturating_sub(flank);
+        let q_end = q_before.saturating_add(inner_q).saturating_add(flank);
+        let r_end = r_before.saturating_add(inner_r).saturating_add(flank);
+        let (Some(q_slice), Some(r_slice)) =
+            (query.get(q_start..q_end), reference.get(r_start..r_end))
+        else {
+            first += 1;
+            continue;
+        };
+        let max_span = q_slice.len().max(r_slice.len());
+        if max_span > gap_policy.medium_gap_dp_max
+            || q_slice.len().saturating_mul(r_slice.len()) > 16_000_000
+        {
+            first += 1;
+            continue;
+        }
+
+        let mut original = Vec::with_capacity(last - first + 3);
+        original.push(CigarOp::Match(flank as u32));
+        original.extend_from_slice(&ops[first..=last]);
+        original.push(CigarOp::Match(flank as u32));
+        let original_score = scoring
+            .cigar_score(&original, q_slice, r_slice)
+            .unwrap_or(i32::MIN);
+        let original_gaps = super::prepare::count_gap_opens(&original);
+        let band = q_slice.len().abs_diff(r_slice.len()).saturating_add(32);
+        if let Some(stats) = diagnostics.as_deref_mut() {
+            stats.fragmented_polish_dp_attempted =
+                stats.fragmented_polish_dp_attempted.saturating_add(1);
+        }
+        let Some(alignment) = run_gap_dp(
+            q_slice,
+            r_slice,
+            band,
+            GapDpKind::Polish,
+            scoring,
+            diagnostics.as_deref_mut(),
+        ) else {
+            first += 1;
+            continue;
+        };
+        let polished = alignment.cigar.into_ops();
+        let polished_score = scoring
+            .cigar_score(&polished, q_slice, r_slice)
+            .unwrap_or(i32::MIN);
+        let polished_gaps = super::prepare::count_gap_opens(&polished);
+        if polished_score > original_score
+            || (polished_score == original_score && polished_gaps < original_gaps)
+        {
+            let mut replacement = Vec::with_capacity(polished.len() + 2);
+            if before > flank {
+                replacement.push(CigarOp::Match((before - flank) as u32));
+            }
+            replacement.extend(polished);
+            if after > flank {
+                replacement.push(CigarOp::Match((after - flank) as u32));
+            }
+            ops.splice(first - 1..=last + 1, replacement);
+            crate::types::normalize_cigar_ops(ops);
+            if let Some(stats) = diagnostics.as_deref_mut() {
+                stats.fragmented_polish_accepted =
+                    stats.fragmented_polish_accepted.saturating_add(1);
+            }
+            first = first.saturating_sub(2).max(1);
+        } else {
+            first += 1;
+        }
+    }
+    if let (Some(started), Some(stats)) = (started, diagnostics) {
+        stats.fragmented_polish_nanos = stats
+            .fragmented_polish_nanos
+            .saturating_add(crate::diagnostics::elapsed_nanos(started));
+    }
 }
 
 fn to_u32(value: usize) -> Result<u32, ChainCigarError> {
@@ -1934,6 +2155,47 @@ mod tests {
             .expect("test configuration resolves to an anchor policy");
         policy.gaps.dissolve_repeat_run = run;
         policy.gaps
+    }
+
+    #[test]
+    fn post_cigar_polishing_unifies_a_fragmented_repeat_deletion() {
+        let mut reference = b"GTCAGTACGATCGATGCTAGCTACGTCAGTAC".to_vec();
+        reference.extend_from_slice(&b"AC".repeat(20));
+        reference.extend_from_slice(b"TGCATCGATGACTGACCTAGCATGCTAGCATG");
+        let mut query = reference.clone();
+        query.drain(32..38);
+        let mut ops = vec![
+            CigarOp::Match(32),
+            CigarOp::Del(2),
+            CigarOp::Match(8),
+            CigarOp::Del(2),
+            CigarOp::Match(8),
+            CigarOp::Del(2),
+            CigarOp::Match(50),
+        ];
+        let mut gap_policy = dissolving_config(0);
+        gap_policy.fragmented_indel_polish_window = 32;
+        let scoring = gap_policy.scoring;
+        let mut stats = crate::ReadDiagnostics {
+            profiling: true,
+            ..crate::ReadDiagnostics::default()
+        };
+
+        polish_fragmented_indel_windows(
+            &mut ops,
+            &query,
+            &reference,
+            0,
+            &gap_policy,
+            &scoring,
+            Some(&mut stats),
+        );
+
+        assert_eq!(count_gap_opens(&ops), 1);
+        assert!(ops.contains(&CigarOp::Del(6)));
+        assert_eq!(stats.fragmented_polish_candidates, 1);
+        assert_eq!(stats.fragmented_polish_dp_attempted, 1);
+        assert_eq!(stats.fragmented_polish_accepted, 1);
     }
 
     #[test]

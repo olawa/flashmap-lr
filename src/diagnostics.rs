@@ -154,6 +154,10 @@ pub struct ReadDiagnostics {
     /// bucketed as 0, 1, or 2+.
     pub coordinate_delta_segments_attempted: [u64; 3],
     pub coordinate_delta_segments_dissolved: [u64; 3],
+    pub fragmented_polish_candidates: u64,
+    pub fragmented_polish_dp_attempted: u64,
+    pub fragmented_polish_accepted: u64,
+    pub fragmented_polish_nanos: u64,
     pub dissolution_dp_nanos: u64,
     pub anchor_runs_dissolved: u64,
     pub anchors_dissolved: u64,

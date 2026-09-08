@@ -41,6 +41,7 @@ struct Options {
     map_window: usize,
     island_lookback: Option<usize>,
     dissolve_repeat_run: Option<usize>,
+    fragmented_indel_polish_window: Option<usize>,
     overlap_flank: Option<usize>,
     overlap_flank_min: Option<usize>,
     drop_contained: bool,
@@ -124,6 +125,7 @@ impl Options {
         let mut map_window = 1usize;
         let mut island_lookback: Option<usize> = None;
         let mut dissolve_repeat_run: Option<usize> = None;
+        let mut fragmented_indel_polish_window: Option<usize> = None;
         let mut overlap_flank: Option<usize> = None;
         let mut overlap_flank_min: Option<usize> = None;
         let mut drop_contained = false;
@@ -239,6 +241,12 @@ impl Options {
                     dissolve_repeat_run = Some(parse_count(
                         next_value(&mut args, &argument)?,
                         "dissolve-repeat-anchors",
+                    )?);
+                }
+                "--polish-fragmented-indels" => {
+                    fragmented_indel_polish_window = Some(parse_count(
+                        next_value(&mut args, &argument)?,
+                        "polish-fragmented-indels",
                     )?);
                 }
                 "--sampled-anchors" => {
@@ -462,6 +470,7 @@ impl Options {
             map_window,
             island_lookback,
             dissolve_repeat_run,
+            fragmented_indel_polish_window,
             overlap_flank,
             overlap_flank_min,
             drop_contained,
@@ -630,6 +639,7 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--map-window",
     "--island-lookback",
     "--dissolve-repeat-anchors",
+    "--polish-fragmented-indels",
     "--overlap-flank",
     "--overlap-flank-min",
     "--drop-contained-anchors",
@@ -817,6 +827,9 @@ fn usage() -> &'static str {
         "                            an indel and the DP reads it at least as well. An\n",
         "                            expansion the scan filled with anchors otherwise\n",
         "                            comes out short or split (default: 4; 0 disables)\n",
+        "      --polish-fragmented-indels N\n",
+        "                            Realign repetitive CIGAR regions with same-type\n",
+        "                            indels separated by at most N matches (default: 0)\n",
         "      --map-window N        Window for the local map's minimizer selection.\n",
         "                            A wider window stores fewer positions (default: 1)\n",
         "      --sampled-anchors     Let a sampled hit list seed anchors inside a\n",
@@ -1012,6 +1025,10 @@ fn non_default_settings(options: &Options) -> Vec<String> {
         (options.dp_max_drift, "dp-max-drift"),
         (options.dp_min_drift, "dp-min-drift"),
         (options.dissolve_repeat_run, "dissolve-repeat-anchors"),
+        (
+            options.fragmented_indel_polish_window,
+            "polish-fragmented-indels",
+        ),
         (options.island_lookback, "island-lookback"),
         (options.anchor_k, "anchor-k"),
     ] {
@@ -1610,6 +1627,9 @@ fn execute_mapping(
                 dissolve_repeat_run: options
                     .dissolve_repeat_run
                     .unwrap_or(defaults.alignment.dissolve_repeat_run),
+                fragmented_indel_polish_window: options
+                    .fragmented_indel_polish_window
+                    .unwrap_or(defaults.alignment.fragmented_indel_polish_window),
                 overlap_flank: options
                     .overlap_flank
                     .unwrap_or(defaults.alignment.overlap_flank),
@@ -1855,6 +1875,10 @@ struct ProfileReporter {
     interior_count_dissolved: [AtomicU64; 3],
     coordinate_delta_segments_attempted: [AtomicU64; 3],
     coordinate_delta_segments_dissolved: [AtomicU64; 3],
+    fragmented_polish_candidates: AtomicU64,
+    fragmented_polish_dp_attempted: AtomicU64,
+    fragmented_polish_accepted: AtomicU64,
+    fragmented_polish_nanos: AtomicU64,
     dissolution_dp_nanos: AtomicU64,
     anchor_runs_dissolved: AtomicU64,
     anchors_dissolved: AtomicU64,
@@ -2250,6 +2274,22 @@ impl DiagnosticsSink for ProfileReporter {
             (
                 &self.repeat_ambiguous_anchors_dissolved,
                 diagnostics.repeat_ambiguous_anchors_dissolved,
+            ),
+            (
+                &self.fragmented_polish_candidates,
+                diagnostics.fragmented_polish_candidates,
+            ),
+            (
+                &self.fragmented_polish_dp_attempted,
+                diagnostics.fragmented_polish_dp_attempted,
+            ),
+            (
+                &self.fragmented_polish_accepted,
+                diagnostics.fragmented_polish_accepted,
+            ),
+            (
+                &self.fragmented_polish_nanos,
+                diagnostics.fragmented_polish_nanos,
             ),
         ] {
             target.fetch_add(value, Ordering::Relaxed);
@@ -2722,6 +2762,15 @@ impl ProfileReporter {
                 interior_dissolved[1],
                 interior_attempted[2],
                 interior_dissolved[2]
+            );
+        }
+        let polish_candidates = self.fragmented_polish_candidates.load(Ordering::Relaxed);
+        if polish_candidates > 0 {
+            let polish_attempted = self.fragmented_polish_dp_attempted.load(Ordering::Relaxed);
+            let polish_accepted = self.fragmented_polish_accepted.load(Ordering::Relaxed);
+            let polish_secs = self.fragmented_polish_nanos.load(Ordering::Relaxed) as f64 / 1e9;
+            eprintln!(
+                "  Fragmented polishing: {polish_candidates} CIGAR candidates, {polish_attempted} DPs, {polish_accepted} accepted, {polish_secs:.3} s"
             );
         }
         let sampled = self.sampled_lookups_admitted.load(Ordering::Relaxed);

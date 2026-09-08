@@ -265,6 +265,9 @@ pub struct AlignmentConfig {
     /// Zero leaves the behaviour unchanged; otherwise it is the longest run
     /// of anchors a single DP is allowed to replace.
     pub dissolve_repeat_run: usize,
+    /// Maximum total match span between same-type indels considered by the
+    /// post-CIGAR polishing pass. Zero disables it.
+    pub fragmented_indel_polish_window: usize,
     /// Bases to pull both anchors back from a resolved overlap, so the gap DP
     /// sees reference on both sides of the event instead of none.
     pub overlap_flank: usize,
@@ -325,6 +328,7 @@ impl Default for Config {
             alignment: AlignmentConfig {
                 island_chain_lookback: usize::MAX,
                 dissolve_repeat_run: 4,
+                fragmented_indel_polish_window: 0,
                 overlap_flank: 0,
                 overlap_flank_min: 0,
                 bridge_flank: 256,
@@ -599,6 +603,7 @@ pub(crate) struct GapPolicy {
     /// Longest run of chained anchors one continuous DP may replace, when
     /// the span they sit in carries an indel. Zero disables the pass.
     pub(crate) dissolve_repeat_run: usize,
+    pub(crate) fragmented_indel_polish_window: usize,
     /// Bases to pull both anchors back from a resolved overlap.
     ///
     /// Resolving an overlap by trimming the left anchor leaves the gap DP a
@@ -894,6 +899,8 @@ impl ResolvedMapperPolicy {
         policy.gaps.island_chain_lookback = config.alignment.island_chain_lookback;
         policy.max_secondary = config.alignment.max_secondary;
         policy.gaps.dissolve_repeat_run = config.alignment.dissolve_repeat_run;
+        policy.gaps.fragmented_indel_polish_window =
+            config.alignment.fragmented_indel_polish_window;
         policy.gaps.overlap_flank = config.alignment.overlap_flank;
         policy.gaps.overlap_flank_min = config.alignment.overlap_flank_min;
         policy.gaps.bridge_flank = config.alignment.bridge_flank;
@@ -1105,6 +1112,7 @@ impl ResolvedMapperPolicy {
             recursive_split_k: 13,
             island_chain_lookback: usize::MAX,
             dissolve_repeat_run: 4,
+            fragmented_indel_polish_window: 0,
             overlap_flank: 0,
             overlap_flank_min: 0,
             recursive_split_min_gap: 13,
@@ -1218,6 +1226,7 @@ impl ResolvedMapperPolicy {
                 mapq_mode: self.work_budget.mapq_mode,
                 island_chain_lookback: self.gaps.island_chain_lookback,
                 dissolve_repeat_run: self.gaps.dissolve_repeat_run,
+                fragmented_indel_polish_window: self.gaps.fragmented_indel_polish_window,
                 overlap_flank: self.gaps.overlap_flank,
                 overlap_flank_min: self.gaps.overlap_flank_min,
                 bridge_flank: self.gaps.bridge_flank,
