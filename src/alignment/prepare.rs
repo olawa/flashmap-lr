@@ -4,10 +4,10 @@ use super::assembly::{append_gap_with_policy, ChainCigarError};
 #[cfg(test)]
 use crate::config::ResolvedMapperPolicy;
 use crate::config::{GapPolicy, ScoringPolicy};
+use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt};
 #[cfg(test)]
 use crate::Config;
 use crate::{Chain, CigarOp, Contig, Strand};
-use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct OrientedAnchor {
@@ -80,6 +80,15 @@ pub(super) struct OverlapStats {
     pub candidate_runs_skipped_single_gap: u64,
     pub candidate_runs_dp_attempted: u64,
     pub gap_resolution_cache_hits: u64,
+    pub candidate_runs_rejected_score: u64,
+    pub candidate_runs_rejected_gap_count: u64,
+    pub candidate_runs_single_gap_segment_attempted: u64,
+    pub candidate_runs_single_gap_segment_dissolved: u64,
+    pub candidate_runs_continuous_cache_hits: u64,
+    pub repeat_source_attempted: [u64; 3],
+    pub repeat_source_dissolved: [u64; 3],
+    pub interior_count_attempted: [u64; 3],
+    pub interior_count_dissolved: [u64; 3],
     pub dissolution_dp_nanos: u64,
     pub dissolved_runs: u64,
     pub dissolved_anchors: u64,
@@ -204,7 +213,14 @@ pub(super) fn is_low_complexity_str(sequence: &[u8]) -> bool {
 
 type RepeatMemo = HashMap<(usize, usize), bool>;
 type GapKey = (usize, usize, usize, usize);
-type GapResolutionCache = HashMap<GapKey, Result<Vec<CigarOp>, ChainCigarError>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GapSummary {
+    score: i32,
+    gap_opens: usize,
+}
+
+type GapResolutionCache = HashMap<GapKey, Result<GapSummary, ChainCigarError>>;
 
 fn memoized_repeat(sequence: &[u8], memo: &mut RepeatMemo) -> bool {
     let key = (sequence.as_ptr() as usize, sequence.len());
@@ -214,8 +230,7 @@ fn memoized_repeat(sequence: &[u8], memo: &mut RepeatMemo) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_cached_gap(
-    ops: &mut Vec<CigarOp>,
+fn resolve_cached_gap(
     query: &[u8],
     reference: &[u8],
     query_start: usize,
@@ -223,19 +238,19 @@ fn append_cached_gap(
     ref_start: usize,
     ref_end: usize,
     gap_policy: &GapPolicy,
+    scoring_policy: &ScoringPolicy,
     cache: &mut GapResolutionCache,
     stats: &mut OverlapStats,
     diagnostics: Option<&mut crate::ReadDiagnostics>,
-) -> Result<(), ChainCigarError> {
+) -> Result<(GapSummary, bool), ChainCigarError> {
     let key = (query_start, query_end, ref_start, ref_end);
     if let Some(cached) = cache.get(&key) {
         stats.gap_resolution_cache_hits = stats.gap_resolution_cache_hits.saturating_add(1);
-        ops.extend_from_slice(cached.as_ref().map_err(|error| *error)?);
-        return Ok(());
+        return cached.map(|summary| (summary, true));
     }
-    let mut resolved = Vec::new();
+    let mut ops = Vec::new();
     let result = append_gap_with_policy(
-        &mut resolved,
+        &mut ops,
         query,
         reference,
         query_start,
@@ -245,10 +260,16 @@ fn append_cached_gap(
         gap_policy,
         diagnostics,
     )
-    .map(|_| resolved);
-    cache.insert(key, result.clone());
-    ops.extend_from_slice(result.as_ref().map_err(|error| *error)?);
-    Ok(())
+    .map(|_| {
+        let query_slice = query.get(query_start..query_end).unwrap_or_default();
+        let reference_slice = reference.get(ref_start..ref_end).unwrap_or_default();
+        GapSummary {
+            score: score_cigar_ops(&ops, query_slice, reference_slice, scoring_policy),
+            gap_opens: count_gap_opens(&ops),
+        }
+    });
+    cache.insert(key, result);
+    result.map(|summary| (summary, false))
 }
 
 /// Prove from coordinates and exact sequence equality that the pinned path
@@ -306,14 +327,21 @@ fn score_cigar_ops(
 
 /// Check if an anchor span contains repeat structure (STR, tandem repeat, homopolymer)
 /// either in the overall span, in any interior anchor, or in any indel gap.
-fn span_has_repeat_structure(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepeatSource {
+    InteriorAnchor = 0,
+    Gap = 1,
+    FullSpan = 2,
+}
+
+fn span_repeat_source(
     anchors: &[OrientedAnchor],
     left: usize,
     right: usize,
     query: &[u8],
     reference: &[u8],
     memo: &mut RepeatMemo,
-) -> bool {
+) -> Option<RepeatSource> {
     let (flank_left, flank_right) = (&anchors[left], &anchors[right]);
 
     // Check reusable interior anchors and gaps first. Overlapping candidate
@@ -321,12 +349,12 @@ fn span_has_repeat_structure(
     for a in &anchors[left + 1..right] {
         if let Some(seq) = query.get(a.q_start..a.q_end) {
             if memoized_repeat(seq, memo) {
-                return true;
+                return Some(RepeatSource::InteriorAnchor);
             }
         }
         if let Some(seq) = reference.get(a.ref_start..a.ref_end) {
             if memoized_repeat(seq, memo) {
-                return true;
+                return Some(RepeatSource::InteriorAnchor);
             }
         }
     }
@@ -340,12 +368,12 @@ fn span_has_repeat_structure(
         if q_gap != ref_gap || q_gap >= 8 || ref_gap >= 8 {
             if let Some(seq) = query.get(prev_q..a.q_start) {
                 if memoized_repeat(seq, memo) {
-                    return true;
+                    return Some(RepeatSource::Gap);
                 }
             }
             if let Some(seq) = reference.get(prev_ref..a.ref_start) {
                 if memoized_repeat(seq, memo) {
-                    return true;
+                    return Some(RepeatSource::Gap);
                 }
             }
         }
@@ -355,12 +383,13 @@ fn span_has_repeat_structure(
 
     // Full spans are pair-specific, so examine them only when their reusable
     // components did not already establish repeat structure.
-    query
+    (query
         .get(flank_left.q_end..flank_right.q_start)
         .is_some_and(|seq| memoized_repeat(seq, memo))
         || reference
             .get(flank_left.ref_end..flank_right.ref_start)
-            .is_some_and(|seq| memoized_repeat(seq, memo))
+            .is_some_and(|seq| memoized_repeat(seq, memo)))
+    .then_some(RepeatSource::FullSpan)
 }
 
 /// Replace a run of chained anchors with one continuous DP when the span they
@@ -431,9 +460,10 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                 continue;
             }
 
-            // Only evaluate candidate spans that contain repeat structure
-            if !span_has_repeat_structure(&anchors, left, right, query, reference, &mut repeat_memo)
-            {
+            // Only evaluate candidate spans that contain repeat structure.
+            let Some(repeat_source) =
+                span_repeat_source(&anchors, left, right, query, reference, &mut repeat_memo)
+            else {
                 stats.candidate_runs_skipped_repeat =
                     stats.candidate_runs_skipped_repeat.saturating_add(1);
                 if let Some(t0) = t0 {
@@ -442,28 +472,20 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                         .saturating_add(t0.elapsed().as_nanos() as u64);
                 }
                 continue;
-            }
-
-            let (Some(q_sub), Some(ref_sub)) = (
-                query.get(flank_left.q_end..flank_right.q_start),
-                reference.get(flank_left.ref_end..flank_right.ref_start),
-            ) else {
-                if let Some(t0) = t0 {
-                    stats.dissolution_dp_nanos = stats
-                        .dissolution_dp_nanos
-                        .saturating_add(t0.elapsed().as_nanos() as u64);
-                }
-                continue;
             };
 
-            // The path as chained: every interior anchor pinned, with the
-            // gaps between them resolved the way assembly would resolve them.
-            let mut split_ops = Vec::new();
+            // Score the chained path from cached gap summaries and exact
+            // interior anchors. This is identical to scoring one concatenated
+            // CIGAR, while avoiding a temporary CIGAR and another sequence
+            // traversal for every overlapping candidate span.
+            let mut split_score_sum = 0i64;
+            let mut split_score_valid = true;
+            let mut split_gaps = 0usize;
+            let mut split_gap_segments = 0usize;
             let mut cursor = (flank_left.q_end, flank_left.ref_end);
             let mut buildable = true;
             for anchor in &anchors[left + 1..right] {
-                if append_cached_gap(
-                    &mut split_ops,
+                let summary = resolve_cached_gap(
                     query,
                     reference,
                     cursor.0,
@@ -471,21 +493,36 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                     cursor.1,
                     anchor.ref_start,
                     gap_policy,
+                    scoring_policy,
                     &mut gap_cache,
                     stats,
                     diagnostics.as_deref_mut(),
-                )
-                .is_err()
-                {
+                );
+                match summary {
+                    Ok((summary, _)) => {
+                        split_score_valid &= summary.score != i32::MIN;
+                        split_score_sum += i64::from(summary.score);
+                        split_gaps += summary.gap_opens;
+                        split_gap_segments += usize::from(summary.gap_opens > 0);
+                    }
+                    Err(_) => {
+                        buildable = false;
+                        break;
+                    }
+                }
+                let (Some(anchor_query), Some(anchor_reference)) = (
+                    query.get(anchor.q_start..anchor.q_end),
+                    reference.get(anchor.ref_start..anchor.ref_end),
+                ) else {
                     buildable = false;
                     break;
-                }
-                split_ops.push(CigarOp::Match((anchor.q_end - anchor.q_start) as u32));
+                };
+                split_score_sum +=
+                    i64::from(scoring_policy.match_score_sum(anchor_query, anchor_reference));
                 cursor = (anchor.q_end, anchor.ref_end);
             }
-            if !buildable
-                || append_cached_gap(
-                    &mut split_ops,
+            let final_gap = buildable.then(|| {
+                resolve_cached_gap(
                     query,
                     reference,
                     cursor.0,
@@ -493,23 +530,31 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                     cursor.1,
                     flank_right.ref_start,
                     gap_policy,
+                    scoring_policy,
                     &mut gap_cache,
                     stats,
                     diagnostics.as_deref_mut(),
                 )
-                .is_err()
-            {
-                if let Some(t0) = t0 {
-                    stats.dissolution_dp_nanos = stats
-                        .dissolution_dp_nanos
-                        .saturating_add(t0.elapsed().as_nanos() as u64);
+            });
+            let final_gap = match final_gap {
+                Some(Ok((summary, _))) => summary,
+                _ => {
+                    if let Some(t0) = t0 {
+                        stats.dissolution_dp_nanos = stats
+                            .dissolution_dp_nanos
+                            .saturating_add(t0.elapsed().as_nanos() as u64);
+                    }
+                    continue;
                 }
-                continue;
-            }
+            };
+            split_score_valid &= final_gap.score != i32::MIN;
+            split_score_sum += i64::from(final_gap.score);
+            split_gaps += final_gap.gap_opens;
+            split_gap_segments += usize::from(final_gap.gap_opens > 0);
 
             // If split_ops has at most 1 gap open, the indel is not fragmented
             // across multiple gaps; continuous DP cannot reduce gap opens further.
-            if count_gap_opens(&split_ops) <= 1 {
+            if split_gaps <= 1 {
                 stats.candidate_runs_skipped_single_gap =
                     stats.candidate_runs_skipped_single_gap.saturating_add(1);
                 if let Some(t0) = t0 {
@@ -521,10 +566,18 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
             }
 
             stats.candidate_runs_dp_attempted = stats.candidate_runs_dp_attempted.saturating_add(1);
+            stats.repeat_source_attempted[repeat_source as usize] =
+                stats.repeat_source_attempted[repeat_source as usize].saturating_add(1);
+            let interior_bucket = (right - left - 1).saturating_sub(1).min(2);
+            stats.interior_count_attempted[interior_bucket] =
+                stats.interior_count_attempted[interior_bucket].saturating_add(1);
+            if split_gap_segments == 1 {
+                stats.candidate_runs_single_gap_segment_attempted = stats
+                    .candidate_runs_single_gap_segment_attempted
+                    .saturating_add(1);
+            }
 
-            let mut continuous_ops = Vec::new();
-            if append_cached_gap(
-                &mut continuous_ops,
+            let (continuous, continuous_was_cached) = if let Ok(summary) = resolve_cached_gap(
                 query,
                 reference,
                 flank_left.q_end,
@@ -532,22 +585,31 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                 flank_left.ref_end,
                 flank_right.ref_start,
                 gap_policy,
+                scoring_policy,
                 &mut gap_cache,
                 stats,
                 diagnostics.as_deref_mut(),
-            )
-            .is_err()
-            {
+            ) {
+                summary
+            } else {
                 if let Some(t0) = t0 {
                     stats.dissolution_dp_nanos = stats
                         .dissolution_dp_nanos
                         .saturating_add(t0.elapsed().as_nanos() as u64);
                 }
                 continue;
+            };
+            if continuous_was_cached {
+                stats.candidate_runs_continuous_cache_hits =
+                    stats.candidate_runs_continuous_cache_hits.saturating_add(1);
             }
 
-            let split_score = score_cigar_ops(&split_ops, q_sub, ref_sub, scoring_policy);
-            let continuous_score = score_cigar_ops(&continuous_ops, q_sub, ref_sub, scoring_policy);
+            let split_score = if split_score_valid {
+                split_score_sum.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+            } else {
+                i32::MIN
+            };
+            let continuous_score = continuous.score;
             if let Some(t0) = t0 {
                 stats.dissolution_dp_nanos = stats
                     .dissolution_dp_nanos
@@ -555,16 +617,30 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
             }
 
             if continuous_score > split_score
-                || (continuous_score == split_score
-                    && count_gap_opens(&continuous_ops) < count_gap_opens(&split_ops))
+                || (continuous_score == split_score && continuous.gap_opens < split_gaps)
             {
                 stats.dissolved_runs = stats.dissolved_runs.saturating_add(1);
                 stats.dissolved_anchors = stats
                     .dissolved_anchors
                     .saturating_add((right - left - 1) as u64);
+                if split_gap_segments == 1 {
+                    stats.candidate_runs_single_gap_segment_dissolved = stats
+                        .candidate_runs_single_gap_segment_dissolved
+                        .saturating_add(1);
+                }
+                stats.repeat_source_dissolved[repeat_source as usize] =
+                    stats.repeat_source_dissolved[repeat_source as usize].saturating_add(1);
+                stats.interior_count_dissolved[interior_bucket] =
+                    stats.interior_count_dissolved[interior_bucket].saturating_add(1);
                 anchors.drain(left + 1..right);
                 dissolved = true;
                 break;
+            } else if continuous_score < split_score {
+                stats.candidate_runs_rejected_score =
+                    stats.candidate_runs_rejected_score.saturating_add(1);
+            } else {
+                stats.candidate_runs_rejected_gap_count =
+                    stats.candidate_runs_rejected_gap_count.saturating_add(1);
             }
         }
         // A dissolved run can expose a longer one across the same flank, so
@@ -808,7 +884,7 @@ mod overlap_flank_tests {
             anchor(30, 40, 20, 30),
         ];
         assert!(!provably_single_gap_path(
-            &two_gaps, 0, 2, &query, &reference
+            &two_gaps, 0, 2, &query, &reference,
         ));
 
         let mut mismatching_query = query;
@@ -818,41 +894,100 @@ mod overlap_flank_tests {
             0,
             2,
             &mismatching_query,
-            &reference
+            &reference,
         ));
     }
 
     #[test]
-    fn resolved_gaps_are_reused_verbatim() {
+    fn resolved_gap_summaries_are_reused_verbatim() {
         let query = vec![b'A'; 20];
         let reference = vec![b'A'; 15];
-        let policy = ResolvedMapperPolicy::from_legacy_config(&Config::default())
-            .unwrap()
-            .gaps;
+        let policy = ResolvedMapperPolicy::from_legacy_config(&Config::default()).unwrap();
         let mut cache = GapResolutionCache::new();
         let mut stats = OverlapStats::default();
-        let mut first = Vec::new();
-        append_cached_gap(
-            &mut first, &query, &reference, 5, 10, 5, 5, &policy, &mut cache, &mut stats, None,
-        )
-        .unwrap();
-        let mut second = Vec::new();
-        append_cached_gap(
-            &mut second,
+        let (first, first_cached) = resolve_cached_gap(
             &query,
             &reference,
             5,
             10,
             5,
             5,
-            &policy,
+            &policy.gaps,
+            &policy.scoring,
+            &mut cache,
+            &mut stats,
+            None,
+        )
+        .unwrap();
+        let (second, second_cached) = resolve_cached_gap(
+            &query,
+            &reference,
+            5,
+            10,
+            5,
+            5,
+            &policy.gaps,
+            &policy.scoring,
             &mut cache,
             &mut stats,
             None,
         )
         .unwrap();
         assert_eq!(first, second);
+        assert_eq!(first.gap_opens, 1);
+        assert!(!first_cached);
+        assert!(second_cached);
         assert_eq!(stats.gap_resolution_cache_hits, 1);
+    }
+
+    #[test]
+    fn split_gap_summary_score_equals_materialized_cigar_score() {
+        let query = vec![b'A'; 20];
+        let reference = vec![b'A'; 20];
+        let policy = ResolvedMapperPolicy::from_legacy_config(&Config::default()).unwrap();
+        let mut cache = GapResolutionCache::new();
+        let mut stats = OverlapStats::default();
+        let (left, _) = resolve_cached_gap(
+            &query,
+            &reference,
+            5,
+            8,
+            5,
+            5,
+            &policy.gaps,
+            &policy.scoring,
+            &mut cache,
+            &mut stats,
+            None,
+        )
+        .unwrap();
+        let (right, _) = resolve_cached_gap(
+            &query,
+            &reference,
+            13,
+            13,
+            10,
+            12,
+            &policy.gaps,
+            &policy.scoring,
+            &mut cache,
+            &mut stats,
+            None,
+        )
+        .unwrap();
+        let summarized = left.score
+            + policy
+                .scoring
+                .match_score_sum(&query[8..13], &reference[5..10])
+            + right.score;
+        let materialized = score_cigar_ops(
+            &[CigarOp::Ins(3), CigarOp::Match(5), CigarOp::Del(2)],
+            &query[5..13],
+            &reference[5..12],
+            &policy.scoring,
+        );
+        assert_eq!(summarized, materialized);
+        assert_eq!(left.gap_opens + right.gap_opens, 2);
     }
 
     /// The two flanks of an expansion overlap on the reference. Trimming

@@ -319,6 +319,33 @@ fn build_chain_cigar_with_policy<'a>(
         diagnostics.dissolution_gap_cache_hits = diagnostics
             .dissolution_gap_cache_hits
             .saturating_add(overlaps.gap_resolution_cache_hits);
+        diagnostics.anchor_runs_rejected_score = diagnostics
+            .anchor_runs_rejected_score
+            .saturating_add(overlaps.candidate_runs_rejected_score);
+        diagnostics.anchor_runs_rejected_gap_count = diagnostics
+            .anchor_runs_rejected_gap_count
+            .saturating_add(overlaps.candidate_runs_rejected_gap_count);
+        diagnostics.anchor_runs_single_gap_segment_attempted = diagnostics
+            .anchor_runs_single_gap_segment_attempted
+            .saturating_add(overlaps.candidate_runs_single_gap_segment_attempted);
+        diagnostics.anchor_runs_single_gap_segment_dissolved = diagnostics
+            .anchor_runs_single_gap_segment_dissolved
+            .saturating_add(overlaps.candidate_runs_single_gap_segment_dissolved);
+        diagnostics.anchor_runs_continuous_cache_hits = diagnostics
+            .anchor_runs_continuous_cache_hits
+            .saturating_add(overlaps.candidate_runs_continuous_cache_hits);
+        for index in 0..3 {
+            diagnostics.repeat_source_attempted[index] = diagnostics.repeat_source_attempted[index]
+                .saturating_add(overlaps.repeat_source_attempted[index]);
+            diagnostics.repeat_source_dissolved[index] = diagnostics.repeat_source_dissolved[index]
+                .saturating_add(overlaps.repeat_source_dissolved[index]);
+            diagnostics.interior_count_attempted[index] = diagnostics.interior_count_attempted
+                [index]
+                .saturating_add(overlaps.interior_count_attempted[index]);
+            diagnostics.interior_count_dissolved[index] = diagnostics.interior_count_dissolved
+                [index]
+                .saturating_add(overlaps.interior_count_dissolved[index]);
+        }
         diagnostics.dissolution_dp_nanos = diagnostics
             .dissolution_dp_nanos
             .saturating_add(overlaps.dissolution_dp_nanos);

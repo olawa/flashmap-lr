@@ -1780,6 +1780,15 @@ struct ProfileReporter {
     anchor_runs_skipped_single_gap: AtomicU64,
     anchor_runs_dp_attempted: AtomicU64,
     dissolution_gap_cache_hits: AtomicU64,
+    anchor_runs_rejected_score: AtomicU64,
+    anchor_runs_rejected_gap_count: AtomicU64,
+    anchor_runs_single_gap_segment_attempted: AtomicU64,
+    anchor_runs_single_gap_segment_dissolved: AtomicU64,
+    anchor_runs_continuous_cache_hits: AtomicU64,
+    repeat_source_attempted: [AtomicU64; 3],
+    repeat_source_dissolved: [AtomicU64; 3],
+    interior_count_attempted: [AtomicU64; 3],
+    interior_count_dissolved: [AtomicU64; 3],
     dissolution_dp_nanos: AtomicU64,
     anchor_runs_dissolved: AtomicU64,
     anchors_dissolved: AtomicU64,
@@ -2112,6 +2121,26 @@ impl DiagnosticsSink for ProfileReporter {
                 &self.dissolution_gap_cache_hits,
                 diagnostics.dissolution_gap_cache_hits,
             ),
+            (
+                &self.anchor_runs_rejected_score,
+                diagnostics.anchor_runs_rejected_score,
+            ),
+            (
+                &self.anchor_runs_rejected_gap_count,
+                diagnostics.anchor_runs_rejected_gap_count,
+            ),
+            (
+                &self.anchor_runs_single_gap_segment_attempted,
+                diagnostics.anchor_runs_single_gap_segment_attempted,
+            ),
+            (
+                &self.anchor_runs_single_gap_segment_dissolved,
+                diagnostics.anchor_runs_single_gap_segment_dissolved,
+            ),
+            (
+                &self.anchor_runs_continuous_cache_hits,
+                diagnostics.anchor_runs_continuous_cache_hits,
+            ),
             (&self.dissolution_dp_nanos, diagnostics.dissolution_dp_nanos),
             (
                 &self.anchor_runs_dissolved,
@@ -2120,6 +2149,24 @@ impl DiagnosticsSink for ProfileReporter {
             (&self.anchors_dissolved, diagnostics.anchors_dissolved),
         ] {
             target.fetch_add(value, Ordering::Relaxed);
+        }
+        for index in 0..3 {
+            self.repeat_source_attempted[index].fetch_add(
+                diagnostics.repeat_source_attempted[index],
+                Ordering::Relaxed,
+            );
+            self.repeat_source_dissolved[index].fetch_add(
+                diagnostics.repeat_source_dissolved[index],
+                Ordering::Relaxed,
+            );
+            self.interior_count_attempted[index].fetch_add(
+                diagnostics.interior_count_attempted[index],
+                Ordering::Relaxed,
+            );
+            self.interior_count_dissolved[index].fetch_add(
+                diagnostics.interior_count_dissolved[index],
+                Ordering::Relaxed,
+            );
         }
         self.best_skipped_candidate_score.fetch_max(
             diagnostics.best_skipped_candidate_score.max(0) as u64,
@@ -2423,12 +2470,56 @@ impl ProfileReporter {
             let skipped_gap = self.anchor_runs_skipped_single_gap.load(Ordering::Relaxed);
             let attempted = self.anchor_runs_dp_attempted.load(Ordering::Relaxed);
             let cache_hits = self.dissolution_gap_cache_hits.load(Ordering::Relaxed);
+            let rejected_score = self.anchor_runs_rejected_score.load(Ordering::Relaxed);
+            let rejected_gaps = self.anchor_runs_rejected_gap_count.load(Ordering::Relaxed);
+            let one_segment_attempted = self
+                .anchor_runs_single_gap_segment_attempted
+                .load(Ordering::Relaxed);
+            let one_segment_dissolved = self
+                .anchor_runs_single_gap_segment_dissolved
+                .load(Ordering::Relaxed);
+            let continuous_cache_hits = self
+                .anchor_runs_continuous_cache_hits
+                .load(Ordering::Relaxed);
             let runs = self.anchor_runs_dissolved.load(Ordering::Relaxed);
             let dissolved = self.anchors_dissolved.load(Ordering::Relaxed);
             let nanos = self.dissolution_dp_nanos.load(Ordering::Relaxed);
             let secs = nanos as f64 / 1e9;
             eprintln!(
-                "  Repeat dissolution:    {considered} candidate spans ({skipped_rep} non-repeat, {skipped_gap} single-gap skipped), {attempted} continuous paths ({cache_hits} gap-cache hits; {runs} dissolved, {dissolved} anchors dropped), {secs:.3} s"
+                "  Repeat dissolution:    {considered} candidate spans ({skipped_rep} non-repeat, {skipped_gap} single-gap skipped), {attempted} continuous paths ({cache_hits} gap-cache hits; {runs} dissolved, {rejected_score} lower-score, {rejected_gaps} no gap reduction; {dissolved} anchors dropped), {secs:.3} s"
+            );
+            eprintln!(
+                "                         continuous cache hits: {continuous_cache_hits}; one gap-bearing segment: {one_segment_attempted} attempted / {one_segment_dissolved} dissolved"
+            );
+            let repeat_attempted = std::array::from_fn::<_, 3, _>(|index| {
+                self.repeat_source_attempted[index].load(Ordering::Relaxed)
+            });
+            let repeat_dissolved = std::array::from_fn::<_, 3, _>(|index| {
+                self.repeat_source_dissolved[index].load(Ordering::Relaxed)
+            });
+            eprintln!(
+                "                         repeat evidence (attempted/dissolved): interior {}/{}, gap {}/{}, full-span only {}/{}",
+                repeat_attempted[0],
+                repeat_dissolved[0],
+                repeat_attempted[1],
+                repeat_dissolved[1],
+                repeat_attempted[2],
+                repeat_dissolved[2]
+            );
+            let interior_attempted = std::array::from_fn::<_, 3, _>(|index| {
+                self.interior_count_attempted[index].load(Ordering::Relaxed)
+            });
+            let interior_dissolved = std::array::from_fn::<_, 3, _>(|index| {
+                self.interior_count_dissolved[index].load(Ordering::Relaxed)
+            });
+            eprintln!(
+                "                         interior anchors (attempted/dissolved): 1 {}/{}, 2 {}/{}, 3+ {}/{}",
+                interior_attempted[0],
+                interior_dissolved[0],
+                interior_attempted[1],
+                interior_dissolved[1],
+                interior_attempted[2],
+                interior_dissolved[2]
             );
         }
         let sampled = self.sampled_lookups_admitted.load(Ordering::Relaxed);
