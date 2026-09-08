@@ -80,6 +80,8 @@ pub(super) struct OverlapStats {
     pub candidate_runs_skipped_single_gap: u64,
     pub candidate_runs_dp_attempted: u64,
     pub gap_resolution_cache_hits: u64,
+    pub early_repeat_attempts: u64,
+    pub early_repeat_accepted: u64,
     pub candidate_runs_rejected_score: u64,
     pub candidate_runs_rejected_gap_count: u64,
     pub candidate_runs_single_gap_segment_attempted: u64,
@@ -221,6 +223,39 @@ struct GapSummary {
 }
 
 type GapResolutionCache = HashMap<GapKey, Result<GapSummary, ChainCigarError>>;
+
+/// Optimistic score for a pinned path: every paired base matches, and each
+/// length-changing gap pays only its minimum affine cost. Nonnegative gap
+/// costs are subadditive for both supported affine models. Extra mismatches
+/// or opposing gaps can only lower this bound.
+fn pinned_score_bound(anchors: &[OrientedAnchor], scoring: &ScoringPolicy) -> Option<(i32, usize)> {
+    if scoring.match_score < 0
+        || scoring.mismatch_penalty < 0
+        || scoring.gap_open < 0
+        || scoring.gap_extend < 0
+        || (scoring.dual_affine && (scoring.gap_open2 < 0 || scoring.gap_extend2 < 0))
+    {
+        return None;
+    }
+    let mut score = 0i64;
+    let mut gaps = 0;
+    for pair in anchors.windows(2) {
+        let q = pair[1].q_start.checked_sub(pair[0].q_end)?;
+        let r = pair[1].ref_start.checked_sub(pair[0].ref_end)?;
+        score += q.min(r) as i64 * i64::from(scoring.match_score)
+            - i64::from(scoring.gap_cost(q.abs_diff(r)));
+        gaps += usize::from(q != r);
+    }
+    for anchor in &anchors[1..anchors.len() - 1] {
+        let q = anchor.q_end.checked_sub(anchor.q_start)?;
+        let r = anchor.ref_end.checked_sub(anchor.ref_start)?;
+        if q != r {
+            return None;
+        }
+        score += q as i64 * i64::from(scoring.match_score);
+    }
+    Some((i32::try_from(score).ok()?, gaps))
+}
 
 fn memoized_repeat(sequence: &[u8], memo: &mut RepeatMemo) -> bool {
     let key = (sequence.as_ptr() as usize, sequence.len());
@@ -473,6 +508,51 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                 }
                 continue;
             };
+
+            // Try a local, unpinned alignment first only where repeat anchors
+            // and at least two register changes identify a fragmented event.
+            // A certified improvement needs no split-path DP at all.
+            if repeat_source == RepeatSource::InteriorAnchor {
+                if let Some((bound, min_gaps)) =
+                    pinned_score_bound(&anchors[left..=right], scoring_policy)
+                        .filter(|(_, gaps)| *gaps >= 2)
+                {
+                    stats.early_repeat_attempts += 1;
+                    if let Ok((continuous, _)) = resolve_cached_gap(
+                        query,
+                        reference,
+                        flank_left.q_end,
+                        flank_right.q_start,
+                        flank_left.ref_end,
+                        flank_right.ref_start,
+                        gap_policy,
+                        scoring_policy,
+                        &mut gap_cache,
+                        stats,
+                        diagnostics.as_deref_mut(),
+                    ) {
+                        if continuous.score > bound
+                            || (continuous.score == bound && continuous.gap_opens < min_gaps)
+                        {
+                            stats.early_repeat_accepted += 1;
+                            stats.candidate_runs_dp_attempted += 1;
+                            stats.repeat_source_attempted[repeat_source as usize] += 1;
+                            stats.repeat_source_dissolved[repeat_source as usize] += 1;
+                            let bucket = (right - left - 2).min(2);
+                            stats.interior_count_attempted[bucket] += 1;
+                            stats.interior_count_dissolved[bucket] += 1;
+                            stats.dissolved_runs += 1;
+                            stats.dissolved_anchors += (right - left - 1) as u64;
+                            if let Some(t0) = t0 {
+                                stats.dissolution_dp_nanos += t0.elapsed().as_nanos() as u64;
+                            }
+                            anchors.drain(left + 1..right);
+                            dissolved = true;
+                            break;
+                        }
+                    }
+                }
+            }
 
             // Score the chained path from cached gap summaries and exact
             // interior anchors. This is identical to scoring one concatenated
@@ -851,6 +931,41 @@ pub(crate) fn oriented_query(sequence: &[u8], strand: Strand) -> std::borrow::Co
 #[cfg(test)]
 mod overlap_flank_tests {
     use super::*;
+
+    #[test]
+    fn repeat_expansion_is_certified_before_split_alignment() {
+        for dual_affine in [false, true] {
+            let mut config = Config::default();
+            config.alignment.dual_affine = dual_affine;
+            let policy = ResolvedMapperPolicy::from_legacy_config(&config).unwrap();
+            let anchors = vec![
+                anchor(0, 4, 0, 4),
+                anchor(6, 14, 4, 12),
+                anchor(16, 24, 12, 20),
+            ];
+            let query = vec![b'A'; 24];
+            let reference = vec![b'A'; 20];
+            let (bound, gaps) = pinned_score_bound(&anchors, &policy.scoring).unwrap();
+            let split = [CigarOp::Ins(2), CigarOp::Match(8), CigarOp::Ins(2)];
+            assert_eq!(
+                bound,
+                score_cigar_ops(&split, &query[4..16], &reference[4..12], &policy.scoring)
+            );
+            assert_eq!(gaps, 2);
+            let mut stats = OverlapStats::default();
+            let kept = dissolve_indel_spanning_anchor_runs(
+                anchors,
+                &query,
+                &reference,
+                &policy.gaps,
+                &policy.scoring,
+                &mut stats,
+                None,
+            );
+            assert_eq!(kept.len(), 2);
+            assert_eq!(stats.early_repeat_accepted, 1);
+        }
+    }
 
     fn anchor(q_start: usize, q_end: usize, ref_start: usize, ref_end: usize) -> OrientedAnchor {
         OrientedAnchor {

@@ -1780,6 +1780,8 @@ struct ProfileReporter {
     anchor_runs_skipped_single_gap: AtomicU64,
     anchor_runs_dp_attempted: AtomicU64,
     dissolution_gap_cache_hits: AtomicU64,
+    early_repeat_attempts: AtomicU64,
+    early_repeat_accepted: AtomicU64,
     anchor_runs_rejected_score: AtomicU64,
     anchor_runs_rejected_gap_count: AtomicU64,
     anchor_runs_single_gap_segment_attempted: AtomicU64,
@@ -2143,6 +2145,14 @@ impl DiagnosticsSink for ProfileReporter {
             ),
             (&self.dissolution_dp_nanos, diagnostics.dissolution_dp_nanos),
             (
+                &self.early_repeat_attempts,
+                diagnostics.early_repeat_attempts,
+            ),
+            (
+                &self.early_repeat_accepted,
+                diagnostics.early_repeat_accepted,
+            ),
+            (
                 &self.anchor_runs_dissolved,
                 diagnostics.anchor_runs_dissolved,
             ),
@@ -2466,6 +2476,11 @@ impl ProfileReporter {
         }
         let considered = self.anchor_runs_considered.load(Ordering::Relaxed);
         if considered > 0 {
+            eprintln!(
+                "  Early repeat alignment: {} attempts / {} certified without split DP",
+                self.early_repeat_attempts.load(Ordering::Relaxed),
+                self.early_repeat_accepted.load(Ordering::Relaxed)
+            );
             let skipped_rep = self.anchor_runs_skipped_repeat.load(Ordering::Relaxed);
             let skipped_gap = self.anchor_runs_skipped_single_gap.load(Ordering::Relaxed);
             let attempted = self.anchor_runs_dp_attempted.load(Ordering::Relaxed);

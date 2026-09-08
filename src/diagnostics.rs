@@ -132,6 +132,8 @@ pub struct ReadDiagnostics {
     pub anchor_runs_skipped_single_gap: u64,
     pub anchor_runs_dp_attempted: u64,
     pub dissolution_gap_cache_hits: u64,
+    pub early_repeat_attempts: u64,
+    pub early_repeat_accepted: u64,
     pub anchor_runs_rejected_score: u64,
     pub anchor_runs_rejected_gap_count: u64,
     pub anchor_runs_single_gap_segment_attempted: u64,

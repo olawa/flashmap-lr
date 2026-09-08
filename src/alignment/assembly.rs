@@ -319,6 +319,8 @@ fn build_chain_cigar_with_policy<'a>(
         diagnostics.dissolution_gap_cache_hits = diagnostics
             .dissolution_gap_cache_hits
             .saturating_add(overlaps.gap_resolution_cache_hits);
+        diagnostics.early_repeat_attempts += overlaps.early_repeat_attempts;
+        diagnostics.early_repeat_accepted += overlaps.early_repeat_accepted;
         diagnostics.anchor_runs_rejected_score = diagnostics
             .anchor_runs_rejected_score
             .saturating_add(overlaps.candidate_runs_rejected_score);
