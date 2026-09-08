@@ -807,6 +807,7 @@ fn find_anchors_with_seed_hits_depth(
     let snp_emms_anchors = std::cell::Cell::new(0u32);
     let snp_emms_bases = std::cell::Cell::new(0u64);
     let snp_emms_mismatches = std::cell::Cell::new(0u64);
+    let snp_emms_indel_ambiguous_stops = std::cell::Cell::new(0u64);
     let local_frequency_buckets: [std::cell::Cell<u64>; 7] =
         std::array::from_fn(|_| std::cell::Cell::new(0));
     // The clustering already found this: `diagonal_mean` is the mean of
@@ -933,15 +934,20 @@ fn find_anchors_with_seed_hits_depth(
                 };
                 let extension = match anchor_policy.extension_mode {
                     AnchorExtensionMode::Exact => {
-                        extend_exact_anchor(request).map(|anchor| (anchor, 0))
+                        extend_exact_anchor(request).map(|anchor| (anchor, 0, 0))
                     }
                     AnchorExtensionMode::SnpEmms => {
                         extend_snp_emms_anchor(request, anchor_policy.snp_emms_relock_span)
                     }
                 };
-                let Some((anchor, snp_mismatches)) = extension else {
+                let Some((anchor, snp_mismatches, indel_ambiguous_stops)) = extension else {
                     continue;
                 };
+                snp_emms_indel_ambiguous_stops.set(
+                    snp_emms_indel_ambiguous_stops
+                        .get()
+                        .saturating_add(indel_ambiguous_stops as u64),
+                );
                 if snp_mismatches > 0 {
                     snp_emms_anchors.set(snp_emms_anchors.get().saturating_add(1));
                     snp_emms_bases.set(
@@ -1122,6 +1128,9 @@ fn find_anchors_with_seed_hits_depth(
         stats.snp_emms_mismatches = stats
             .snp_emms_mismatches
             .saturating_add(snp_emms_mismatches.get());
+        stats.snp_emms_indel_ambiguous_stops = stats
+            .snp_emms_indel_ambiguous_stops
+            .saturating_add(snp_emms_indel_ambiguous_stops.get());
         for (target, source) in stats
             .local_kmer_frequency_buckets
             .iter_mut()
@@ -1697,16 +1706,17 @@ fn extend_exact_anchor(request: ExactAnchorRequest<'_>) -> Option<Anchor> {
 fn extend_snp_emms_anchor(
     request: ExactAnchorRequest<'_>,
     relock_span: usize,
-) -> Option<(Anchor, usize)> {
+) -> Option<(Anchor, usize, usize)> {
     const MAX_MISMATCHES: usize = 32;
     const MAX_MISMATCH_PERCENT: usize = 8;
 
     let original = extend_exact_anchor(request)?;
     if relock_span == 0 {
-        return Some((original, 0));
+        return Some((original, 0, 0));
     }
     let mut anchor = original;
     let mut mismatches = 0usize;
+    let mut indel_ambiguous_stops = 0usize;
 
     loop {
         let q = anchor.q_end as usize;
@@ -1766,6 +1776,10 @@ fn extend_snp_emms_anchor(
             exact += 1;
         }
         if exact < relock_span {
+            break;
+        }
+        if has_one_base_indel_relock(request, q, r, true, relock_span) {
+            indel_ambiguous_stops += 1;
             break;
         }
         let accepted = 1 + exact;
@@ -1832,6 +1846,10 @@ fn extend_snp_emms_anchor(
         if exact < relock_span {
             break;
         }
+        if has_one_base_indel_relock(request, q, r, false, relock_span) {
+            indel_ambiguous_stops += 1;
+            break;
+        }
         let accepted = 1 + exact;
         anchor.q_start = anchor.q_start.saturating_sub(accepted as u32);
         match request.strand {
@@ -1843,10 +1861,49 @@ fn extend_snp_emms_anchor(
 
     let length = anchor.q_end.saturating_sub(anchor.q_start) as usize;
     if mismatches.saturating_mul(100) > length.saturating_mul(MAX_MISMATCH_PERCENT) {
-        return Some((original, 0));
+        return Some((original, 0, indel_ambiguous_stops));
     }
     anchor.score = length.saturating_sub(mismatches).min(i32::MAX as usize) as i32;
-    Some((anchor, mismatches))
+    Some((anchor, mismatches, indel_ambiguous_stops))
+}
+
+/// A same-diagonal re-lock is insufficient evidence for a SNP when skipping
+/// either the query or reference base also gives an exact re-lock. This is a
+/// common boundary signature for a one-base indel immediately before a
+/// homopolymer or tandem repeat. Leave that span to gap DP instead of pinning
+/// the same-diagonal interpretation inside an anchor.
+fn has_one_base_indel_relock(
+    request: ExactAnchorRequest<'_>,
+    mismatch_q: usize,
+    mismatch_r: u64,
+    right: bool,
+    relock_span: usize,
+) -> bool {
+    let q_step = if right { 1isize } else { -1isize };
+    let r_step = match (right, request.strand) {
+        (true, Strand::Forward) | (false, Strand::Reverse) => 1i64,
+        (true, Strand::Reverse) | (false, Strand::Forward) => -1i64,
+    };
+    let matches_shift = |skip_query: bool| {
+        (0..relock_span).all(|offset| {
+            let q_offset = offset as isize + isize::from(skip_query);
+            let r_offset = offset as i64 + i64::from(!skip_query);
+            let q = mismatch_q.checked_add_signed(q_step.saturating_mul(q_offset));
+            let r = mismatch_r.checked_add_signed(r_step.saturating_mul(r_offset));
+            let (Some(q), Some(r)) = (q, r) else {
+                return false;
+            };
+            q < request.read.len()
+                && r >= request.window_start as u64
+                && r < request.window_end as u64
+                && bases_match(
+                    request.read[q],
+                    request.reference[r as usize],
+                    request.strand,
+                )
+        })
+    };
+    matches_shift(true) || matches_shift(false)
 }
 
 /// Mark exact extensions whose query overlap can be placed on more than one
@@ -2308,7 +2365,7 @@ mod tests {
         let reference = b"ACGTCAGTACGATCGATGCTAGCTACGTCAGTACGATCGATGCTAGCTACGTCAGTACGATCGATGCTAGCT";
         let mut query = reference.to_vec();
         query[40] = if query[40] == b'A' { b'C' } else { b'A' };
-        let (anchor, mismatches) = extend_snp_emms_anchor(
+        let (anchor, mismatches, ambiguous_stops) = extend_snp_emms_anchor(
             ExactAnchorRequest {
                 read: &query,
                 reference,
@@ -2327,6 +2384,7 @@ mod tests {
         .expect("the exact core should seed SNP-EMMS");
 
         assert_eq!(mismatches, 1);
+        assert_eq!(ambiguous_stops, 0);
         assert_eq!((anchor.q_start, anchor.q_end), (0, query.len() as u32));
         assert_eq!(anchor.score, query.len() as i32 - 1);
     }
@@ -2338,7 +2396,7 @@ mod tests {
         for position in [40, 48] {
             query[position] = if query[position] == b'A' { b'C' } else { b'A' };
         }
-        let (anchor, mismatches) = extend_snp_emms_anchor(
+        let (anchor, mismatches, ambiguous_stops) = extend_snp_emms_anchor(
             ExactAnchorRequest {
                 read: &query,
                 reference,
@@ -2357,7 +2415,42 @@ mod tests {
         .expect("the exact core should remain an anchor");
 
         assert_eq!(mismatches, 0);
+        assert_eq!(ambiguous_stops, 0);
         assert_eq!(anchor.q_end, 40);
+    }
+
+    #[test]
+    fn single_seed_snp_emms_leaves_repeat_boundary_indel_for_dp() {
+        let mut reference = b"ACGTCAGTACGATCGATGCTAGCTACGTCAGTACGATCGA".to_vec();
+        reference.extend(std::iter::repeat_n(b'A', 48));
+        let mut query = reference.clone();
+        query.insert(40, b'C');
+
+        let (anchor, mismatches, ambiguous_stops) = extend_snp_emms_anchor(
+            ExactAnchorRequest {
+                read: &query,
+                reference: &reference,
+                ref_id: ContigId(0),
+                strand: Strand::Forward,
+                q_seed_start: 8,
+                ref_seed_start: 8,
+                k: 15,
+                window_start: 0,
+                window_end: reference.len(),
+                min_length: 30,
+                seed_verified: false,
+            },
+            12,
+        )
+        .expect("the exact prefix should seed SNP-EMMS");
+
+        assert_eq!(mismatches, 0);
+        assert_eq!(ambiguous_stops, 1);
+        assert_eq!(
+            anchor.q_end, 40,
+            "the inserted base must remain in a DP gap"
+        );
+        assert_eq!(anchor.ref_end, 40);
     }
 
     #[test]
@@ -2373,7 +2466,7 @@ mod tests {
         let seed_start = 12usize;
         let k = 15usize;
         let ref_seed_start = reference.len() - seed_start - k;
-        let (anchor, mismatches) = extend_snp_emms_anchor(
+        let (anchor, mismatches, ambiguous_stops) = extend_snp_emms_anchor(
             ExactAnchorRequest {
                 read: &query,
                 reference: &reference,
@@ -2392,6 +2485,7 @@ mod tests {
         .expect("the reverse exact core should seed SNP-EMMS");
 
         assert_eq!(mismatches, 1);
+        assert_eq!(ambiguous_stops, 0);
         assert_eq!((anchor.q_start, anchor.q_end), (0, query.len() as u32));
         assert_eq!(
             (anchor.ref_start, anchor.ref_end),

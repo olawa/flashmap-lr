@@ -34,6 +34,7 @@ pub struct ReadDiagnostics {
     pub snp_emms_anchors_accepted: u32,
     pub snp_emms_anchor_bases: u64,
     pub snp_emms_mismatches: u64,
+    pub snp_emms_indel_ambiguous_stops: u64,
     pub structural_chain_bridges: u32,
     pub supplementary_alignments: u32,
     pub secondary_alignments: u32,
@@ -149,6 +150,10 @@ pub struct ReadDiagnostics {
     pub repeat_source_dissolved: [u64; 3],
     pub interior_count_attempted: [u64; 3],
     pub interior_count_dissolved: [u64; 3],
+    /// Boundaries in a candidate span whose query and reference gaps differ,
+    /// bucketed as 0, 1, or 2+.
+    pub coordinate_delta_segments_attempted: [u64; 3],
+    pub coordinate_delta_segments_dissolved: [u64; 3],
     pub dissolution_dp_nanos: u64,
     pub anchor_runs_dissolved: u64,
     pub anchors_dissolved: u64,

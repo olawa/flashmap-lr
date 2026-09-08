@@ -93,6 +93,8 @@ pub(super) struct OverlapStats {
     pub repeat_source_dissolved: [u64; 3],
     pub interior_count_attempted: [u64; 3],
     pub interior_count_dissolved: [u64; 3],
+    pub coordinate_delta_segments_attempted: [u64; 3],
+    pub coordinate_delta_segments_dissolved: [u64; 3],
     pub dissolution_dp_nanos: u64,
     pub dissolved_runs: u64,
     pub dissolved_anchors: u64,
@@ -524,6 +526,19 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                 continue;
             };
 
+            // Count how many boundaries between these anchors change the
+            // query/reference register. This is available from coordinates
+            // alone and may become a cheap prefilter, but is diagnostic until
+            // its recall for successfully dissolved paths is known.
+            let coordinate_delta_bucket = anchors[left..=right]
+                .windows(2)
+                .filter(|pair| {
+                    pair[1].q_start.saturating_sub(pair[0].q_end)
+                        != pair[1].ref_start.saturating_sub(pair[0].ref_end)
+                })
+                .count()
+                .min(2);
+
             // Try a local, unpinned alignment first only where repeat anchors
             // and at least two register changes identify a fragmented event.
             // A certified improvement needs no split-path DP at all.
@@ -559,6 +574,8 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                             let bucket = (right - left - 2).min(2);
                             stats.interior_count_attempted[bucket] += 1;
                             stats.interior_count_dissolved[bucket] += 1;
+                            stats.coordinate_delta_segments_attempted[coordinate_delta_bucket] += 1;
+                            stats.coordinate_delta_segments_dissolved[coordinate_delta_bucket] += 1;
                             stats.dissolved_runs += 1;
                             stats.dissolved_anchors += (right - left - 1) as u64;
                             stats.repeat_ambiguous_anchors_dissolved += anchors[left + 1..right]
@@ -677,6 +694,9 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
             let interior_bucket = (right - left - 1).saturating_sub(1).min(2);
             stats.interior_count_attempted[interior_bucket] =
                 stats.interior_count_attempted[interior_bucket].saturating_add(1);
+            stats.coordinate_delta_segments_attempted[coordinate_delta_bucket] = stats
+                .coordinate_delta_segments_attempted[coordinate_delta_bucket]
+                .saturating_add(1);
             if split_gap_segments == 1 {
                 stats.candidate_runs_single_gap_segment_attempted = stats
                     .candidate_runs_single_gap_segment_attempted
@@ -747,6 +767,9 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                     stats.repeat_source_dissolved[repeat_source as usize].saturating_add(1);
                 stats.interior_count_dissolved[interior_bucket] =
                     stats.interior_count_dissolved[interior_bucket].saturating_add(1);
+                stats.coordinate_delta_segments_dissolved[coordinate_delta_bucket] = stats
+                    .coordinate_delta_segments_dissolved[coordinate_delta_bucket]
+                    .saturating_add(1);
                 anchors.drain(left + 1..right);
                 dissolved = true;
                 break;

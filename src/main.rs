@@ -1788,6 +1788,7 @@ struct ProfileReporter {
     snp_emms_anchors_accepted: AtomicU64,
     snp_emms_anchor_bases: AtomicU64,
     snp_emms_mismatches: AtomicU64,
+    snp_emms_indel_ambiguous_stops: AtomicU64,
     structural_chain_bridges: AtomicU64,
     supplementary_alignments: AtomicU64,
     secondary_alignments: AtomicU64,
@@ -1852,6 +1853,8 @@ struct ProfileReporter {
     repeat_source_dissolved: [AtomicU64; 3],
     interior_count_attempted: [AtomicU64; 3],
     interior_count_dissolved: [AtomicU64; 3],
+    coordinate_delta_segments_attempted: [AtomicU64; 3],
+    coordinate_delta_segments_dissolved: [AtomicU64; 3],
     dissolution_dp_nanos: AtomicU64,
     anchor_runs_dissolved: AtomicU64,
     anchors_dissolved: AtomicU64,
@@ -1967,6 +1970,10 @@ impl DiagnosticsSink for ProfileReporter {
                 diagnostics.snp_emms_anchor_bases,
             ),
             (&self.snp_emms_mismatches, diagnostics.snp_emms_mismatches),
+            (
+                &self.snp_emms_indel_ambiguous_stops,
+                diagnostics.snp_emms_indel_ambiguous_stops,
+            ),
             (
                 &self.structural_chain_bridges,
                 diagnostics.structural_chain_bridges as u64,
@@ -2264,6 +2271,14 @@ impl DiagnosticsSink for ProfileReporter {
                 diagnostics.interior_count_dissolved[index],
                 Ordering::Relaxed,
             );
+            self.coordinate_delta_segments_attempted[index].fetch_add(
+                diagnostics.coordinate_delta_segments_attempted[index],
+                Ordering::Relaxed,
+            );
+            self.coordinate_delta_segments_dissolved[index].fetch_add(
+                diagnostics.coordinate_delta_segments_dissolved[index],
+                Ordering::Relaxed,
+            );
         }
         for index in 0..6 {
             self.dissolution_span_attempted[index].fetch_add(
@@ -2401,9 +2416,10 @@ impl ProfileReporter {
         let snp_emms_anchors = self.snp_emms_anchors_accepted.load(Ordering::Relaxed);
         if snp_emms_anchors > 0 {
             eprintln!(
-                "  SNP-EMMS extension:   {snp_emms_anchors} anchors, {:.3} Mb, {} substitutions bridged",
+                "  SNP-EMMS extension:   {snp_emms_anchors} anchors, {:.3} Mb, {} substitutions bridged, {} indel-ambiguous stops",
                 self.snp_emms_anchor_bases.load(Ordering::Relaxed) as f64 / 1_000_000.0,
                 self.snp_emms_mismatches.load(Ordering::Relaxed),
+                self.snp_emms_indel_ambiguous_stops.load(Ordering::Relaxed),
             );
         }
         eprintln!(
@@ -2676,6 +2692,21 @@ impl ProfileReporter {
                 repeat_dissolved[1],
                 repeat_attempted[2],
                 repeat_dissolved[2]
+            );
+            let coordinate_attempted = std::array::from_fn::<_, 3, _>(|index| {
+                self.coordinate_delta_segments_attempted[index].load(Ordering::Relaxed)
+            });
+            let coordinate_dissolved = std::array::from_fn::<_, 3, _>(|index| {
+                self.coordinate_delta_segments_dissolved[index].load(Ordering::Relaxed)
+            });
+            eprintln!(
+                "                         coordinate-delta boundaries (attempted/dissolved): 0 {}/{}, 1 {}/{}, 2+ {}/{}",
+                coordinate_attempted[0],
+                coordinate_dissolved[0],
+                coordinate_attempted[1],
+                coordinate_dissolved[1],
+                coordinate_attempted[2],
+                coordinate_dissolved[2]
             );
             let interior_attempted = std::array::from_fn::<_, 3, _>(|index| {
                 self.interior_count_attempted[index].load(Ordering::Relaxed)

@@ -357,6 +357,12 @@ fn build_chain_cigar_with_policy<'a>(
             diagnostics.interior_count_dissolved[index] = diagnostics.interior_count_dissolved
                 [index]
                 .saturating_add(overlaps.interior_count_dissolved[index]);
+            diagnostics.coordinate_delta_segments_attempted[index] = diagnostics
+                .coordinate_delta_segments_attempted[index]
+                .saturating_add(overlaps.coordinate_delta_segments_attempted[index]);
+            diagnostics.coordinate_delta_segments_dissolved[index] = diagnostics
+                .coordinate_delta_segments_dissolved[index]
+                .saturating_add(overlaps.coordinate_delta_segments_dissolved[index]);
         }
         diagnostics.dissolution_dp_nanos = diagnostics
             .dissolution_dp_nanos
