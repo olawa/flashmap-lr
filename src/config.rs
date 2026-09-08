@@ -103,7 +103,6 @@ pub struct MapperConfig {
     pub dual_affine: bool,
     /// Maximum secondary records; zero disables their refinement/emission.
     pub max_secondary: usize,
-    pub mapq_calibration: Option<crate::MapqCalibration>,
     pub mapq_mode: MapqMode,
 }
 
@@ -114,7 +113,6 @@ impl Default for MapperConfig {
             runtime: RuntimeConfig::default(),
             dual_affine: false,
             max_secondary: 0,
-            mapq_calibration: None,
             mapq_mode: MapqMode::Minimap2,
         }
     }
@@ -154,26 +152,6 @@ pub struct SeedingConfig {
     /// Align a locked region in one banded pass instead of finding anchors.
     pub near_exact_dp: bool,
     /// Score a placement's confidence by how much of the read its chain
-    /// spans, rather than by how densely its anchors covered that span.
-    ///
-    /// The coverage factor exists so a chain built from sparse anchors on a
-    /// short repeat cannot claim MAPQ 60. But it multiplies the whole score,
-    /// so an unambiguous placement with no competitor at all is capped at 30
-    /// when its anchors covered 40% of the read -- and a verify run found 3113
-    /// reads at least 30 below minimap2 at the same position, against 126 the
-    /// other way. Anchor density is a proxy for "did we really see this
-    /// locus"; the span is the thing the proxy stood for, and it does not fall
-    /// when anchors are deliberately dropped.
-    pub mapq_from_span: bool,
-    /// Score difference that settles a placement on its own.
-    ///
-    /// A chain score is the sum of its anchor lengths, so on a 15 kb read it
-    /// runs to thousands and a rival a hundred bases behind reads as a 0.7%
-    /// ratio -- MAPQ 0 for a hundred bases of unique sequence. This is the
-    /// difference that counts as decisive whatever the scores are. Zero
-    /// restores the ratio-only rule; 250 is the score a both-ends endpoint
-    /// match is already worth in the ranking.
-    pub mapq_score_saturation: i32,
     /// Bases of band beyond the measured drift for the locked banded pass.
     ///
     /// The two end seeds bound only the net shift between them, so a read
@@ -270,7 +248,6 @@ pub struct AlignmentConfig {
     pub dual_affine: bool,
     /// Maximum secondary records; zero disables their refinement/emission.
     pub max_secondary: usize,
-    pub mapq_calibration: Option<crate::MapqCalibration>,
     pub mapq_mode: MapqMode,
 }
 
@@ -281,8 +258,6 @@ impl Default for Config {
                 reseed_uncovered: false,
                 near_exact_candidate: false,
                 near_exact_dp: false,
-                mapq_from_span: false,
-                mapq_score_saturation: 0,
                 near_exact_dp_band_slack: 64,
                 near_exact_dp_max_drift: 256,
                 near_exact_dp_min_drift: 0,
@@ -315,7 +290,7 @@ impl Default for Config {
             },
             alignment: AlignmentConfig {
                 island_chain_lookback: usize::MAX,
-                dissolve_repeat_run: 0,
+                dissolve_repeat_run: 4,
                 overlap_flank: 0,
                 overlap_flank_min: 0,
                 bridge_flank: 256,
@@ -325,7 +300,6 @@ impl Default for Config {
                 mode: AlignmentMode::Standard,
                 dual_affine: false,
                 max_secondary: 0,
-                mapq_calibration: None,
                 mapq_mode: MapqMode::Minimap2,
             },
             worker_pool: WorkerPoolConfig::default(),
@@ -832,12 +806,6 @@ pub(crate) struct WorkBudget {
     pub(crate) high_coverage_fraction: f64,
     pub(crate) low_coverage_fraction: f64,
     pub(crate) limited_mapq_cap: u8,
-    /// Score confidence by the chain's span over the read rather than by its
-    /// anchor density within that span.
-    pub(crate) mapq_from_span: bool,
-    /// Score difference that settles a placement on its own, regardless of
-    /// how large the scores themselves are. Zero is the ratio-only rule.
-    pub(crate) mapq_score_saturation: i32,
     pub(crate) mapq_mode: MapqMode,
     /// Fast-only coarse-candidate entropy guard. When at least this many
     /// candidates remain within `ambiguity_score_fraction` of the top probe
@@ -868,7 +836,6 @@ pub(crate) struct ResolvedMapperPolicy {
     pub(crate) mode: AlignmentMode,
     pub(crate) runtime: RuntimeConfig,
     pub(crate) max_secondary: usize,
-    pub(crate) mapq_calibration: Option<crate::MapqCalibration>,
 }
 
 impl ResolvedMapperPolicy {
@@ -876,7 +843,6 @@ impl ResolvedMapperPolicy {
         config.validate()?;
         let mut policy = Self::for_mode(config.mode, config.runtime.clone(), config.dual_affine);
         policy.max_secondary = config.max_secondary;
-        policy.mapq_calibration = config.mapq_calibration.clone();
         policy.work_budget.mapq_mode = config.mapq_mode;
         Ok(policy)
     }
@@ -890,7 +856,6 @@ impl ResolvedMapperPolicy {
         );
         policy.gaps.island_chain_lookback = config.alignment.island_chain_lookback;
         policy.max_secondary = config.alignment.max_secondary;
-        policy.mapq_calibration = config.alignment.mapq_calibration.clone();
         policy.gaps.dissolve_repeat_run = config.alignment.dissolve_repeat_run;
         policy.gaps.overlap_flank = config.alignment.overlap_flank;
         policy.gaps.overlap_flank_min = config.alignment.overlap_flank_min;
@@ -944,8 +909,6 @@ impl ResolvedMapperPolicy {
             ..policy.anchors
         };
         policy.work_budget.max_candidates = config.candidates.max_regions.min(8);
-        policy.work_budget.mapq_from_span = config.seeding.mapq_from_span;
-        policy.work_budget.mapq_score_saturation = config.seeding.mapq_score_saturation;
         policy.work_budget.mapq_mode = config.alignment.mapq_mode;
         // Tiered and EMMS switches are compatibility-only.  They are carried
         // into the resolved policy only when explicitly requested through the
@@ -1098,7 +1061,7 @@ impl ResolvedMapperPolicy {
             medium_gap_dp_delta_max: if mode.is_sensitive() { 1_024 } else { 512 },
             recursive_split_k: 13,
             island_chain_lookback: usize::MAX,
-            dissolve_repeat_run: 0,
+            dissolve_repeat_run: 4,
             overlap_flank: 0,
             overlap_flank_min: 0,
             recursive_split_min_gap: 13,
@@ -1147,8 +1110,6 @@ impl ResolvedMapperPolicy {
             high_coverage_fraction: 0.90,
             low_coverage_fraction: 0.40,
             limited_mapq_cap: if mode.is_sensitive() { 60 } else { 50 },
-            mapq_from_span: false,
-            mapq_score_saturation: 0,
             mapq_mode: MapqMode::Minimap2,
             ambiguity_score_fraction: 0.60,
             ambiguity_candidate_count: 4,
@@ -1167,7 +1128,6 @@ impl ResolvedMapperPolicy {
             scoring,
             work_budget,
             max_secondary: 0,
-            mapq_calibration: None,
             mode,
             runtime,
         }
@@ -1179,8 +1139,6 @@ impl ResolvedMapperPolicy {
                 reseed_uncovered: self.probes.reseed_uncovered,
                 near_exact_candidate: self.probes.near_exact_candidate,
                 near_exact_dp: self.probes.near_exact_dp,
-                mapq_from_span: self.work_budget.mapq_from_span,
-                mapq_score_saturation: self.work_budget.mapq_score_saturation,
                 near_exact_dp_band_slack: self.probes.near_exact_dp_band_slack,
                 near_exact_dp_max_drift: self.probes.near_exact_dp_max_drift,
                 near_exact_dp_min_drift: self.probes.near_exact_dp_min_drift,
@@ -1211,7 +1169,6 @@ impl ResolvedMapperPolicy {
             },
             alignment: AlignmentConfig {
                 max_secondary: self.max_secondary,
-                mapq_calibration: self.mapq_calibration.clone(),
                 mapq_mode: self.work_budget.mapq_mode,
                 island_chain_lookback: self.gaps.island_chain_lookback,
                 dissolve_repeat_run: self.gaps.dissolve_repeat_run,

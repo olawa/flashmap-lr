@@ -297,7 +297,7 @@ fn dual_affine_cli_preserves_long_indels_on_both_strands() {
 }
 
 #[test]
-fn secondary_records_preserve_primary_and_calibration_caps_unique_mapq() {
+fn secondary_records_preserve_primary_records() {
     let root = std::env::temp_dir().join(format!("rs-lra-secondary-{}", std::process::id()));
     fs::create_dir_all(&root).unwrap();
     let repeated = String::from_utf8(pseudo_sequence(8000, 937)).unwrap();
@@ -316,14 +316,7 @@ fn secondary_records_preserve_primary_and_calibration_caps_unique_mapq() {
         ),
     )
     .unwrap();
-    fs::write(
-        root.join("caps.tsv"),
-        (0..=60)
-            .map(|q| format!("{q}\t{}\n", q.min(12)))
-            .collect::<String>(),
-    )
-    .unwrap();
-    let run = |secondary: usize, calibrated: bool| {
+    let run = |secondary: usize| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rs-lra"));
         command.args([
             "--reference",
@@ -337,9 +330,6 @@ fn secondary_records_preserve_primary_and_calibration_caps_unique_mapq() {
             "--secondary",
             &secondary.to_string(),
         ]);
-        if calibrated {
-            command.arg("--mapq-calibration").arg(root.join("caps.tsv"));
-        }
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
@@ -353,8 +343,8 @@ fn secondary_records_preserve_primary_and_calibration_caps_unique_mapq() {
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
-    let baseline = run(0, false);
-    let enabled = run(1, false);
+    let baseline = run(0);
+    let enabled = run(1);
     let primary = |records: &Vec<String>| {
         records
             .iter()
@@ -373,12 +363,6 @@ fn secondary_records_preserve_primary_and_calibration_caps_unique_mapq() {
     assert_eq!(fields[4], "0");
     assert!(!alternatives[0].contains("SA:Z:"));
     assert!(fields.contains(&"NM:i:0"));
-    let calibrated = run(1, true);
-    let unique_record = calibrated
-        .iter()
-        .find(|r| r.starts_with("unique\t"))
-        .unwrap();
-    assert_eq!(unique_record.split('\t').nth(4), Some("12"));
     fs::remove_dir_all(root).unwrap();
 }
 

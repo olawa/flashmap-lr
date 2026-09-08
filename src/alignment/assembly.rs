@@ -304,6 +304,24 @@ fn build_chain_cigar_with_policy<'a>(
         diagnostics.anchor_overlap_flanked_bases = diagnostics
             .anchor_overlap_flanked_bases
             .saturating_add(overlaps.flanked);
+        diagnostics.anchor_runs_considered = diagnostics
+            .anchor_runs_considered
+            .saturating_add(overlaps.candidate_runs_considered);
+        diagnostics.anchor_runs_skipped_repeat = diagnostics
+            .anchor_runs_skipped_repeat
+            .saturating_add(overlaps.candidate_runs_skipped_repeat);
+        diagnostics.anchor_runs_skipped_single_gap = diagnostics
+            .anchor_runs_skipped_single_gap
+            .saturating_add(overlaps.candidate_runs_skipped_single_gap);
+        diagnostics.anchor_runs_dp_attempted = diagnostics
+            .anchor_runs_dp_attempted
+            .saturating_add(overlaps.candidate_runs_dp_attempted);
+        diagnostics.dissolution_gap_cache_hits = diagnostics
+            .dissolution_gap_cache_hits
+            .saturating_add(overlaps.gap_resolution_cache_hits);
+        diagnostics.dissolution_dp_nanos = diagnostics
+            .dissolution_dp_nanos
+            .saturating_add(overlaps.dissolution_dp_nanos);
         diagnostics.anchor_runs_dissolved = diagnostics
             .anchor_runs_dissolved
             .saturating_add(overlaps.dissolved_runs);

@@ -77,7 +77,6 @@ impl<'a> Aligner<'a> {
                     runtime: policy.runtime.clone(),
                     dual_affine: policy.scoring.dual_affine,
                     max_secondary: policy.max_secondary,
-                    mapq_calibration: policy.mapq_calibration.clone(),
                     mapq_mode: policy.work_budget.mapq_mode,
                 };
                 (policy, mapper_config, config)
@@ -136,13 +135,7 @@ impl<'a> Aligner<'a> {
     /// should wrap it in [`crate::WorkerPool`], which owns the reader,
     /// bounded batches, mapper workers, and ordered output sink.
     pub fn map(&self, read: Read<'_>) -> Result<MappingResult, MapError> {
-        let mut result = self.map_raw(read)?;
-        if let Some(table) = &self.policy.mapq_calibration {
-            for alignment in result.primary.iter_mut().chain(&mut result.supplementary) {
-                alignment.mapq = table.apply(alignment.mapq);
-            }
-        }
-        Ok(result)
+        self.map_raw(read)
     }
 
     fn map_raw(&self, read: Read<'_>) -> Result<MappingResult, MapError> {
@@ -878,25 +871,11 @@ impl<'a> Aligner<'a> {
                     competing_count,
                 ))
             }
-            MapqMode::Legacy => {
-                let confidence_coverage =
-                    if self.policy.work_budget.mapq_from_span && second_score.is_some() {
-                        diagnostics.mapq_span_applied = 1;
-                        let span = chain.q_end.saturating_sub(chain.q_start) as f64;
-                        (span / read.sequence.len().max(1) as f64).clamp(0.0, 1.0)
-                    } else {
-                        if self.policy.work_budget.mapq_from_span {
-                            diagnostics.mapq_span_withheld = 1;
-                        }
-                        chain.query_covered_fraction
-                    };
-                confidence_cap(mapping_quality_with_saturation(
-                    best_rank_score,
-                    second_score,
-                    confidence_coverage,
-                    self.policy.work_budget.mapq_score_saturation,
-                ))
-            }
+            MapqMode::Legacy => confidence_cap(mapping_quality(
+                best_rank_score,
+                second_score,
+                chain.query_covered_fraction,
+            )),
         };
         let contig = self.reference.contig(*contig_id).ok_or(MapError::Anchor(
             crate::AnchorError::MissingReference(*contig_id),
@@ -980,7 +959,7 @@ impl<'a> Aligner<'a> {
                         competing_count,
                     ))
                 }
-                MapqMode::Legacy => confidence_cap(mapping_quality_with_saturation(
+                MapqMode::Legacy => confidence_cap(mapping_quality(
                     endpoint_rank_score(
                         supplementary_chain.score,
                         supplementary_support,
@@ -994,12 +973,7 @@ impl<'a> Aligner<'a> {
                             .structural
                             .max_supplementary_query_overlap_fraction,
                     ),
-                    if self.policy.work_budget.mapq_from_span {
-                        1.0
-                    } else {
-                        chain_span_coverage(supplementary_chain)
-                    },
-                    self.policy.work_budget.mapq_score_saturation,
+                    chain_span_coverage(supplementary_chain),
                 )),
             };
             let mut alignment = crate::alignment::build_chain_alignment_with_policy(
@@ -1976,12 +1950,7 @@ fn candidate_search_is_limited(
     retained_candidates >= clustering_cap || retained_candidates > resolution_budget
 }
 
-fn mapping_quality_with_saturation(
-    best_score: i32,
-    second_score: Option<i32>,
-    coverage: f64,
-    saturation: i32,
-) -> u8 {
+fn mapping_quality(best_score: i32, second_score: Option<i32>, coverage: f64) -> u8 {
     // The LR chain score margin is useful only when the chain covers a
     // meaningful part of the read.  This is the same coverage knee used by
     // FlashMap's default LR emission path: sparse anchors on a short repeat
@@ -1990,27 +1959,15 @@ fn mapping_quality_with_saturation(
     let margin = second_score
         .map(|second| {
             let difference = best_score.saturating_sub(second).max(0);
-            let by_ratio = if best_score > 0 {
-                difference as f64 / best_score as f64
+            if best_score > 0 {
+                (difference as f64 / best_score as f64).clamp(0.0, 1.0)
             } else {
                 0.0
-            };
-            let by_difference = if saturation > 0 {
-                difference as f64 / saturation as f64
-            } else {
-                0.0
-            };
-            by_ratio.max(by_difference).clamp(0.0, 1.0)
+            }
         })
         .unwrap_or(1.0);
     let coverage_factor = (coverage.clamp(0.0, 1.0) / COVERAGE_KNEE).min(1.0);
     (60.0 * margin * coverage_factor).round().clamp(0.0, 60.0) as u8
-}
-
-/// The historical rule: the ratio alone, with no absolute term.
-#[cfg(test)]
-fn mapping_quality(best_score: i32, second_score: Option<i32>, coverage: f64) -> u8 {
-    mapping_quality_with_saturation(best_score, second_score, coverage, 0)
 }
 
 /// Does this candidate cover query that no accepted placement explains?
@@ -2784,68 +2741,6 @@ mod tests {
         assert_eq!(primary.ref_end, 20);
         assert_eq!(primary.cigar.ops(), &[crate::CigarOp::Match(20)]);
         assert_eq!(primary.edit_distance, 0);
-    }
-
-    /// The absolute term must not disturb what the ratio already decided; a
-    /// both-ends endpoint's worth of difference is simply another way to be
-    /// sure.
-    #[test]
-    fn the_absolute_term_leaves_the_ratios_answers_alone() {
-        const SATURATION: i32 = 250;
-        for (best, second, coverage) in [
-            (100, None, 1.0),
-            (100, None, 0.80),
-            (100, None, 0.40),
-            (100, Some(99), 1.0),
-            (100, Some(50), 1.0),
-            (100, Some(100), 1.0),
-        ] {
-            assert_eq!(
-                mapping_quality_with_saturation(best, second, coverage, SATURATION),
-                mapping_quality(best, second, coverage),
-                "score {best} against {second:?} at coverage {coverage}"
-            );
-        }
-    }
-
-    /// A chain score is the sum of its anchor lengths, so a long read scores
-    /// in the thousands and the ratio cannot see a decisive difference.
-    #[test]
-    fn a_long_read_is_settled_by_the_difference_the_ratio_cannot_see() {
-        const SATURATION: i32 = 250;
-        // 15 kb of anchors, a rival a hundred anchor-covered bases behind.
-        assert_eq!(
-            mapping_quality(15_000, Some(14_900), 1.0),
-            0,
-            "the ratio calls a hundred bases of unique sequence a coin toss"
-        );
-        assert_eq!(
-            mapping_quality_with_saturation(15_000, Some(14_900), 1.0, SATURATION),
-            24
-        );
-
-        // A full endpoint's worth behind is decisive on its own.
-        assert_eq!(
-            mapping_quality_with_saturation(15_000, Some(14_750), 1.0, SATURATION),
-            60
-        );
-
-        // And a genuinely close second stays close: ten bases in fifteen
-        // thousand is not evidence.
-        assert_eq!(
-            mapping_quality_with_saturation(15_000, Some(14_990), 1.0, SATURATION),
-            2
-        );
-    }
-
-    /// The coverage factor still bounds the result, so the absolute term
-    /// cannot hand MAPQ 60 to a chain that explains a fraction of the read.
-    #[test]
-    fn the_absolute_term_is_still_bounded_by_coverage() {
-        assert_eq!(
-            mapping_quality_with_saturation(15_000, Some(14_000), 0.40, 250),
-            30
-        );
     }
 
     #[test]

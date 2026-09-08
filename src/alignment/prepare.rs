@@ -7,6 +7,7 @@ use crate::config::{GapPolicy, ScoringPolicy};
 #[cfg(test)]
 use crate::Config;
 use crate::{Chain, CigarOp, Contig, Strand};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct OrientedAnchor {
@@ -74,6 +75,12 @@ pub(super) fn orient_anchors(
 pub(super) struct OverlapStats {
     pub buckets: [u64; 7],
     pub flanked: u64,
+    pub candidate_runs_considered: u64,
+    pub candidate_runs_skipped_repeat: u64,
+    pub candidate_runs_skipped_single_gap: u64,
+    pub candidate_runs_dp_attempted: u64,
+    pub gap_resolution_cache_hits: u64,
+    pub dissolution_dp_nanos: u64,
     pub dissolved_runs: u64,
     pub dissolved_anchors: u64,
     pub reference_only: u64,
@@ -174,11 +181,11 @@ pub(super) fn normalize_anchor_overlaps_measured(
 }
 
 /// Check if a sequence is predominantly a low-complexity tandem repeat (STR, homopolymer, dinucleotide, etc.)
-fn is_low_complexity_str(sequence: &[u8]) -> bool {
-    if sequence.len() < 8 {
+pub(super) fn is_low_complexity_str(sequence: &[u8]) -> bool {
+    if sequence.len() < 6 {
         return false;
     }
-    for period in 1..=6 {
+    for period in 1..=8 {
         if sequence.len() <= period {
             continue;
         }
@@ -188,11 +195,94 @@ fn is_low_complexity_str(sequence: &[u8]) -> bool {
             .filter(|(a, b)| a.eq_ignore_ascii_case(b))
             .count();
         let total = sequence.len() - period;
-        if total > 0 && (matches * 100) / total >= 80 {
+        if total > 0 && (matches * 100) / total >= 75 {
             return true;
         }
     }
     false
+}
+
+type RepeatMemo = HashMap<(usize, usize), bool>;
+type GapKey = (usize, usize, usize, usize);
+type GapResolutionCache = HashMap<GapKey, Result<Vec<CigarOp>, ChainCigarError>>;
+
+fn memoized_repeat(sequence: &[u8], memo: &mut RepeatMemo) -> bool {
+    let key = (sequence.as_ptr() as usize, sequence.len());
+    *memo
+        .entry(key)
+        .or_insert_with(|| is_low_complexity_str(sequence))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_cached_gap(
+    ops: &mut Vec<CigarOp>,
+    query: &[u8],
+    reference: &[u8],
+    query_start: usize,
+    query_end: usize,
+    ref_start: usize,
+    ref_end: usize,
+    gap_policy: &GapPolicy,
+    cache: &mut GapResolutionCache,
+    stats: &mut OverlapStats,
+    diagnostics: Option<&mut crate::ReadDiagnostics>,
+) -> Result<(), ChainCigarError> {
+    let key = (query_start, query_end, ref_start, ref_end);
+    if let Some(cached) = cache.get(&key) {
+        stats.gap_resolution_cache_hits = stats.gap_resolution_cache_hits.saturating_add(1);
+        ops.extend_from_slice(cached.as_ref().map_err(|error| *error)?);
+        return Ok(());
+    }
+    let mut resolved = Vec::new();
+    let result = append_gap_with_policy(
+        &mut resolved,
+        query,
+        reference,
+        query_start,
+        query_end,
+        ref_start,
+        ref_end,
+        gap_policy,
+        diagnostics,
+    )
+    .map(|_| resolved);
+    cache.insert(key, result.clone());
+    ops.extend_from_slice(result.as_ref().map_err(|error| *error)?);
+    Ok(())
+}
+
+/// Prove from coordinates and exact sequence equality that the pinned path
+/// contains at most one gap open. Unknown equal-length or two-sided gaps return
+/// false and follow the ordinary resolver; this guard cannot change a CIGAR.
+fn provably_single_gap_path(
+    anchors: &[OrientedAnchor],
+    left: usize,
+    right: usize,
+    query: &[u8],
+    reference: &[u8],
+) -> bool {
+    let mut gap_opens = 0usize;
+    for pair in anchors[left..=right].windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        let q = match query.get(a.q_end..b.q_start) {
+            Some(value) => value,
+            None => return false,
+        };
+        let r = match reference.get(a.ref_end..b.ref_start) {
+            Some(value) => value,
+            None => return false,
+        };
+        match (q.is_empty(), r.is_empty(), q.len() == r.len()) {
+            (true, true, _) => {}
+            (true, false, _) | (false, true, _) => gap_opens += 1,
+            (false, false, true) if q.eq_ignore_ascii_case(r) => {}
+            _ => return false,
+        }
+        if gap_opens > 1 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Count the number of gap opens (Ins or Del operations) in a CIGAR slice
@@ -214,6 +304,65 @@ fn score_cigar_ops(
         .unwrap_or(i32::MIN)
 }
 
+/// Check if an anchor span contains repeat structure (STR, tandem repeat, homopolymer)
+/// either in the overall span, in any interior anchor, or in any indel gap.
+fn span_has_repeat_structure(
+    anchors: &[OrientedAnchor],
+    left: usize,
+    right: usize,
+    query: &[u8],
+    reference: &[u8],
+    memo: &mut RepeatMemo,
+) -> bool {
+    let (flank_left, flank_right) = (&anchors[left], &anchors[right]);
+
+    // Check reusable interior anchors and gaps first. Overlapping candidate
+    // spans otherwise rescan the same sequence many times.
+    for a in &anchors[left + 1..right] {
+        if let Some(seq) = query.get(a.q_start..a.q_end) {
+            if memoized_repeat(seq, memo) {
+                return true;
+            }
+        }
+        if let Some(seq) = reference.get(a.ref_start..a.ref_end) {
+            if memoized_repeat(seq, memo) {
+                return true;
+            }
+        }
+    }
+
+    // 3. Check each gap between adjacent anchors in the span
+    let mut prev_q = flank_left.q_end;
+    let mut prev_ref = flank_left.ref_end;
+    for a in &anchors[left + 1..=right] {
+        let q_gap = a.q_start.saturating_sub(prev_q);
+        let ref_gap = a.ref_start.saturating_sub(prev_ref);
+        if q_gap != ref_gap || q_gap >= 8 || ref_gap >= 8 {
+            if let Some(seq) = query.get(prev_q..a.q_start) {
+                if memoized_repeat(seq, memo) {
+                    return true;
+                }
+            }
+            if let Some(seq) = reference.get(prev_ref..a.ref_start) {
+                if memoized_repeat(seq, memo) {
+                    return true;
+                }
+            }
+        }
+        prev_q = a.q_end;
+        prev_ref = a.ref_end;
+    }
+
+    // Full spans are pair-specific, so examine them only when their reusable
+    // components did not already establish repeat structure.
+    query
+        .get(flank_left.q_end..flank_right.q_start)
+        .is_some_and(|seq| memoized_repeat(seq, memo))
+        || reference
+            .get(flank_left.ref_end..flank_right.ref_start)
+            .is_some_and(|seq| memoized_repeat(seq, memo))
+}
+
 /// Replace a run of chained anchors with one continuous DP when the span they
 /// sit in carries an indel and the DP reads it at least as well.
 ///
@@ -225,13 +374,8 @@ fn score_cigar_ops(
 /// copies short, or split into a run of small indels, because the interior
 /// anchors pinned a register that the whole event contradicts.
 ///
-/// The existing register-shift unlock removes one short STR anchor at a time.
-/// This removes the whole run at once, and asks the same question the unlock
-/// asks: does one continuous alignment over the span score at least as well
-/// with fewer gap opens? If the interior anchors are genuine, it does not,
-/// and nothing changes. The candidate spans are only those whose flanking
-/// geometry already shows a real indel, so the DP runs a handful of times per
-/// read rather than per anchor.
+/// The candidate spans are only evaluated when repeat structure is present
+/// (STR / tandem repeat / homopolymer), avoiding speculative DP on non-repeat sequence.
 ///
 /// Returns the anchors kept, and counts the runs it dissolved.
 pub(super) fn dissolve_indel_spanning_anchor_runs(
@@ -249,12 +393,12 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
     }
     // A span is only worth a DP if the anchors around it already disagree
     // about length by more than sequencing noise would explain.
-    const MIN_INDEL: usize = 20;
+    const MIN_INDEL: usize = 4;
+    let mut repeat_memo = RepeatMemo::new();
+    let mut gap_cache = GapResolutionCache::new();
 
     let mut left = 0usize;
     while left + 2 < anchors.len() {
-        // The longest run this left flank can bound, shortest span first so
-        // the DP stays inside its budget.
         let limit = (left + 1 + max_run).min(anchors.len() - 1);
         let mut dissolved = false;
         for right in (left + 2..=limit).rev() {
@@ -272,10 +416,43 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
             {
                 continue;
             }
+
+            stats.candidate_runs_considered = stats.candidate_runs_considered.saturating_add(1);
+            let t0 = diagnostics.is_some().then(std::time::Instant::now);
+
+            if provably_single_gap_path(&anchors, left, right, query, reference) {
+                stats.candidate_runs_skipped_single_gap =
+                    stats.candidate_runs_skipped_single_gap.saturating_add(1);
+                if let Some(t0) = t0 {
+                    stats.dissolution_dp_nanos = stats
+                        .dissolution_dp_nanos
+                        .saturating_add(t0.elapsed().as_nanos() as u64);
+                }
+                continue;
+            }
+
+            // Only evaluate candidate spans that contain repeat structure
+            if !span_has_repeat_structure(&anchors, left, right, query, reference, &mut repeat_memo)
+            {
+                stats.candidate_runs_skipped_repeat =
+                    stats.candidate_runs_skipped_repeat.saturating_add(1);
+                if let Some(t0) = t0 {
+                    stats.dissolution_dp_nanos = stats
+                        .dissolution_dp_nanos
+                        .saturating_add(t0.elapsed().as_nanos() as u64);
+                }
+                continue;
+            }
+
             let (Some(q_sub), Some(ref_sub)) = (
                 query.get(flank_left.q_end..flank_right.q_start),
                 reference.get(flank_left.ref_end..flank_right.ref_start),
             ) else {
+                if let Some(t0) = t0 {
+                    stats.dissolution_dp_nanos = stats
+                        .dissolution_dp_nanos
+                        .saturating_add(t0.elapsed().as_nanos() as u64);
+                }
                 continue;
             };
 
@@ -285,7 +462,7 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
             let mut cursor = (flank_left.q_end, flank_left.ref_end);
             let mut buildable = true;
             for anchor in &anchors[left + 1..right] {
-                if append_gap_with_policy(
+                if append_cached_gap(
                     &mut split_ops,
                     query,
                     reference,
@@ -294,6 +471,8 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                     cursor.1,
                     anchor.ref_start,
                     gap_policy,
+                    &mut gap_cache,
+                    stats,
                     diagnostics.as_deref_mut(),
                 )
                 .is_err()
@@ -305,7 +484,7 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                 cursor = (anchor.q_end, anchor.ref_end);
             }
             if !buildable
-                || append_gap_with_policy(
+                || append_cached_gap(
                     &mut split_ops,
                     query,
                     reference,
@@ -314,15 +493,37 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                     cursor.1,
                     flank_right.ref_start,
                     gap_policy,
+                    &mut gap_cache,
+                    stats,
                     diagnostics.as_deref_mut(),
                 )
                 .is_err()
             {
+                if let Some(t0) = t0 {
+                    stats.dissolution_dp_nanos = stats
+                        .dissolution_dp_nanos
+                        .saturating_add(t0.elapsed().as_nanos() as u64);
+                }
                 continue;
             }
 
+            // If split_ops has at most 1 gap open, the indel is not fragmented
+            // across multiple gaps; continuous DP cannot reduce gap opens further.
+            if count_gap_opens(&split_ops) <= 1 {
+                stats.candidate_runs_skipped_single_gap =
+                    stats.candidate_runs_skipped_single_gap.saturating_add(1);
+                if let Some(t0) = t0 {
+                    stats.dissolution_dp_nanos = stats
+                        .dissolution_dp_nanos
+                        .saturating_add(t0.elapsed().as_nanos() as u64);
+                }
+                continue;
+            }
+
+            stats.candidate_runs_dp_attempted = stats.candidate_runs_dp_attempted.saturating_add(1);
+
             let mut continuous_ops = Vec::new();
-            if append_gap_with_policy(
+            if append_cached_gap(
                 &mut continuous_ops,
                 query,
                 reference,
@@ -331,15 +532,28 @@ pub(super) fn dissolve_indel_spanning_anchor_runs(
                 flank_left.ref_end,
                 flank_right.ref_start,
                 gap_policy,
+                &mut gap_cache,
+                stats,
                 diagnostics.as_deref_mut(),
             )
             .is_err()
             {
+                if let Some(t0) = t0 {
+                    stats.dissolution_dp_nanos = stats
+                        .dissolution_dp_nanos
+                        .saturating_add(t0.elapsed().as_nanos() as u64);
+                }
                 continue;
             }
 
             let split_score = score_cigar_ops(&split_ops, q_sub, ref_sub, scoring_policy);
             let continuous_score = score_cigar_ops(&continuous_ops, q_sub, ref_sub, scoring_policy);
+            if let Some(t0) = t0 {
+                stats.dissolution_dp_nanos = stats
+                    .dissolution_dp_nanos
+                    .saturating_add(t0.elapsed().as_nanos() as u64);
+            }
+
             if continuous_score > split_score
                 || (continuous_score == split_score
                     && count_gap_opens(&continuous_ops) < count_gap_opens(&split_ops))
@@ -569,6 +783,76 @@ mod overlap_flank_tests {
             ref_start,
             ref_end,
         }
+    }
+
+    #[test]
+    fn repeat_detection_keeps_short_verified_motifs() {
+        assert!(is_low_complexity_str(b"ACACAC"));
+        assert!(is_low_complexity_str(b"AAAAAA"));
+    }
+
+    #[test]
+    fn coordinate_precheck_only_accepts_provable_single_gap_paths() {
+        let query = vec![b'A'; 50];
+        let reference = vec![b'A'; 50];
+        let one_gap = vec![
+            anchor(0, 10, 0, 10),
+            anchor(15, 25, 10, 20),
+            anchor(30, 40, 25, 35),
+        ];
+        assert!(provably_single_gap_path(&one_gap, 0, 2, &query, &reference));
+
+        let two_gaps = vec![
+            anchor(0, 10, 0, 10),
+            anchor(15, 25, 10, 20),
+            anchor(30, 40, 20, 30),
+        ];
+        assert!(!provably_single_gap_path(
+            &two_gaps, 0, 2, &query, &reference
+        ));
+
+        let mut mismatching_query = query;
+        mismatching_query[25] = b'C';
+        assert!(!provably_single_gap_path(
+            &one_gap,
+            0,
+            2,
+            &mismatching_query,
+            &reference
+        ));
+    }
+
+    #[test]
+    fn resolved_gaps_are_reused_verbatim() {
+        let query = vec![b'A'; 20];
+        let reference = vec![b'A'; 15];
+        let policy = ResolvedMapperPolicy::from_legacy_config(&Config::default())
+            .unwrap()
+            .gaps;
+        let mut cache = GapResolutionCache::new();
+        let mut stats = OverlapStats::default();
+        let mut first = Vec::new();
+        append_cached_gap(
+            &mut first, &query, &reference, 5, 10, 5, 5, &policy, &mut cache, &mut stats, None,
+        )
+        .unwrap();
+        let mut second = Vec::new();
+        append_cached_gap(
+            &mut second,
+            &query,
+            &reference,
+            5,
+            10,
+            5,
+            5,
+            &policy,
+            &mut cache,
+            &mut stats,
+            None,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(stats.gap_resolution_cache_hits, 1);
     }
 
     /// The two flanks of an expansion overlap on the reference. Trimming

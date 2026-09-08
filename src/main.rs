@@ -45,14 +45,11 @@ struct Options {
     near_exact: bool,
     near_exact_dp: bool,
     lazy_seed_cache: bool,
-    mapq_from_span: bool,
-    mapq_saturation: Option<i32>,
     dp_band_slack: Option<usize>,
     dp_max_drift: Option<usize>,
     dp_min_drift: Option<usize>,
     dual_affine: bool,
     max_secondary: usize,
-    mapq_calibration: Option<PathBuf>,
     mapq_mode: rs_lra::MapqMode,
     limit: Option<usize>,
     decompress_with: Option<String>,
@@ -127,14 +124,11 @@ impl Options {
         let mut diagonal_band: Option<i64> = None;
         let mut near_exact_dp = false;
         let mut lazy_seed_cache = false;
-        let mut mapq_from_span = false;
-        let mut mapq_saturation: Option<i32> = None;
         let mut dp_band_slack: Option<usize> = None;
         let mut dp_max_drift: Option<usize> = None;
         let mut dp_min_drift: Option<usize> = None;
         let mut dual_affine = false;
         let mut max_secondary = 0usize;
-        let mut mapq_calibration = None;
         let mut mapq_mode = rs_lra::MapqMode::Minimap2;
         let mut limit: Option<usize> = None;
         let mut decompress_with: Option<String> = None;
@@ -220,7 +214,7 @@ impl Options {
                     drop_contained = true;
                 }
                 "--dissolve-repeat-anchors" => {
-                    dissolve_repeat_run = Some(parse_positive(
+                    dissolve_repeat_run = Some(parse_count(
                         next_value(&mut args, &argument)?,
                         "dissolve-repeat-anchors",
                     )?);
@@ -252,15 +246,6 @@ impl Options {
                         "dp-min-drift",
                     )?);
                 }
-                "--mapq-saturation" => {
-                    mapq_saturation = Some(parse_count(
-                        next_value(&mut args, &argument)?,
-                        "mapq-saturation",
-                    )? as i32);
-                }
-                "--mapq-from-span" => {
-                    mapq_from_span = true;
-                }
                 "--lazy-seed-cache" => {
                     lazy_seed_cache = true;
                 }
@@ -276,9 +261,6 @@ impl Options {
                             value,
                         },
                     )?;
-                }
-                "--mapq-calibration" => {
-                    mapq_calibration = Some(PathBuf::from(next_value(&mut args, &argument)?));
                 }
                 "--mapq-mode" => {
                     let val = next_value(&mut args, &argument)?;
@@ -463,14 +445,11 @@ impl Options {
             near_exact,
             near_exact_dp,
             lazy_seed_cache,
-            mapq_from_span,
-            mapq_saturation,
             dp_band_slack,
             dp_max_drift,
             dp_min_drift,
             dual_affine,
             max_secondary,
-            mapq_calibration,
             mapq_mode,
             limit,
             decompress_with,
@@ -631,12 +610,9 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--lazy-seed-cache",
     "--dual-affine",
     "--secondary",
-    "--mapq-calibration",
     "--mapq-mode",
     "--mm2-mapq",
     "--legacy-mapq",
-    "--mapq-from-span",
-    "--mapq-saturation",
     "--dp-band-slack",
     "--dp-max-drift",
     "--dp-min-drift",
@@ -743,7 +719,6 @@ fn usage() -> &'static str {
         "      --standard            Deep DP gaps and full STR left-alignment (default)\n",
         "      --sensitive           Standard plus a wider candidate and DP ceiling\n",
         "  --secondary N            Emit up to N alternative loci (0..64; default 0)\n",
-        "  --mapq-calibration FILE  Conservative 61-row MAPQ cap table fitted to truth\n",
         "      --mapq-mode MODE      MAPQ calculation mode: mm2 (default) or legacy\n",
         "      --mm2-mapq            Calibrated MAPQ modeled on minimap2 (default)\n",
         "      --legacy-mapq         Legacy ratio-based MAPQ calculation\n",
@@ -756,19 +731,6 @@ fn usage() -> &'static str {
         "                            one banded pass instead of finding anchors\n",
         "      --dual-affine         Enable dual-affine gap DP (KSW2 extd2) with gap\n",
         "                            penalties 6/2, 24/1 (default: off)\n",
-        "      --mapq-saturation N   Score difference that settles a placement on its\n",
-        "                            own. A chain score is the sum of its anchor\n",
-        "                            lengths, so a 15 kb read scores in the thousands\n",
-        "                            and a rival 100 bases behind reads as a 0.7%\n",
-        "                            margin -- MAPQ 0 for 100 bases of unique\n",
-        "                            sequence. 250 is what a both-ends endpoint match\n",
-        "                            is worth in the ranking (default: 0, ratio only)\n",
-        "      --mapq-from-span      Score confidence by how much of the read the\n",
-        "                            chain spans, not by how densely its anchors\n",
-        "                            covered that span. Measured negative on every\n",
-        "                            index and preset tried, by 0.17 to 0.27 F1:\n",
-        "                            density says something the span does not\n",
-        "                            (default: off)\n",
         "      --dp-band-slack N     Band the banded pass adds beyond the measured\n",
         "                            drift. The end seeds bound only the net shift,\n",
         "                            so an internal +50 and -50 needs band the drift\n",
@@ -980,13 +942,6 @@ fn non_default_settings(options: &Options) -> Vec<String> {
     flag(parts, options.dual_affine, "dual-affine");
     if options.max_secondary > 0 {
         parts.push(format!("secondary={}", options.max_secondary));
-    }
-    if let Some(path) = &options.mapq_calibration {
-        parts.push(format!("mapq-calibration={}", path.display()));
-    }
-    flag(parts, options.mapq_from_span, "mapq-from-span");
-    if let Some(saturation) = options.mapq_saturation {
-        parts.push(format!("mapq-saturation {saturation}"));
     }
     if options.mapq_mode != rs_lra::MapqMode::Minimap2 {
         parts.push("mapq-mode=legacy".to_owned());
@@ -1539,18 +1494,11 @@ fn execute_mapping(
             );
         }
     }
-    let calibration = options
-        .mapq_calibration
-        .as_ref()
-        .map(rs_lra::MapqCalibration::open)
-        .transpose()
-        .map_err(|error| CliError::Pool(format!("MAPQ calibration: {error}")))?;
     let mapper_config = MapperConfig {
         mode: options.mode,
         runtime: runtime.clone(),
         dual_affine: options.dual_affine,
         max_secondary: options.max_secondary,
-        mapq_calibration: calibration.clone(),
         mapq_mode: options.mapq_mode,
     };
     // Experimental phase switches remain an explicit compatibility escape
@@ -1573,10 +1521,6 @@ fn execute_mapping(
                 near_exact_candidate: options.near_exact || options.near_exact_dp,
                 near_exact_dp: options.near_exact_dp,
                 lazy_seed_cache: options.lazy_seed_cache,
-                mapq_from_span: options.mapq_from_span,
-                mapq_score_saturation: options
-                    .mapq_saturation
-                    .unwrap_or(defaults.seeding.mapq_score_saturation),
                 near_exact_dp_band_slack: options
                     .dp_band_slack
                     .unwrap_or(defaults.seeding.near_exact_dp_band_slack),
@@ -1600,7 +1544,6 @@ fn execute_mapping(
             },
             alignment: rs_lra::AlignmentConfig {
                 max_secondary: options.max_secondary,
-                mapq_calibration: calibration,
                 mode: options.mode,
                 dual_affine: options.dual_affine,
                 mapq_mode: options.mapq_mode,
@@ -1831,9 +1774,13 @@ struct ProfileReporter {
     anchor_overlaps_trimmed: AtomicU64,
     anchor_overlaps_removed: AtomicU64,
     anchor_overlap_flanked_bases: AtomicU64,
-    mapq_span_applied: AtomicU64,
-    mapq_span_withheld: AtomicU64,
     lazy_seed_cache_rebuilds: AtomicU64,
+    anchor_runs_considered: AtomicU64,
+    anchor_runs_skipped_repeat: AtomicU64,
+    anchor_runs_skipped_single_gap: AtomicU64,
+    anchor_runs_dp_attempted: AtomicU64,
+    dissolution_gap_cache_hits: AtomicU64,
+    dissolution_dp_nanos: AtomicU64,
     anchor_runs_dissolved: AtomicU64,
     anchors_dissolved: AtomicU64,
     chain_query_gap_buckets: [AtomicU64; 7],
@@ -2142,17 +2089,30 @@ impl DiagnosticsSink for ProfileReporter {
                 diagnostics.anchor_overlap_flanked_bases,
             ),
             (
-                &self.mapq_span_applied,
-                diagnostics.mapq_span_applied as u64,
-            ),
-            (
-                &self.mapq_span_withheld,
-                diagnostics.mapq_span_withheld as u64,
-            ),
-            (
                 &self.lazy_seed_cache_rebuilds,
                 diagnostics.lazy_seed_cache_rebuilds as u64,
             ),
+            (
+                &self.anchor_runs_considered,
+                diagnostics.anchor_runs_considered,
+            ),
+            (
+                &self.anchor_runs_skipped_repeat,
+                diagnostics.anchor_runs_skipped_repeat,
+            ),
+            (
+                &self.anchor_runs_skipped_single_gap,
+                diagnostics.anchor_runs_skipped_single_gap,
+            ),
+            (
+                &self.anchor_runs_dp_attempted,
+                diagnostics.anchor_runs_dp_attempted,
+            ),
+            (
+                &self.dissolution_gap_cache_hits,
+                diagnostics.dissolution_gap_cache_hits,
+            ),
+            (&self.dissolution_dp_nanos, diagnostics.dissolution_dp_nanos),
             (
                 &self.anchor_runs_dissolved,
                 diagnostics.anchor_runs_dissolved,
@@ -2451,25 +2411,24 @@ impl ProfileReporter {
                 "  Overlap flank:         {flanked} anchor bases handed to the gap DP as context"
             );
         }
-        let span_applied = self.mapq_span_applied.load(Ordering::Relaxed);
-        let span_withheld = self.mapq_span_withheld.load(Ordering::Relaxed);
-        if span_applied + span_withheld > 0 {
-            eprintln!(
-                "  MAPQ from span:        {span_applied} placements had a rival to weigh, \
-                 {span_withheld} did not and kept the anchor-density term"
-            );
-        }
         let rebuilds = self.lazy_seed_cache_rebuilds.load(Ordering::Relaxed);
         if rebuilds > 0 {
             eprintln!(
                 "  Lazy seed cache:       {rebuilds} reads the banded pass declined, rebuilt in full"
             );
         }
-        let runs = self.anchor_runs_dissolved.load(Ordering::Relaxed);
-        if runs > 0 {
+        let considered = self.anchor_runs_considered.load(Ordering::Relaxed);
+        if considered > 0 {
+            let skipped_rep = self.anchor_runs_skipped_repeat.load(Ordering::Relaxed);
+            let skipped_gap = self.anchor_runs_skipped_single_gap.load(Ordering::Relaxed);
+            let attempted = self.anchor_runs_dp_attempted.load(Ordering::Relaxed);
+            let cache_hits = self.dissolution_gap_cache_hits.load(Ordering::Relaxed);
+            let runs = self.anchor_runs_dissolved.load(Ordering::Relaxed);
             let dissolved = self.anchors_dissolved.load(Ordering::Relaxed);
+            let nanos = self.dissolution_dp_nanos.load(Ordering::Relaxed);
+            let secs = nanos as f64 / 1e9;
             eprintln!(
-                "  Runs dissolved:        {runs} spans re-read by one DP, {dissolved} anchors dropped"
+                "  Repeat dissolution:    {considered} candidate spans ({skipped_rep} non-repeat, {skipped_gap} single-gap skipped), {attempted} continuous paths ({cache_hits} gap-cache hits; {runs} dissolved, {dissolved} anchors dropped), {secs:.3} s"
             );
         }
         let sampled = self.sampled_lookups_admitted.load(Ordering::Relaxed);
@@ -2734,8 +2693,7 @@ mod tests {
     /// only when this list is non-empty. An option the parser accepts but the
     /// list does not name is therefore accepted and silently ignored -- which
     /// is exactly what happened to --near-exact-dp, --lazy-seed-cache,
-    /// --dp-band-slack, --dp-max-drift, --dp-min-drift, --mapq-from-span and
-    /// --mapq-saturation, all of which ran to completion changing nothing.
+    /// --dp-band-slack, --dp-max-drift, and --dp-min-drift.
     ///
     /// Adding a search flag to KNOWN_OPTIONS without adding it to
     /// `non_default_settings` now fails here rather than in a profile that

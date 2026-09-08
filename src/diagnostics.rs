@@ -126,14 +126,13 @@ pub struct ReadDiagnostics {
     /// Reads whose end-window seed cache had to be rebuilt in full because
     /// the locked banded pass declined them. Under --lazy-seed-cache this is
     /// the only waste: their end windows were resolved twice.
-    /// Placements where --mapq-from-span replaced the anchor-density term,
-    /// and those where it was withheld because no rival had been weighed.
-    ///
-    /// A margin of 1.0 with no second score is an assumption rather than a
-    /// measurement, and the density term is then the only guard left.
-    pub mapq_span_applied: u32,
-    pub mapq_span_withheld: u32,
     pub lazy_seed_cache_rebuilds: u32,
+    pub anchor_runs_considered: u64,
+    pub anchor_runs_skipped_repeat: u64,
+    pub anchor_runs_skipped_single_gap: u64,
+    pub anchor_runs_dp_attempted: u64,
+    pub dissolution_gap_cache_hits: u64,
+    pub dissolution_dp_nanos: u64,
     pub anchor_runs_dissolved: u64,
     pub anchors_dissolved: u64,
     pub stage_a_anchors: u32,
