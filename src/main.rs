@@ -777,7 +777,7 @@ fn usage() -> &'static str {
         "                            chained anchors when the span they sit in carries\n",
         "                            an indel and the DP reads it at least as well. An\n",
         "                            expansion the scan filled with anchors otherwise\n",
-        "                            comes out short or split (default: off)\n",
+        "                            comes out short or split (default: 4; 0 disables)\n",
         "      --map-window N        Window for the local map's minimizer selection.\n",
         "                            A wider window stores fewer positions (default: 1)\n",
         "      --sampled-anchors     Let a sampled hit list seed anchors inside a\n",
