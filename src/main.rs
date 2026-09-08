@@ -1861,6 +1861,14 @@ struct ProfileReporter {
     near_exact_loci: AtomicU64,
     ambiguous_candidate_stops: AtomicU64,
     ambiguous_candidates_skipped: AtomicU64,
+    limited_candidate_budget_reads: AtomicU64,
+    limited_internal_only_skips: AtomicU64,
+    limited_score_breaks: AtomicU64,
+    limited_no_placement_breaks: AtomicU64,
+    limited_low_coverage_skips: AtomicU64,
+    limited_sparse_searches: AtomicU64,
+    limited_with_runner_up_reads: AtomicU64,
+    best_skipped_candidate_score: AtomicU64,
     query_seed_nanos: AtomicU64,
     probe_nanos: AtomicU64,
     candidate_nanos: AtomicU64,
@@ -2090,6 +2098,34 @@ impl DiagnosticsSink for ProfileReporter {
                 diagnostics.ambiguous_candidates_skipped as u64,
             ),
             (
+                &self.limited_candidate_budget_reads,
+                diagnostics.limited_candidate_budget_reads as u64,
+            ),
+            (
+                &self.limited_internal_only_skips,
+                diagnostics.limited_internal_only_skips as u64,
+            ),
+            (
+                &self.limited_score_breaks,
+                diagnostics.limited_score_breaks as u64,
+            ),
+            (
+                &self.limited_no_placement_breaks,
+                diagnostics.limited_no_placement_breaks as u64,
+            ),
+            (
+                &self.limited_low_coverage_skips,
+                diagnostics.limited_low_coverage_skips as u64,
+            ),
+            (
+                &self.limited_sparse_searches,
+                diagnostics.limited_sparse_searches as u64,
+            ),
+            (
+                &self.limited_with_runner_up_reads,
+                diagnostics.limited_with_runner_up_reads as u64,
+            ),
+            (
                 &self.anchor_overlaps_reference_only,
                 diagnostics.anchor_overlaps_reference_only,
             ),
@@ -2125,6 +2161,10 @@ impl DiagnosticsSink for ProfileReporter {
         ] {
             target.fetch_add(value, Ordering::Relaxed);
         }
+        self.best_skipped_candidate_score.fetch_max(
+            diagnostics.best_skipped_candidate_score.max(0) as u64,
+            Ordering::Relaxed,
+        );
         for (slot, value) in self
             .chain_ref_gap_buckets
             .iter()
@@ -2489,6 +2529,17 @@ impl ProfileReporter {
             self.adaptive_gap_escalations.load(Ordering::Relaxed),
             self.ambiguous_candidate_stops.load(Ordering::Relaxed),
             self.ambiguous_candidates_skipped.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "  Limited search:       {} budget; {} internal-only; {} score breaks; {} no-placement; {} low-coverage; {} sparse; {} with runner-up; max skipped score {}",
+            self.limited_candidate_budget_reads.load(Ordering::Relaxed),
+            self.limited_internal_only_skips.load(Ordering::Relaxed),
+            self.limited_score_breaks.load(Ordering::Relaxed),
+            self.limited_no_placement_breaks.load(Ordering::Relaxed),
+            self.limited_low_coverage_skips.load(Ordering::Relaxed),
+            self.limited_sparse_searches.load(Ordering::Relaxed),
+            self.limited_with_runner_up_reads.load(Ordering::Relaxed),
+            self.best_skipped_candidate_score.load(Ordering::Relaxed),
         );
         for (name, value) in [
             ("Query seeds", self.query_seed_nanos.load(Ordering::Relaxed)),
@@ -3138,20 +3189,12 @@ mod tests {
         let default_opts = Options::parse(base.into_iter().map(str::to_owned)).unwrap();
         assert_eq!(default_opts.mapq_mode, rs_lra::MapqMode::Minimap2);
 
-        let mm2_opts = Options::parse(
-            base.into_iter()
-                .chain(["--mm2-mapq"])
-                .map(str::to_owned),
-        )
-        .unwrap();
+        let mm2_opts =
+            Options::parse(base.into_iter().chain(["--mm2-mapq"]).map(str::to_owned)).unwrap();
         assert_eq!(mm2_opts.mapq_mode, rs_lra::MapqMode::Minimap2);
 
-        let legacy_opts = Options::parse(
-            base.into_iter()
-                .chain(["--legacy-mapq"])
-                .map(str::to_owned),
-        )
-        .unwrap();
+        let legacy_opts =
+            Options::parse(base.into_iter().chain(["--legacy-mapq"]).map(str::to_owned)).unwrap();
         assert_eq!(legacy_opts.mapq_mode, rs_lra::MapqMode::Legacy);
 
         let mode_legacy = Options::parse(

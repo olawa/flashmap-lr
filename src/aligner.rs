@@ -379,9 +379,15 @@ impl<'a> Aligner<'a> {
         // Candidate clustering itself caps the returned list. Reaching that
         // cap, or applying the mode's smaller candidate budget, means the
         // absence of a runner-up cannot be interpreted as proof of uniqueness.
-        let mut search_completeness = if candidates.len() >= self.policy.candidates.max_regions
-            || candidates.len() >= candidate_budget
-        {
+        let mut search_completeness = if candidate_search_is_limited(
+            candidates.len(),
+            self.policy.candidates.max_regions,
+            candidate_budget,
+        ) {
+            diagnostics.limited_candidate_budget_reads = 1;
+            if let Some(skipped) = candidates.get(candidate_budget) {
+                diagnostics.best_skipped_candidate_score = skipped.score;
+            }
             SearchCompleteness::Limited
         } else {
             SearchCompleteness::Complete
@@ -406,6 +412,11 @@ impl<'a> Aligner<'a> {
                     )
                 {
                     search_completeness = SearchCompleteness::Limited;
+                    diagnostics.limited_internal_only_skips =
+                        diagnostics.limited_internal_only_skips.saturating_add(1);
+                    diagnostics.best_skipped_candidate_score = diagnostics
+                        .best_skipped_candidate_score
+                        .max(candidate.score);
                     continue;
                 }
 
@@ -421,6 +432,11 @@ impl<'a> Aligner<'a> {
                             diagnostics.split_candidates_kept.saturating_add(1);
                     } else {
                         search_completeness = SearchCompleteness::Limited;
+                        diagnostics.limited_score_breaks =
+                            diagnostics.limited_score_breaks.saturating_add(1);
+                        diagnostics.best_skipped_candidate_score = diagnostics
+                            .best_skipped_candidate_score
+                            .max(candidate.score);
                         break;
                     }
                 }
@@ -460,6 +476,11 @@ impl<'a> Aligner<'a> {
                     )
                 {
                     search_completeness = SearchCompleteness::Limited;
+                    diagnostics.limited_score_breaks =
+                        diagnostics.limited_score_breaks.saturating_add(1);
+                    diagnostics.best_skipped_candidate_score = diagnostics
+                        .best_skipped_candidate_score
+                        .max(candidate.score);
                     break;
                 }
             }
@@ -467,6 +488,11 @@ impl<'a> Aligner<'a> {
                 && placements.is_empty()
             {
                 search_completeness = SearchCompleteness::Limited;
+                diagnostics.limited_no_placement_breaks =
+                    diagnostics.limited_no_placement_breaks.saturating_add(1);
+                diagnostics.best_skipped_candidate_score = diagnostics
+                    .best_skipped_candidate_score
+                    .max(candidate.score);
                 break;
             }
             let full_search = self.policy.work_budget.full_search_score_fraction <= 0.0
@@ -475,6 +501,8 @@ impl<'a> Aligner<'a> {
                     && idx < self.policy.work_budget.max_candidates_without_placement);
             if !full_search {
                 search_completeness = SearchCompleteness::Limited;
+                diagnostics.limited_sparse_searches =
+                    diagnostics.limited_sparse_searches.saturating_add(1);
             }
             if full_search {
                 diagnostics.full_anchor_searches =
@@ -553,6 +581,11 @@ impl<'a> Aligner<'a> {
                         < best_covered_fraction * self.policy.work_budget.low_coverage_fraction
                     {
                         search_completeness = SearchCompleteness::Limited;
+                        diagnostics.limited_low_coverage_skips =
+                            diagnostics.limited_low_coverage_skips.saturating_add(1);
+                        diagnostics.best_skipped_candidate_score = diagnostics
+                            .best_skipped_candidate_score
+                            .max(candidate.score);
                         continue;
                     }
                 }
@@ -789,18 +822,21 @@ impl<'a> Aligner<'a> {
                 .structural
                 .max_supplementary_query_overlap_fraction,
         );
+        diagnostics.observed_runner_up_score = second_score.unwrap_or(0);
+        if matches!(search_completeness, SearchCompleteness::Limited) && second_score.is_some() {
+            diagnostics.limited_with_runner_up_reads = 1;
+        }
         // Search completeness is a property of the read's whole search, so it
         // bounds every record the read produces, not only the primary.
         let confidence_cap = |mapq: u8| {
-            let mut mapq = mapq;
-            if matches!(search_completeness, SearchCompleteness::Limited) && second_score.is_none()
-            {
-                mapq = mapq.min(self.policy.work_budget.limited_mapq_cap);
-            }
-            if ambiguity_limited {
-                mapq = mapq.min(self.policy.work_budget.ambiguity_mapq_cap);
-            }
-            mapq
+            cap_mapq_for_search(
+                mapq,
+                search_completeness,
+                second_score.is_some(),
+                ambiguity_limited,
+                self.policy.work_budget.limited_mapq_cap,
+                self.policy.work_budget.ambiguity_mapq_cap,
+            )
         };
         // Anchor density says how the locus was found; the span says how much
         // of the read the placement claims. The factor was always meant to be
@@ -887,7 +923,12 @@ impl<'a> Aligner<'a> {
         );
         let mut supplementary = Vec::new();
         for (supplementary_contig, supplementary_chain, supplementary_support) in
-            select_supplementary_chains(*contig_id, chain, placements.iter().skip(1), &self.policy.structural)
+            select_supplementary_chains(
+                *contig_id,
+                chain,
+                placements.iter().skip(1),
+                &self.policy.structural,
+            )
         {
             let contig = self
                 .reference
@@ -916,9 +957,9 @@ impl<'a> Aligner<'a> {
                         .count();
                     let span = supplementary_chain
                         .q_end
-                        .saturating_sub(supplementary_chain.q_start) as f64;
-                    let span_fraction =
-                        (span / read.sequence.len().max(1) as f64).clamp(0.0, 1.0);
+                        .saturating_sub(supplementary_chain.q_start)
+                        as f64;
+                    let span_fraction = (span / read.sequence.len().max(1) as f64).clamp(0.0, 1.0);
                     confidence_cap(mapping_quality_minimap2(
                         endpoint_rank_score(
                             supplementary_chain.score,
@@ -939,29 +980,27 @@ impl<'a> Aligner<'a> {
                         competing_count,
                     ))
                 }
-                MapqMode::Legacy => {
-                    confidence_cap(mapping_quality_with_saturation(
-                        endpoint_rank_score(
-                            supplementary_chain.score,
-                            supplementary_support,
-                            read.sequence.len(),
-                        ),
-                        competing_rank_score(
-                            supplementary_chain,
-                            &placements,
-                            read.sequence.len(),
-                            self.policy
-                                .structural
-                                .max_supplementary_query_overlap_fraction,
-                        ),
-                        if self.policy.work_budget.mapq_from_span {
-                            1.0
-                        } else {
-                            chain_span_coverage(supplementary_chain)
-                        },
-                        self.policy.work_budget.mapq_score_saturation,
-                    ))
-                }
+                MapqMode::Legacy => confidence_cap(mapping_quality_with_saturation(
+                    endpoint_rank_score(
+                        supplementary_chain.score,
+                        supplementary_support,
+                        read.sequence.len(),
+                    ),
+                    competing_rank_score(
+                        supplementary_chain,
+                        &placements,
+                        read.sequence.len(),
+                        self.policy
+                            .structural
+                            .max_supplementary_query_overlap_fraction,
+                    ),
+                    if self.policy.work_budget.mapq_from_span {
+                        1.0
+                    } else {
+                        chain_span_coverage(supplementary_chain)
+                    },
+                    self.policy.work_budget.mapq_score_saturation,
+                )),
             };
             let mut alignment = crate::alignment::build_chain_alignment_with_policy(
                 read,
@@ -1905,6 +1944,38 @@ fn mapping_quality_minimap2(
     mapq
 }
 
+fn cap_mapq_for_search(
+    mut mapq: u8,
+    completeness: SearchCompleteness,
+    runner_up_observed: bool,
+    ambiguity_limited: bool,
+    limited_cap: u8,
+    ambiguity_cap: u8,
+) -> u8 {
+    // When no runner-up was resolved, bounded search means uniqueness was not
+    // established. If a runner-up was resolved, its score already bounds the
+    // MAPQ; diagnostics retain the stop reason so this choice can be calibrated
+    // empirically rather than assigning every limited search the same penalty.
+    if matches!(completeness, SearchCompleteness::Limited) && !runner_up_observed {
+        mapq = mapq.min(limited_cap);
+    }
+    if ambiguity_limited {
+        mapq = mapq.min(ambiguity_cap);
+    }
+    mapq
+}
+
+fn candidate_search_is_limited(
+    retained_candidates: usize,
+    clustering_cap: usize,
+    resolution_budget: usize,
+) -> bool {
+    // Equality with the clustering cap may hide truncated candidates. Equality
+    // with a smaller resolution budget does not: all retained candidates were
+    // inspected when their count exactly fits that budget.
+    retained_candidates >= clustering_cap || retained_candidates > resolution_budget
+}
+
 fn mapping_quality_with_saturation(
     best_score: i32,
     second_score: Option<i32>,
@@ -2085,16 +2156,16 @@ fn chains_compete_for_reference(
     if p_anc.strand != c_anc.strand {
         return false;
     }
-    let overlap = interval_overlap(
-        primary.ref_start as u32,
-        primary.ref_end as u32,
-        candidate.ref_start as u32,
-        candidate.ref_end as u32,
+    let overlap = interval_overlap_u64(
+        primary.ref_start,
+        primary.ref_end,
+        candidate.ref_start,
+        candidate.ref_end,
     );
     let shorter_ref_span = primary
         .ref_end
         .saturating_sub(primary.ref_start)
-        .min(candidate.ref_end.saturating_sub(candidate.ref_start)) as u32;
+        .min(candidate.ref_end.saturating_sub(candidate.ref_start));
     shorter_ref_span == 0 || overlap as f64 / shorter_ref_span as f64 > max_ref_overlap
 }
 
@@ -2110,7 +2181,12 @@ fn calibrate_mapq_with_alignment(
     let aligned_len: u32 = cigar
         .ops()
         .iter()
-        .filter(|op| matches!(op, crate::CigarOp::Match(_) | crate::CigarOp::Ins(_) | crate::CigarOp::Del(_)))
+        .filter(|op| {
+            matches!(
+                op,
+                crate::CigarOp::Match(_) | crate::CigarOp::Ins(_) | crate::CigarOp::Del(_)
+            )
+        })
         .map(|op| op.len())
         .sum();
     if aligned_len == 0 {
@@ -2145,7 +2221,7 @@ fn select_supplementary_chains<'a>(
                     primary,
                     *contig,
                     chain,
-                    0.20,
+                    policy.max_supplementary_reference_overlap_fraction,
                 )
         })
         .collect::<Vec<_>>();
@@ -2170,7 +2246,7 @@ fn select_supplementary_chains<'a>(
                 selected_chain,
                 candidate.0,
                 &candidate.1,
-                0.20,
+                policy.max_supplementary_reference_overlap_fraction,
             )
         }) {
             continue;
@@ -2184,6 +2260,12 @@ fn select_supplementary_chains<'a>(
 }
 
 fn interval_overlap(left_start: u32, left_end: u32, right_start: u32, right_end: u32) -> u32 {
+    left_end
+        .min(right_end)
+        .saturating_sub(left_start.max(right_start))
+}
+
+fn interval_overlap_u64(left_start: u64, left_end: u64, right_start: u64, right_end: u64) -> u64 {
     left_end
         .min(right_end)
         .saturating_sub(left_start.max(right_start))
@@ -2411,8 +2493,12 @@ mod tests {
         );
         let candidates = [disjoint, competing];
 
-        let selected =
-            select_supplementary_chains(ContigId(0), &primary, candidates.iter(), &structural_policy());
+        let selected = select_supplementary_chains(
+            ContigId(0),
+            &primary,
+            candidates.iter(),
+            &structural_policy(),
+        );
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].0, ContigId(1));
         assert_eq!(selected[0].1.q_start, 0);
@@ -2429,9 +2515,71 @@ mod tests {
             EndpointSupport::BothEnds,
         );
         let candidates = [tandem_repeat];
-        let selected =
-            select_supplementary_chains(ContigId(0), &primary, candidates.iter(), &structural_policy());
-        assert_eq!(selected.len(), 0, "tandem repeat matching same reference locus must not be supplementary");
+        let selected = select_supplementary_chains(
+            ContigId(0),
+            &primary,
+            candidates.iter(),
+            &structural_policy(),
+        );
+        assert_eq!(
+            selected.len(),
+            0,
+            "tandem repeat matching same reference locus must not be supplementary"
+        );
+    }
+
+    #[test]
+    fn supplementary_selection_keeps_supported_tandem_duplication_geometry() {
+        let primary = placement_chain(ContigId(0), 0, 6_000, 10_000, Strand::Forward, 12_000);
+        // The disjoint query halves advance by 3kb on the reference. Their
+        // 50% reference overlap is the signature of a possible 3kb tandem
+        // duplication, rather than repeated copies of one reference locus.
+        let duplicated = (
+            ContigId(0),
+            placement_chain(ContigId(0), 6_000, 12_000, 13_000, Strand::Forward, 12_000),
+            EndpointSupport::RightOnly,
+        );
+        let selected = select_supplementary_chains(
+            ContigId(0),
+            &primary,
+            [&duplicated].into_iter(),
+            &structural_policy(),
+        );
+        assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn supplementary_selection_rejects_seventy_percent_reference_overlap() {
+        let primary = placement_chain(ContigId(0), 0, 6_000, 10_000, Strand::Forward, 12_000);
+        let overlapping = (
+            ContigId(0),
+            placement_chain(ContigId(0), 6_000, 12_000, 11_800, Strand::Forward, 12_000),
+            EndpointSupport::RightOnly,
+        );
+        let selected = select_supplementary_chains(
+            ContigId(0),
+            &primary,
+            [&overlapping].into_iter(),
+            &structural_policy(),
+        );
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn limited_search_caps_mapq_only_without_an_observed_runner_up() {
+        let raw = mapping_quality_minimap2(1_000, Some(100), 1.0, 10, 1_000, 1);
+        assert_eq!(raw, 60);
+        assert_eq!(
+            cap_mapq_for_search(raw, SearchCompleteness::Limited, true, false, 50, 20),
+            60
+        );
+        assert_eq!(
+            cap_mapq_for_search(raw, SearchCompleteness::Limited, false, false, 50, 20),
+            50
+        );
+        assert!(!candidate_search_is_limited(4, 20, 4));
+        assert!(candidate_search_is_limited(5, 20, 4));
+        assert!(candidate_search_is_limited(20, 20, 20));
     }
 
     #[test]
@@ -2442,15 +2590,24 @@ mod tests {
         assert_eq!(calibrate_mapq_with_alignment(50, 0, 50, &clean_cigar), 0);
 
         // Clean read divergence <= 2% -> no penalty
-        assert_eq!(calibrate_mapq_with_alignment(60, 5000, 100, &clean_cigar), 60);
+        assert_eq!(
+            calibrate_mapq_with_alignment(60, 5000, 100, &clean_cigar),
+            60
+        );
 
         // Divergent read (10% mismatch) -> MAPQ dampened
         let mapq_div10 = calibrate_mapq_with_alignment(60, 5000, 1000, &clean_cigar);
-        assert!(mapq_div10 < 60 && mapq_div10 > 40, "expected dampened MAPQ, got {mapq_div10}");
+        assert!(
+            mapq_div10 < 60 && mapq_div10 > 40,
+            "expected dampened MAPQ, got {mapq_div10}"
+        );
 
         // Highly divergent read (30% mismatch) -> MAPQ heavily dampened
         let mapq_div30 = calibrate_mapq_with_alignment(60, 5000, 3000, &clean_cigar);
-        assert!(mapq_div30 <= 32, "expected heavily dampened MAPQ, got {mapq_div30}");
+        assert!(
+            mapq_div30 <= 32,
+            "expected heavily dampened MAPQ, got {mapq_div30}"
+        );
     }
 
     #[test]
@@ -2713,14 +2870,23 @@ mod tests {
         assert_eq!(mapping_quality_minimap2(10_000, None, 1.0, 20, 500, 10), 50);
 
         // 3. Competitor with decisive score ratio difference (15,000 vs 13,500, 10% diff) earns MAPQ 60
-        assert_eq!(mapping_quality_minimap2(15_000, Some(13_500), 1.0, 50, 1000, 1), 60);
+        assert_eq!(
+            mapping_quality_minimap2(15_000, Some(13_500), 1.0, 50, 1000, 1),
+            60
+        );
 
         // 4. Competitor in long read with small relative difference (15,000 vs 14,980, 20 points diff, 0.13%)
         // is suppressed by competitor ratio term to MAPQ 1 (minimap2 long-read repeat suppression)
-        assert_eq!(mapping_quality_minimap2(15_000, Some(14_980), 1.0, 50, 1000, 1), 1);
+        assert_eq!(
+            mapping_quality_minimap2(15_000, Some(14_980), 1.0, 50, 1000, 1),
+            1
+        );
 
         // 5. Competitor with moderate ratio (15,000 vs 14,500, 3.3% diff) earns intermediate MAPQ 23
-        assert_eq!(mapping_quality_minimap2(15_000, Some(14_500), 1.0, 50, 1000, 1), 23);
+        assert_eq!(
+            mapping_quality_minimap2(15_000, Some(14_500), 1.0, 50, 1000, 1),
+            23
+        );
 
         // 6. Short read with 20 score points difference (100 vs 80, 20% diff) earns MAPQ 56
         assert_eq!(mapping_quality_minimap2(100, Some(80), 1.0, 10, 100, 1), 56);
@@ -2729,9 +2895,15 @@ mod tests {
         assert_eq!(mapping_quality_minimap2(100, Some(95), 1.0, 10, 100, 1), 15);
 
         // 8. Exact tie gets MAPQ 0
-        assert_eq!(mapping_quality_minimap2(15_000, Some(15_000), 1.0, 50, 1000, 1), 0);
+        assert_eq!(
+            mapping_quality_minimap2(15_000, Some(15_000), 1.0, 50, 1000, 1),
+            0
+        );
 
         // 9. Strictly better placement gets at least MAPQ 1
-        assert_eq!(mapping_quality_minimap2(15_000, Some(14_999), 1.0, 50, 1000, 1), 1);
+        assert_eq!(
+            mapping_quality_minimap2(15_000, Some(14_999), 1.0, 50, 1000, 1),
+            1
+        );
     }
 }

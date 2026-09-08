@@ -560,6 +560,10 @@ pub(crate) struct StructuralPolicy {
     pub(crate) bridge_score_penalty: i32,
     pub(crate) min_supplementary_bases: u32,
     pub(crate) max_supplementary_query_overlap_fraction: f64,
+    /// Same-locus suppression threshold. A high threshold removes duplicate
+    /// repeat placements while retaining split geometries that advance along
+    /// the reference, such as tandem duplications with unique flanks.
+    pub(crate) max_supplementary_reference_overlap_fraction: f64,
     pub(crate) max_supplementary_alignments: usize,
 }
 
@@ -1053,6 +1057,7 @@ impl ResolvedMapperPolicy {
             bridge_score_penalty: 40,
             min_supplementary_bases: 500,
             max_supplementary_query_overlap_fraction: 0.20,
+            max_supplementary_reference_overlap_fraction: 0.60,
             max_supplementary_alignments: 4,
         };
         let scoring = if dual_affine {

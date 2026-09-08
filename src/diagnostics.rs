@@ -169,6 +169,21 @@ pub struct ReadDiagnostics {
     pub near_exact_loci: u32,
     pub ambiguous_candidate_stops: u32,
     pub ambiguous_candidates_skipped: u32,
+    /// Why candidate resolution declared the search incomplete. These are
+    /// separate because their implications for MAPQ are not equivalent.
+    pub limited_candidate_budget_reads: u32,
+    pub limited_internal_only_skips: u32,
+    pub limited_score_breaks: u32,
+    pub limited_no_placement_breaks: u32,
+    pub limited_low_coverage_skips: u32,
+    pub limited_sparse_searches: u32,
+    pub limited_with_runner_up_reads: u32,
+    /// Highest pre-chaining candidate score explicitly skipped in this read.
+    /// Zero means either none was observed or truncation hid the next score.
+    pub best_skipped_candidate_score: i32,
+    /// Endpoint-adjusted chain score of the observed competing placement.
+    /// Zero means no runner-up was resolved.
+    pub observed_runner_up_score: i32,
     pub query_seed_nanos: u64,
     pub probe_nanos: u64,
     pub candidate_nanos: u64,

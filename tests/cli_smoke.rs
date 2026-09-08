@@ -416,7 +416,11 @@ fn mapq_mode_cli_flag_selects_calculation() {
             String::from_utf8_lossy(&output.stderr)
         );
         let sam = fs::read_to_string(root.join("out.sam")).unwrap();
-        let record = sam.lines().find(|l| l.starts_with("read1\t")).unwrap().to_owned();
+        let record = sam
+            .lines()
+            .find(|l| l.starts_with("read1\t"))
+            .unwrap()
+            .to_owned();
         record.split('\t').nth(4).unwrap().parse::<u8>().unwrap()
     };
 
@@ -424,11 +428,13 @@ fn mapq_mode_cli_flag_selects_calculation() {
     let mm2_mapq = run(Some("--mm2-mapq"));
     let legacy_mapq = run(Some("--legacy-mapq"));
 
-    assert_eq!(default_mapq, 60, "Default MAPQ should be 60 for unambiguous read");
+    assert_eq!(
+        default_mapq, 60,
+        "Default MAPQ should be 60 for unambiguous read"
+    );
     assert_eq!(mm2_mapq, 60, "MM2 MAPQ should be 60 for unambiguous read");
     // Legacy calculation also yields a valid mapq (<= 60)
     assert!(legacy_mapq <= 60);
 
     fs::remove_dir_all(root).unwrap();
 }
-
