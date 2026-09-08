@@ -31,6 +31,9 @@ pub struct ReadDiagnostics {
     pub emms_variant_anchors: u32,
     pub emms_variant_anchor_bases: u64,
     pub emms_anchor_mismatches: u64,
+    pub snp_emms_anchors_accepted: u32,
+    pub snp_emms_anchor_bases: u64,
+    pub snp_emms_mismatches: u64,
     pub structural_chain_bridges: u32,
     pub supplementary_alignments: u32,
     pub secondary_alignments: u32,
@@ -65,6 +68,9 @@ pub struct ReadDiagnostics {
     /// Diagonal drift of an unambiguous locus: the band a whole-read DP needs.
     pub local_kmer_map_builds: u32,
     pub local_kmer_map_nanos: u64,
+    /// Candidate-local k-mer lookups bucketed by reference multiplicity:
+    /// absent, 1, 2-4, 5-8, 9-16, 17-32, and 33+.
+    pub local_kmer_frequency_buckets: [u64; 7],
     /// Query positions the anchor scan encoded and looked up.
     pub scan_positions_visited: u64,
     /// Reference hits those lookups returned and the scan considered.

@@ -2,9 +2,10 @@ use rs_lra::io::{
     load_reference_path, open_fastx_with_decompressor, resolve_decompressor, AlignmentSink,
 };
 use rs_lra::{
-    Aligner, AlignerConfig, AlignmentMode, CigarOp, Config, DiagnosticsSink, InMemorySeedIndex,
-    MappedRead, MapperConfig, MinimizerIndex, MinimizerIndexError, ReadDiagnostics, Reference,
-    RuntimeConfig, SeedIndex, WorkerPool, WorkerPoolError, WorkerPoolStats,
+    Aligner, AlignerConfig, AlignmentMode, AnchorExtensionMode, CigarOp, Config, DiagnosticsSink,
+    InMemorySeedIndex, MappedRead, MapperConfig, MinimizerIndex, MinimizerIndexError,
+    ReadDiagnostics, Reference, RuntimeConfig, SeedIndex, WorkerPool, WorkerPoolError,
+    WorkerPoolStats,
 };
 use std::env;
 use std::io::{self, Write};
@@ -34,6 +35,9 @@ struct Options {
     reseed: bool,
     sampled_anchors: bool,
     anchor_k: Option<usize>,
+    anchor_extension: AnchorExtensionMode,
+    anchor_extension_relock: usize,
+    local_kmer_max_frequency: usize,
     map_window: usize,
     island_lookback: Option<usize>,
     dissolve_repeat_run: Option<usize>,
@@ -114,6 +118,9 @@ impl Options {
         let mut reseed = false;
         let mut sampled_anchors = false;
         let mut anchor_k: Option<usize> = None;
+        let mut anchor_extension = AnchorExtensionMode::Exact;
+        let mut anchor_extension_relock = 24usize;
+        let mut local_kmer_max_frequency = 128usize;
         let mut map_window = 1usize;
         let mut island_lookback: Option<usize> = None;
         let mut dissolve_repeat_run: Option<usize> = None;
@@ -179,6 +186,21 @@ impl Options {
                         next_value(&mut args, &argument)?,
                         "anchor-k",
                     )?);
+                }
+                "--anchor-extension" => {
+                    anchor_extension = next_value(&mut args, &argument)?
+                        .parse()
+                        .map_err(CliError::InvalidAnchorExtension)?;
+                }
+                "--anchor-extension-relock" => {
+                    anchor_extension_relock = parse_positive(
+                        next_value(&mut args, &argument)?,
+                        "anchor-extension-relock",
+                    )?;
+                }
+                "--local-kmer-max-freq" => {
+                    local_kmer_max_frequency =
+                        parse_count(next_value(&mut args, &argument)?, "local-kmer-max-freq")?;
                 }
                 "--map-window" => {
                     map_window = parse_positive(next_value(&mut args, &argument)?, "map-window")?;
@@ -266,7 +288,7 @@ impl Options {
                     let val = next_value(&mut args, &argument)?;
                     mapq_mode = val
                         .parse::<rs_lra::MapqMode>()
-                        .map_err(|msg| CliError::InvalidMapqMode(msg))?;
+                        .map_err(CliError::InvalidMapqMode)?;
                 }
                 "--mm2-mapq" => {
                     mapq_mode = rs_lra::MapqMode::Minimap2;
@@ -434,6 +456,9 @@ impl Options {
             reseed,
             sampled_anchors,
             anchor_k,
+            anchor_extension,
+            anchor_extension_relock,
+            local_kmer_max_frequency,
             map_window,
             island_lookback,
             dissolve_repeat_run,
@@ -497,6 +522,7 @@ enum CliError {
     Output(io::Error),
     Pool(String),
     InvalidMapqMode(String),
+    InvalidAnchorExtension(String),
 }
 
 impl std::fmt::Display for CliError {
@@ -544,6 +570,7 @@ impl std::fmt::Display for CliError {
             Self::Output(error) => write!(f, "output: {error}"),
             Self::Pool(error) => f.write_str(error),
             Self::InvalidMapqMode(error) => f.write_str(error),
+            Self::InvalidAnchorExtension(error) => f.write_str(error),
         }
     }
 }
@@ -597,6 +624,9 @@ const KNOWN_OPTIONS: &[&str] = &[
     "--reseed",
     "--sampled-anchors",
     "--anchor-k",
+    "--anchor-extension",
+    "--anchor-extension-relock",
+    "--local-kmer-max-freq",
     "--map-window",
     "--island-lookback",
     "--dissolve-repeat-anchors",
@@ -751,6 +781,15 @@ fn usage() -> &'static str {
         "      --anchor-k N          Seed length for the local anchor scan. A shorter\n",
         "                            seed than the anchor it must reach spends most of\n",
         "                            its extensions on matches that cannot (default: 15)\n",
+        "      --anchor-extension M  Local seed extension: exact or snp-emms. SNP-EMMS\n",
+        "                            bridges isolated substitutions after 24 exact\n",
+        "                            re-lock bases (default: exact)\n",
+        "      --anchor-extension-relock N\n",
+        "                            Exact bases required after each SNP-EMMS\n",
+        "                            substitution (default: 24)\n",
+        "      --local-kmer-max-freq N\n",
+        "                            Largest candidate-local k-mer bucket allowed to\n",
+        "                            start anchors; 0 disables local hits (default: 128)\n",
         "      --diagonal-band N     Skip a seed more than N bases from the candidate's\n",
         "                            diagonal. Must exceed the indels a chain carries:\n",
         "                            13.8% span a kilobase (default: no limit)\n",
@@ -920,6 +959,21 @@ fn non_default_settings(options: &Options) -> Vec<String> {
     flag(parts, options.drop_contained, "drop-contained-anchors");
     flag(parts, options.rarest_first, "rarest-first");
     flag(parts, options.sampled_anchors, "sampled-anchors");
+    if options.anchor_extension != AnchorExtensionMode::Exact {
+        parts.push("anchor-extension snp-emms".to_owned());
+    }
+    if options.anchor_extension_relock != 24 {
+        parts.push(format!(
+            "anchor-extension-relock {}",
+            options.anchor_extension_relock
+        ));
+    }
+    if options.local_kmer_max_frequency != 128 {
+        parts.push(format!(
+            "local-kmer-max-freq {}",
+            options.local_kmer_max_frequency
+        ));
+    }
     flag(parts, options.reseed, "reseed");
     flag(
         parts,
@@ -1506,12 +1560,13 @@ fn execute_mapping(
     // the small public MapperConfig and therefore cannot accidentally combine
     // hidden algorithm thresholds with a mode selection.
     // A setting the banner names must be one the configuration receives.
-    let aligner_config = if !non_default_settings(&options).is_empty() {
+    let aligner_config = if !non_default_settings(options).is_empty() {
         let defaults = Config::default();
         let legacy = Config {
             seeding: rs_lra::SeedingConfig {
                 reseed_uncovered: options.reseed,
                 sampled_anchors: options.sampled_anchors,
+                local_kmer_max_frequency: options.local_kmer_max_frequency,
                 map_window: options.map_window,
                 rarest_first: options.rarest_first,
                 diagonal_band: options.diagonal_band.unwrap_or(i64::MAX),
@@ -1535,6 +1590,8 @@ fn execute_mapping(
             },
             candidates: rs_lra::CandidateConfig {
                 anchor_k: options.anchor_k.unwrap_or(defaults.candidates.anchor_k),
+                anchor_extension: options.anchor_extension,
+                snp_emms_relock_span: options.anchor_extension_relock,
                 paired_emms: options.paired_emms,
                 emms_max_mismatch_run: options.emms_max_mismatch_run,
                 emms_relock_span: options.emms_relock_span,
@@ -1728,6 +1785,9 @@ struct ProfileReporter {
     emms_variant_anchors: AtomicU64,
     emms_variant_anchor_bases: AtomicU64,
     emms_anchor_mismatches: AtomicU64,
+    snp_emms_anchors_accepted: AtomicU64,
+    snp_emms_anchor_bases: AtomicU64,
+    snp_emms_mismatches: AtomicU64,
     structural_chain_bridges: AtomicU64,
     supplementary_alignments: AtomicU64,
     secondary_alignments: AtomicU64,
@@ -1760,6 +1820,7 @@ struct ProfileReporter {
     adaptive_gap_escalations: AtomicU64,
     local_kmer_map_builds: AtomicU64,
     local_kmer_map_nanos: AtomicU64,
+    local_kmer_frequency_buckets: [AtomicU64; 7],
     scan_positions_visited: AtomicU64,
     scan_hits_examined: AtomicU64,
     scan_extensions: AtomicU64,
@@ -1897,6 +1958,15 @@ impl DiagnosticsSink for ProfileReporter {
                 &self.emms_anchor_mismatches,
                 diagnostics.emms_anchor_mismatches,
             ),
+            (
+                &self.snp_emms_anchors_accepted,
+                diagnostics.snp_emms_anchors_accepted as u64,
+            ),
+            (
+                &self.snp_emms_anchor_bases,
+                diagnostics.snp_emms_anchor_bases,
+            ),
+            (&self.snp_emms_mismatches, diagnostics.snp_emms_mismatches),
             (
                 &self.structural_chain_bridges,
                 diagnostics.structural_chain_bridges as u64,
@@ -2205,6 +2275,12 @@ impl DiagnosticsSink for ProfileReporter {
                 Ordering::Relaxed,
             );
         }
+        for index in 0..7 {
+            self.local_kmer_frequency_buckets[index].fetch_add(
+                diagnostics.local_kmer_frequency_buckets[index],
+                Ordering::Relaxed,
+            );
+        }
         self.best_skipped_candidate_score.fetch_max(
             diagnostics.best_skipped_candidate_score.max(0) as u64,
             Ordering::Relaxed,
@@ -2322,6 +2398,14 @@ impl ProfileReporter {
             self.emms_pairs_considered.load(Ordering::Relaxed),
             self.emms_variant_anchors.load(Ordering::Relaxed),
         );
+        let snp_emms_anchors = self.snp_emms_anchors_accepted.load(Ordering::Relaxed);
+        if snp_emms_anchors > 0 {
+            eprintln!(
+                "  SNP-EMMS extension:   {snp_emms_anchors} anchors, {:.3} Mb, {} substitutions bridged",
+                self.snp_emms_anchor_bases.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+                self.snp_emms_mismatches.load(Ordering::Relaxed),
+            );
+        }
         eprintln!(
             "                         {:.3} Mb total / {:.3} Mb variant span; {:.3}% variant mismatches",
             emms_bases as f64 / 1_000_000.0,
@@ -2414,6 +2498,19 @@ impl ProfileReporter {
             sa,
             sbc,
             100.0 * sbc as f64 / (sa + sbc).max(1) as f64,
+        );
+        let local_frequency = std::array::from_fn::<_, 7, _>(|index| {
+            self.local_kmer_frequency_buckets[index].load(Ordering::Relaxed)
+        });
+        eprintln!(
+            "                         local k-mer lookups by frequency: absent {}, 1 {}, 2-4 {}, 5-8 {}, 9-16 {}, 17-32 {}, 33+ {}",
+            local_frequency[0],
+            local_frequency[1],
+            local_frequency[2],
+            local_frequency[3],
+            local_frequency[4],
+            local_frequency[5],
+            local_frequency[6],
         );
         let stage_a_bases = self.stage_a_query_bases.load(Ordering::Relaxed);
         let added_bases = self.stage_bc_added_query_bases.load(Ordering::Relaxed);
@@ -2904,9 +3001,14 @@ mod tests {
             // Try it as a switch first, then as one taking a value; a search
             // option has to be reachable in one of those two shapes.
             let base = ["rs-lra", "-i", "index.fmi", "-q", "reads.fq"];
+            let value = if option == "--anchor-extension" {
+                "snp-emms"
+            } else {
+                "8"
+            };
             let parsed = [
                 vec![option.to_owned()],
-                vec![option.to_owned(), "8".to_owned()],
+                vec![option.to_owned(), value.to_owned()],
             ]
             .into_iter()
             .find_map(|extra| {
@@ -3069,6 +3171,33 @@ mod tests {
         assert!(options.paired_emms);
         assert_eq!(options.emms_max_mismatch_run, 1);
         assert_eq!(options.emms_relock_span, 24);
+    }
+
+    #[test]
+    fn parser_accepts_snp_emms_and_local_kmer_cap() {
+        let options = Options::parse(
+            [
+                "rs-lra",
+                "-i",
+                "ref.fmi",
+                "-q",
+                "reads.fq",
+                "--anchor-extension",
+                "snp-emms",
+                "--anchor-extension-relock",
+                "48",
+                "--local-kmer-max-freq",
+                "16",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+
+        assert_eq!(options.anchor_extension, AnchorExtensionMode::SnpEmms);
+        assert_eq!(options.anchor_extension_relock, 48);
+        assert_eq!(options.local_kmer_max_frequency, 16);
+        assert!(!options.paired_emms);
     }
 
     #[test]

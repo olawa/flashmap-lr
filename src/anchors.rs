@@ -13,7 +13,7 @@ use std::collections::hash_map::Entry;
 
 use crate::fxhash::{FxHashMap as HashMap, FxHashMapExt, FxHashSet as HashSet, FxHashSetExt};
 
-use crate::config::{AnchorPolicy, ResolvedMapperPolicy};
+use crate::config::{AnchorExtensionMode, AnchorPolicy, ResolvedMapperPolicy};
 use crate::dna::{base_code, encode_kmer};
 use crate::minimizer_index::hash_code;
 use crate::{
@@ -412,31 +412,38 @@ impl LocalKmerMap {
 
     /// Return only non-repetitive local k-mer buckets.
     ///
-    /// FlashMap's local map deliberately emits no positions when a bucket has
-    /// more than 128 entries. A sampled subset of a repetitive k-mer is not
-    /// safe evidence for a placement, so retain that invariant here.
-    fn positions(&self, code: u64) -> Option<RefPositions<'_>> {
+    /// A sampled subset of a repetitive k-mer is not safe evidence for a
+    /// placement, so reject the entire bucket above the configured limit.
+    fn positions(&self, code: u64, max_frequency: usize) -> (usize, Option<RefPositions<'_>>) {
         if !self.packed.is_empty() {
             let start = self
                 .packed
                 .partition_point(|&entry| entry >> self.offset_bits < code);
             let end = start
                 + self.packed[start..].partition_point(|&entry| entry >> self.offset_bits == code);
-            if end == start || end - start > 128 {
-                return None;
+            let frequency = end - start;
+            if frequency == 0 || frequency > max_frequency {
+                return (frequency, None);
             }
-            Some(RefPositions::Packed {
-                entries: self.packed[start..end].iter(),
-                mask: self.offset_mask,
-                base: self.window_start,
-            })
+            (
+                frequency,
+                Some(RefPositions::Packed {
+                    entries: self.packed[start..end].iter(),
+                    mask: self.offset_mask,
+                    base: self.window_start,
+                }),
+            )
         } else {
             let start = self.pairs.partition_point(|&(entry, _)| entry < code);
             let end = start + self.pairs[start..].partition_point(|&(entry, _)| entry == code);
-            if end == start || end - start > 128 {
-                return None;
+            let frequency = end - start;
+            if frequency == 0 || frequency > max_frequency {
+                return (frequency, None);
             }
-            Some(RefPositions::Pairs(self.pairs[start..end].iter()))
+            (
+                frequency,
+                Some(RefPositions::Pairs(self.pairs[start..end].iter())),
+            )
         }
     }
 }
@@ -797,6 +804,11 @@ fn find_anchors_with_seed_hits_depth(
     let on_diagonal = std::cell::Cell::new(0u64);
     let on_wide_diagonal = std::cell::Cell::new(0u64);
     let anchors_on_diagonal = std::cell::Cell::new(0u64);
+    let snp_emms_anchors = std::cell::Cell::new(0u32);
+    let snp_emms_bases = std::cell::Cell::new(0u64);
+    let snp_emms_mismatches = std::cell::Cell::new(0u64);
+    let local_frequency_buckets: [std::cell::Cell<u64>; 7] =
+        std::array::from_fn(|_| std::cell::Cell::new(0));
     // The clustering already found this: `diagonal_mean` is the mean of
     // `query - ref` over the probes that formed the region, so it is the
     // alignment's diagonal rather than the region's corner.
@@ -860,10 +872,21 @@ fn find_anchors_with_seed_hits_depth(
                 } else {
                     code
                 };
-                local_kmer_map
-                    .as_ref()
-                    .and_then(|map| map.positions(code))
-                    .unwrap_or_default()
+                let (frequency, positions) = local_kmer_map.as_ref().map_or((0, None), |map| {
+                    map.positions(code, anchor_policy.local_kmer_max_frequency)
+                });
+                let bucket = match frequency {
+                    0 => 0,
+                    1 => 1,
+                    2..=4 => 2,
+                    5..=8 => 3,
+                    9..=16 => 4,
+                    17..=32 => 5,
+                    _ => 6,
+                };
+                local_frequency_buckets[bucket]
+                    .set(local_frequency_buckets[bucket].get().saturating_add(1));
+                positions.unwrap_or_default()
             };
 
             for ref_start in ref_positions {
@@ -895,7 +918,7 @@ fn find_anchors_with_seed_hits_depth(
                 if drift <= 5_000 {
                     on_wide_diagonal.set(on_wide_diagonal.get().saturating_add(1));
                 }
-                let Some(anchor) = extend_exact_anchor(ExactAnchorRequest {
+                let request = ExactAnchorRequest {
                     read: read.sequence,
                     reference: contig.sequence,
                     ref_id: candidate.contig,
@@ -907,9 +930,31 @@ fn find_anchors_with_seed_hits_depth(
                     window_end,
                     min_length: anchor_policy.min_anchor_length,
                     seed_verified: verified,
-                }) else {
+                };
+                let extension = match anchor_policy.extension_mode {
+                    AnchorExtensionMode::Exact => {
+                        extend_exact_anchor(request).map(|anchor| (anchor, 0))
+                    }
+                    AnchorExtensionMode::SnpEmms => {
+                        extend_snp_emms_anchor(request, anchor_policy.snp_emms_relock_span)
+                    }
+                };
+                let Some((anchor, snp_mismatches)) = extension else {
                     continue;
                 };
+                if snp_mismatches > 0 {
+                    snp_emms_anchors.set(snp_emms_anchors.get().saturating_add(1));
+                    snp_emms_bases.set(
+                        snp_emms_bases
+                            .get()
+                            .saturating_add(u64::from(anchor.q_end.saturating_sub(anchor.q_start))),
+                    );
+                    snp_emms_mismatches.set(
+                        snp_emms_mismatches
+                            .get()
+                            .saturating_add(snp_mismatches as u64),
+                    );
+                }
 
                 let full_span = is_full_span_anchor(
                     anchor.q_start,
@@ -1068,6 +1113,22 @@ fn find_anchors_with_seed_hits_depth(
         stats.anchors_on_diagonal_50 = stats
             .anchors_on_diagonal_50
             .saturating_add(anchors_on_diagonal.get());
+        stats.snp_emms_anchors_accepted = stats
+            .snp_emms_anchors_accepted
+            .saturating_add(snp_emms_anchors.get());
+        stats.snp_emms_anchor_bases = stats
+            .snp_emms_anchor_bases
+            .saturating_add(snp_emms_bases.get());
+        stats.snp_emms_mismatches = stats
+            .snp_emms_mismatches
+            .saturating_add(snp_emms_mismatches.get());
+        for (target, source) in stats
+            .local_kmer_frequency_buckets
+            .iter_mut()
+            .zip(local_frequency_buckets.iter())
+        {
+            *target = target.saturating_add(source.get());
+        }
         stats.stage_a_anchors = stats.stage_a_anchors.saturating_add(stage_a as u32);
         stats.stage_bc_anchors = stats
             .stage_bc_anchors
@@ -1511,6 +1572,7 @@ fn build_paired_emms_anchor(
     ))
 }
 
+#[derive(Clone, Copy)]
 struct ExactAnchorRequest<'a> {
     read: &'a [u8],
     reference: &'a [u8],
@@ -1626,6 +1688,165 @@ fn extend_exact_anchor(request: ExactAnchorRequest<'_>) -> Option<Anchor> {
         score: length.min(i32::MAX as usize) as i32,
         repeat_ambiguous: false,
     })
+}
+
+/// Extend an ordinary exact anchor over isolated substitutions while staying
+/// on the seed's diagonal. Every bridged base must be followed, in that
+/// direction, by `relock_span` exact bases. An indel therefore fails the
+/// re-lock instead of silently moving the anchor into another register.
+fn extend_snp_emms_anchor(
+    request: ExactAnchorRequest<'_>,
+    relock_span: usize,
+) -> Option<(Anchor, usize)> {
+    const MAX_MISMATCHES: usize = 32;
+    const MAX_MISMATCH_PERCENT: usize = 8;
+
+    let original = extend_exact_anchor(request)?;
+    if relock_span == 0 {
+        return Some((original, 0));
+    }
+    let mut anchor = original;
+    let mut mismatches = 0usize;
+
+    loop {
+        let q = anchor.q_end as usize;
+        if q >= request.read.len() {
+            break;
+        }
+        let Some(r) = (match request.strand {
+            Strand::Forward => Some(anchor.ref_end),
+            Strand::Reverse => anchor.ref_start.checked_sub(1),
+        }) else {
+            break;
+        };
+        if r < request.window_start as u64 || r >= request.window_end as u64 {
+            break;
+        }
+        if bases_match(
+            request.read[q],
+            request.reference[r as usize],
+            request.strand,
+        ) {
+            anchor.q_end += 1;
+            match request.strand {
+                Strand::Forward => anchor.ref_end += 1,
+                Strand::Reverse => anchor.ref_start -= 1,
+            }
+            continue;
+        }
+        if mismatches == MAX_MISMATCHES
+            || base_code(request.read[q]).is_none()
+            || base_code(request.reference[r as usize]).is_none()
+        {
+            break;
+        }
+        let mut exact = 0usize;
+        while exact < relock_span {
+            let q_next = q + 1 + exact;
+            if q_next >= request.read.len() {
+                break;
+            }
+            let r_next = match request.strand {
+                Strand::Forward => r.checked_add(1 + exact as u64),
+                Strand::Reverse => r.checked_sub(1 + exact as u64),
+            };
+            let Some(r_next) = r_next else {
+                break;
+            };
+            if r_next < request.window_start as u64
+                || r_next >= request.window_end as u64
+                || !bases_match(
+                    request.read[q_next],
+                    request.reference[r_next as usize],
+                    request.strand,
+                )
+            {
+                break;
+            }
+            exact += 1;
+        }
+        if exact < relock_span {
+            break;
+        }
+        let accepted = 1 + exact;
+        anchor.q_end = anchor.q_end.saturating_add(accepted as u32);
+        match request.strand {
+            Strand::Forward => anchor.ref_end += accepted as u64,
+            Strand::Reverse => anchor.ref_start -= accepted as u64,
+        }
+        mismatches += 1;
+    }
+
+    while let Some(q) = (anchor.q_start as usize).checked_sub(1) {
+        let Some(r) = (match request.strand {
+            Strand::Forward => anchor.ref_start.checked_sub(1),
+            Strand::Reverse => Some(anchor.ref_end),
+        }) else {
+            break;
+        };
+        if r < request.window_start as u64 || r >= request.window_end as u64 {
+            break;
+        }
+        if bases_match(
+            request.read[q],
+            request.reference[r as usize],
+            request.strand,
+        ) {
+            anchor.q_start -= 1;
+            match request.strand {
+                Strand::Forward => anchor.ref_start -= 1,
+                Strand::Reverse => anchor.ref_end += 1,
+            }
+            continue;
+        }
+        if mismatches == MAX_MISMATCHES
+            || base_code(request.read[q]).is_none()
+            || base_code(request.reference[r as usize]).is_none()
+        {
+            break;
+        }
+        let mut exact = 0usize;
+        while exact < relock_span {
+            let Some(q_next) = q.checked_sub(1 + exact) else {
+                break;
+            };
+            let r_next = match request.strand {
+                Strand::Forward => r.checked_sub(1 + exact as u64),
+                Strand::Reverse => r.checked_add(1 + exact as u64),
+            };
+            let Some(r_next) = r_next else {
+                break;
+            };
+            if r_next < request.window_start as u64
+                || r_next >= request.window_end as u64
+                || !bases_match(
+                    request.read[q_next],
+                    request.reference[r_next as usize],
+                    request.strand,
+                )
+            {
+                break;
+            }
+            exact += 1;
+        }
+        if exact < relock_span {
+            break;
+        }
+        let accepted = 1 + exact;
+        anchor.q_start = anchor.q_start.saturating_sub(accepted as u32);
+        match request.strand {
+            Strand::Forward => anchor.ref_start -= accepted as u64,
+            Strand::Reverse => anchor.ref_end += accepted as u64,
+        }
+        mismatches += 1;
+    }
+
+    let length = anchor.q_end.saturating_sub(anchor.q_start) as usize;
+    if mismatches.saturating_mul(100) > length.saturating_mul(MAX_MISMATCH_PERCENT) {
+        return Some((original, 0));
+    }
+    anchor.score = length.saturating_sub(mismatches).min(i32::MAX as usize) as i32;
+    Some((anchor, mismatches))
 }
 
 /// Mark exact extensions whose query overlap can be placed on more than one
@@ -2080,6 +2301,103 @@ mod tests {
             score: 1,
             endpoint_support: crate::EndpointSupport::None,
         }
+    }
+
+    #[test]
+    fn single_seed_snp_emms_bridges_one_substitution_after_relock() {
+        let reference = b"ACGTCAGTACGATCGATGCTAGCTACGTCAGTACGATCGATGCTAGCTACGTCAGTACGATCGATGCTAGCT";
+        let mut query = reference.to_vec();
+        query[40] = if query[40] == b'A' { b'C' } else { b'A' };
+        let (anchor, mismatches) = extend_snp_emms_anchor(
+            ExactAnchorRequest {
+                read: &query,
+                reference,
+                ref_id: ContigId(0),
+                strand: Strand::Forward,
+                q_seed_start: 12,
+                ref_seed_start: 12,
+                k: 15,
+                window_start: 0,
+                window_end: reference.len(),
+                min_length: 30,
+                seed_verified: false,
+            },
+            12,
+        )
+        .expect("the exact core should seed SNP-EMMS");
+
+        assert_eq!(mismatches, 1);
+        assert_eq!((anchor.q_start, anchor.q_end), (0, query.len() as u32));
+        assert_eq!(anchor.score, query.len() as i32 - 1);
+    }
+
+    #[test]
+    fn single_seed_snp_emms_stops_before_an_unconfirmed_substitution() {
+        let reference = b"ACGTCAGTACGATCGATGCTAGCTACGTCAGTACGATCGATGCTAGCTACGTCAGTACGATCGATGCTAGCT";
+        let mut query = reference.to_vec();
+        for position in [40, 48] {
+            query[position] = if query[position] == b'A' { b'C' } else { b'A' };
+        }
+        let (anchor, mismatches) = extend_snp_emms_anchor(
+            ExactAnchorRequest {
+                read: &query,
+                reference,
+                ref_id: ContigId(0),
+                strand: Strand::Forward,
+                q_seed_start: 12,
+                ref_seed_start: 12,
+                k: 15,
+                window_start: 0,
+                window_end: reference.len(),
+                min_length: 30,
+                seed_verified: false,
+            },
+            12,
+        )
+        .expect("the exact core should remain an anchor");
+
+        assert_eq!(mismatches, 0);
+        assert_eq!(anchor.q_end, 40);
+    }
+
+    #[test]
+    fn single_seed_snp_emms_bridges_a_reverse_strand_substitution() {
+        let mut query =
+            b"ACGTCAGTACGATCGATGCTAGCTACGTCAGTACGATCGATGCTAGCTACGTCAGTACGATCGATGCTAGCT".to_vec();
+        let reference: Vec<u8> = query
+            .iter()
+            .rev()
+            .map(|&base| test_complement(base))
+            .collect();
+        query[40] = if query[40] == b'A' { b'C' } else { b'A' };
+        let seed_start = 12usize;
+        let k = 15usize;
+        let ref_seed_start = reference.len() - seed_start - k;
+        let (anchor, mismatches) = extend_snp_emms_anchor(
+            ExactAnchorRequest {
+                read: &query,
+                reference: &reference,
+                ref_id: ContigId(0),
+                strand: Strand::Reverse,
+                q_seed_start: seed_start,
+                ref_seed_start: ref_seed_start as u64,
+                k,
+                window_start: 0,
+                window_end: reference.len(),
+                min_length: 30,
+                seed_verified: false,
+            },
+            12,
+        )
+        .expect("the reverse exact core should seed SNP-EMMS");
+
+        assert_eq!(mismatches, 1);
+        assert_eq!((anchor.q_start, anchor.q_end), (0, query.len() as u32));
+        assert_eq!(
+            (anchor.ref_start, anchor.ref_end),
+            (0, reference.len() as u64)
+        );
+        assert_eq!(anchor.score, query.len() as i32 - 1);
     }
 
     #[test]
@@ -2573,7 +2891,10 @@ mod packed_map_tests {
                     expected.entry(code).or_default().push(pos as u64 + 1234)
                 });
                 for (code, positions) in expected {
-                    let actual = map.positions(code).map(|iter| iter.collect::<Vec<_>>());
+                    let actual = map
+                        .positions(code, 128)
+                        .1
+                        .map(|iter| iter.collect::<Vec<_>>());
                     assert_eq!(
                         actual,
                         if positions.len() <= 128 {
@@ -2586,8 +2907,17 @@ mod packed_map_tests {
             }
         }
         let repeat = vec![b'A'; 200];
-        assert!(LocalKmerMap::build_minimizers(&repeat, 0, 15, 1)
-            .positions(0)
-            .is_none());
+        let map = LocalKmerMap::build_minimizers(&repeat, 0, 15, 1);
+        let frequency = repeat.len() - 15 + 1;
+        assert_eq!(map.positions(0, 128).0, frequency);
+        assert!(map.positions(0, 128).1.is_none());
+        assert_eq!(
+            map.positions(0, frequency)
+                .1
+                .expect("the configured inclusive limit should retain the bucket")
+                .count(),
+            frequency
+        );
+        assert!(map.positions(0, 0).1.is_none());
     }
 }

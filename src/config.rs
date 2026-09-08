@@ -43,6 +43,31 @@ impl AlignmentMode {
     }
 }
 
+/// How a verified local seed is extended into an anchor.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AnchorExtensionMode {
+    /// Extend exactly in both directions and stop at the first mismatch.
+    #[default]
+    Exact,
+    /// Stay on one diagonal but bridge isolated single-base substitutions
+    /// when each is followed by a sufficiently long exact re-lock.
+    SnpEmms,
+}
+
+impl std::str::FromStr for AnchorExtensionMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "exact" | "mms" => Ok(Self::Exact),
+            "snp-emms" | "snp_emms" => Ok(Self::SnpEmms),
+            _ => Err(format!(
+                "unknown anchor extension '{value}', expected 'exact' or 'snp-emms'"
+            )),
+        }
+    }
+}
+
 /// Mapping quality calculation mode.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MapqMode {
@@ -176,6 +201,8 @@ pub struct SeedingConfig {
     pub sampled_anchors: bool,
     /// Window for the local map's minimizer selection. `0` or `1` stores all.
     pub map_window: usize,
+    /// Largest local candidate-window k-mer bucket allowed to seed anchors.
+    pub local_kmer_max_frequency: usize,
     /// Scan the index-resolved positions rarest first.
     pub rarest_first: bool,
     /// Largest distance from the candidate's diagonal an anchor may start at.
@@ -203,6 +230,10 @@ pub struct CandidateConfig {
     pub anchor_k: usize,
     pub min_anchor_length: usize,
     pub max_anchors_per_region: usize,
+    pub anchor_extension: AnchorExtensionMode,
+    /// Exact bases required to re-lock after a substitution in single-seed
+    /// SNP-EMMS extension (default: 24).
+    pub snp_emms_relock_span: usize,
     /// Drop anchors already covered on either the query or the reference
     /// axis, not only those covered on both.
     pub drop_single_axis_contained: bool,
@@ -264,6 +295,7 @@ impl Default for Config {
                 lazy_seed_cache: false,
                 sampled_anchors: false,
                 map_window: 1,
+                local_kmer_max_frequency: 128,
                 rarest_first: false,
                 diagonal_band: i64::MAX,
                 query_window: 0,
@@ -281,6 +313,8 @@ impl Default for Config {
                 anchor_k: 15,
                 min_anchor_length: 30,
                 max_anchors_per_region: 512,
+                anchor_extension: AnchorExtensionMode::Exact,
+                snp_emms_relock_span: 24,
                 drop_single_axis_contained: false,
                 diagonal_tolerance: 2_000,
                 paired_emms: false,
@@ -462,6 +496,7 @@ pub(crate) struct AnchorPolicy {
     pub(crate) anchor_k: usize,
     pub(crate) min_anchor_length: usize,
     pub(crate) max_anchors_per_region: usize,
+    pub(crate) extension_mode: AnchorExtensionMode,
     /// Drop an anchor whose span is already covered on either axis.
     ///
     /// Deduplication requires containment on both axes, so an anchor inside a
@@ -477,6 +512,7 @@ pub(crate) struct AnchorPolicy {
     pub(crate) paired_emms: bool,
     pub(crate) emms_max_mismatch_run: usize,
     pub(crate) emms_relock_span: usize,
+    pub(crate) snp_emms_relock_span: usize,
     pub(crate) paired_min_distance: usize,
     pub(crate) paired_max_distance: usize,
     pub(crate) paired_distance_tolerance: usize,
@@ -496,6 +532,7 @@ pub(crate) struct AnchorPolicy {
     pub(crate) allow_sampled_anchors: bool,
     /// Longest hit list an anchor lookup will walk.
     pub(crate) max_seed_hits: usize,
+    pub(crate) local_kmer_max_frequency: usize,
     /// Scan the index-resolved positions rarest first.
     pub(crate) rarest_first: bool,
     /// Largest distance from the candidate's diagonal an anchor may start at.
@@ -893,6 +930,8 @@ impl ResolvedMapperPolicy {
             anchor_k: config.candidates.anchor_k,
             min_anchor_length: config.candidates.min_anchor_length,
             max_anchors_per_region: config.candidates.max_anchors_per_region,
+            extension_mode: config.candidates.anchor_extension,
+            snp_emms_relock_span: config.candidates.snp_emms_relock_span,
             drop_single_axis_contained: config.candidates.drop_single_axis_contained,
             paired_emms: config.candidates.paired_emms,
             emms_max_mismatch_run: config.candidates.emms_max_mismatch_run,
@@ -903,6 +942,7 @@ impl ResolvedMapperPolicy {
             } else {
                 128
             },
+            local_kmer_max_frequency: config.seeding.local_kmer_max_frequency,
             map_window: config.seeding.map_window.max(1),
             rarest_first: config.seeding.rarest_first,
             diagonal_band: config.seeding.diagonal_band,
@@ -977,6 +1017,8 @@ impl ResolvedMapperPolicy {
                 AlignmentMode::Standard => 512,
                 AlignmentMode::Sensitive => 1_024,
             },
+            extension_mode: AnchorExtensionMode::Exact,
+            snp_emms_relock_span: 24,
             drop_single_axis_contained: false,
             reference_flank: 1_024,
             max_local_kmer_hits: match mode {
@@ -997,6 +1039,7 @@ impl ResolvedMapperPolicy {
             sufficient_coverage_permille: 350,
             allow_sampled_anchors: false,
             max_seed_hits: 128,
+            local_kmer_max_frequency: 128,
             map_window: 1,
             rarest_first: false,
             diagonal_band: i64::MAX,
@@ -1151,6 +1194,7 @@ impl ResolvedMapperPolicy {
                 max_probe_frequency: self.probes.max_probe_frequency,
                 sampled_anchors: self.probes.sampled_anchors,
                 map_window: self.probes.map_window,
+                local_kmer_max_frequency: self.anchors.local_kmer_max_frequency,
                 rarest_first: self.anchors.rarest_first,
                 diagonal_band: self.anchors.diagonal_band,
             },
@@ -1160,6 +1204,8 @@ impl ResolvedMapperPolicy {
                 anchor_k: self.anchors.anchor_k,
                 min_anchor_length: self.anchors.min_anchor_length,
                 max_anchors_per_region: self.anchors.max_anchors_per_region,
+                anchor_extension: self.anchors.extension_mode,
+                snp_emms_relock_span: self.anchors.snp_emms_relock_span,
                 drop_single_axis_contained: self.anchors.drop_single_axis_contained,
                 diagonal_tolerance: self.candidates.diagonal_tolerance,
                 paired_emms: self.anchors.paired_emms,

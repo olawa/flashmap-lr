@@ -272,7 +272,7 @@ fn anchor_length(anchor: &Anchor) -> u32 {
 }
 
 fn anchor_score(anchor: &Anchor) -> i32 {
-    anchor.score.max(anchor_length(anchor) as i32)
+    anchor.score.max(0)
 }
 
 fn fast_log2(value: f32) -> f32 {
