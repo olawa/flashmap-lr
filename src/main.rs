@@ -826,10 +826,12 @@ fn usage() -> &'static str {
         "                            chained anchors when the span they sit in carries\n",
         "                            an indel and the DP reads it at least as well. An\n",
         "                            expansion the scan filled with anchors otherwise\n",
-        "                            comes out short or split (default: 4; 0 disables)\n",
+        "                            comes out short or split (fast: 0; standard: 2;\n",
+        "                            sensitive: 4)\n",
         "      --polish-fragmented-indels N\n",
         "                            Realign repetitive CIGAR regions with same-type\n",
-        "                            indels separated by at most N matches (default: 0)\n",
+        "                            indels separated by at most N matches (default: 256;\n",
+        "                            0 disables)\n",
         "      --map-window N        Window for the local map's minimizer selection.\n",
         "                            A wider window stores fewer positions (default: 1)\n",
         "      --sampled-anchors     Let a sampled hit list seed anchors inside a\n",
@@ -1626,10 +1628,10 @@ fn execute_mapping(
                     .unwrap_or(defaults.alignment.island_chain_lookback),
                 dissolve_repeat_run: options
                     .dissolve_repeat_run
-                    .unwrap_or(defaults.alignment.dissolve_repeat_run),
+                    .unwrap_or_else(|| options.mode.default_dissolve_repeat_run()),
                 fragmented_indel_polish_window: options
                     .fragmented_indel_polish_window
-                    .unwrap_or(defaults.alignment.fragmented_indel_polish_window),
+                    .unwrap_or_else(|| options.mode.default_fragmented_indel_polish_window()),
                 overlap_flank: options
                     .overlap_flank
                     .unwrap_or(defaults.alignment.overlap_flank),

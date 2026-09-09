@@ -41,6 +41,22 @@ impl AlignmentMode {
     pub const fn resolves_full_depth(self) -> bool {
         !self.is_fast()
     }
+
+    /// Maximum repeat-anchor run replaced before CIGAR assembly. Fast leaves
+    /// this speculative repair off, while deeper modes spend progressively
+    /// more work on indels hidden by repeat anchors.
+    pub const fn default_dissolve_repeat_run(self) -> usize {
+        match self {
+            Self::Fast => 0,
+            Self::Standard => 2,
+            Self::Sensitive => 4,
+        }
+    }
+
+    /// Match span searched by the cheaper evidence-driven post-CIGAR pass.
+    pub const fn default_fragmented_indel_polish_window(self) -> usize {
+        256
+    }
 }
 
 /// How a verified local seed is extended into an anchor.
@@ -327,8 +343,9 @@ impl Default for Config {
             },
             alignment: AlignmentConfig {
                 island_chain_lookback: usize::MAX,
-                dissolve_repeat_run: 4,
-                fragmented_indel_polish_window: 0,
+                dissolve_repeat_run: AlignmentMode::Standard.default_dissolve_repeat_run(),
+                fragmented_indel_polish_window: AlignmentMode::Standard
+                    .default_fragmented_indel_polish_window(),
                 overlap_flank: 0,
                 overlap_flank_min: 0,
                 bridge_flank: 256,
@@ -1094,12 +1111,10 @@ impl ResolvedMapperPolicy {
                 dual_affine: false,
             }
         };
-        // Gap resolution, terminal rescue, normalization, and scoring are
-        // quality rules, not search budgets. All three tiers resolve a gap
-        // the same way; they differ only in how much of the read's seed and
-        // chain space they are willing to search to find the gap in the
-        // first place. Fast giving up DP depth cost it aligned bases in
-        // exactly the unique regions it is meant to be correct in.
+        // Most gap resolution rules are shared. Repeat-anchor dissolution is
+        // the deliberate preset exception: it is a speculative pre-CIGAR
+        // repair whose measured cost and recall benefit both rise by tier.
+        // The evidence-driven post-CIGAR polish remains enabled in every tier.
         let gaps = GapPolicy {
             bridge_flank: 256,
             bridge_max_gap: 5_000,
@@ -1111,8 +1126,8 @@ impl ResolvedMapperPolicy {
             medium_gap_dp_delta_max: if mode.is_sensitive() { 1_024 } else { 512 },
             recursive_split_k: 13,
             island_chain_lookback: usize::MAX,
-            dissolve_repeat_run: 4,
-            fragmented_indel_polish_window: 0,
+            dissolve_repeat_run: mode.default_dissolve_repeat_run(),
+            fragmented_indel_polish_window: mode.default_fragmented_indel_polish_window(),
             overlap_flank: 0,
             overlap_flank_min: 0,
             recursive_split_min_gap: 13,
@@ -1293,17 +1308,19 @@ mod tests {
     }
 
     #[test]
-    fn tiers_share_every_quality_rule_and_differ_only_in_search_budget() {
+    fn tiers_only_vary_the_measured_repeat_repair_among_quality_rules() {
         let runtime = RuntimeConfig::default();
         let fast = ResolvedMapperPolicy::for_mode(AlignmentMode::Fast, runtime.clone(), false);
         let standard =
             ResolvedMapperPolicy::for_mode(AlignmentMode::Standard, runtime.clone(), false);
         let sensitive = ResolvedMapperPolicy::for_mode(AlignmentMode::Sensitive, runtime, false);
 
-        // How a gap, terminal, or base is resolved does not depend on the
-        // tier. Fast trading DP depth for speed cost it aligned bases in the
-        // unique regions it is meant to be correct in.
-        assert_eq!(fast.gaps, standard.gaps);
+        assert_eq!(fast.gaps.dissolve_repeat_run, 0);
+        assert_eq!(standard.gaps.dissolve_repeat_run, 2);
+        assert_eq!(sensitive.gaps.dissolve_repeat_run, 4);
+        assert_eq!(fast.gaps.fragmented_indel_polish_window, 256);
+        assert_eq!(standard.gaps.fragmented_indel_polish_window, 256);
+        assert_eq!(sensitive.gaps.fragmented_indel_polish_window, 256);
         assert_eq!(fast.terminal, standard.terminal);
         assert_eq!(fast.normalization, standard.normalization);
         assert_eq!(fast.scoring, standard.scoring);
@@ -1352,8 +1369,15 @@ mod tests {
             ResolvedMapperPolicy::for_mode(AlignmentMode::Standard, runtime.clone(), false);
         let sensitive = ResolvedMapperPolicy::for_mode(AlignmentMode::Sensitive, runtime, false);
 
-        // Fast is bounded by search budget, not by resolution.
-        assert_eq!(fast.gaps, standard.gaps);
+        // Fast skips speculative dissolution but retains evidence-driven
+        // polishing; Sensitive spends the full dissolution budget.
+        assert_eq!(fast.gaps.dissolve_repeat_run, 0);
+        assert_eq!(standard.gaps.dissolve_repeat_run, 2);
+        assert_eq!(sensitive.gaps.dissolve_repeat_run, 4);
+        assert_eq!(
+            fast.gaps.fragmented_indel_polish_window,
+            standard.gaps.fragmented_indel_polish_window
+        );
         assert!(fast.work_budget.max_candidates < standard.work_budget.max_candidates);
         assert_eq!(standard.gaps.recursive_split_max_depth, 8);
 
